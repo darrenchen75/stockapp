@@ -13,7 +13,7 @@ pastes their own free Alpaca key, and within minutes sees a live table and chart
 In:
 - Minute bars (OHLCV) for the ~500 S&P 500 symbols.
 - Rolling 30 days of history in a local cache, backfilled on launch.
-- Live streaming during market hours.
+- Live updates during market hours (REST poll every 60s).
 - Sortable table of all symbols + candle chart for the selected symbol.
 - Installers for all three OSes built in CI.
 
@@ -37,6 +37,21 @@ Out (deliberately, for now):
 Known limitation: IEX is one exchange, so volume is lower than consolidated volume.
 Prices are representative. Shown as-is; noted in the README.
 
+## Revision (during planning)
+
+- **REST polling replaces the websocket.** Alpaca's free plan caps websocket
+  subscriptions at 30 symbols (sources disagree on whether minute bars are
+  exempt). Polling REST every 60s (~5 requests per poll, under 200/min) works
+  either way, and makes the gap fill after a drop automatic: each poll fetches
+  from each symbol's last bar. No reconnect logic.
+- **No `/clock` call.** Status is derived from bar freshness: newest bar < 5 min
+  old = "Live", otherwise "Market closed". Works with any key type (paper or live).
+- **Linux ships as a `.tar.gz` single binary**, not an AppImage (no
+  appimagetool/icon/desktop-file plumbing). Add AppImage if users want menu entries.
+- **No-data cells are blank**, not "—", so numeric column sorting stays correct.
+
+Sections below are updated to match.
+
 ## Architecture
 
 One process. Modules:
@@ -51,8 +66,8 @@ One process. Modules:
   - `backfill()`: for each symbol, fetch from `latest_ts(symbol)` (or now − 30 days
     if none) to now via REST, batching ~100 symbols per request, staying under
     200 requests/min. Upserts after each batch, so an interrupted backfill resumes.
-  - `stream()`: IEX websocket on a `QThread`, subscribed to minute bars for all
-    symbols. Each bar is upserted, then a Qt signal notifies the UI.
+  - `Poller`: background thread running `backfill()` on launch, then every 60s.
+    Emits Qt signals for progress, updates, status, and auth failure.
 - `app/ui.py` — main window.
   - Left: sortable `QTableView` — symbol, last price, % change today, volume today.
   - Right: pyqtgraph candle chart for the selected symbol, range switch 1D / 5D / 30D.
@@ -66,22 +81,25 @@ One process. Modules:
 
 1. Launch: load key from keychain (show dialog if missing).
 2. `prune(30)`, then render the table from the cache.
-3. Start `backfill()` in the background; progress in the status bar.
-4. If the market is open (Alpaca `/clock`), start `stream()` after backfill.
-5. Stream bars → store → signal → table row + chart refresh.
+3. Start the `Poller`: full `backfill()` first (progress in the status bar).
+4. Every 60s: gap `backfill()` from each symbol's last bar → store → signal →
+   table + chart refresh.
 
 ## Error handling
 
 - Bad/missing key (401/403): reopen key dialog with "Key rejected"; no backfill.
 - Rate limit (429): wait `Retry-After` (else exponential backoff), retry the same
   batch. Progress is persisted per batch.
-- Websocket drop: alpaca-py reconnects; on reconnect, run a gap backfill from each
-  symbol's `latest_ts`. Status bar shows "Reconnecting…".
-- Market closed: no streaming; table shows last close, labeled "Closed". Market
-  hours come from Alpaca `/clock`, so no holiday calendar is maintained.
-- Offline at launch: open from cache, retry connection every 30s.
-- Symbol with no data (delisted/renamed): log and skip; table shows "—".
-- Duplicate bars from backfill/stream overlap: prevented by the primary key + upsert.
+- Network drop: next poll fetches from each symbol's last bar, so gaps self-heal.
+  Failed poll → status "Offline — retrying in 30s".
+- Market closed: polls return nothing; table shows last session vs. previous
+  close; status "Market closed · last bar <time>". No holiday calendar.
+- Offline at launch: open from cache, retry every 30s.
+- Symbol with no data (delisted/renamed): logged after first backfill, skipped by
+  later polls; table cells blank.
+- Duplicate bars (refetching a symbol's last bar): prevented by primary key + upsert.
+- No OS keychain (e.g. Linux without Secret Service): warn, keep keys in memory
+  for this session only. Never fall back to plaintext.
 - Logs: rotating file in the OS log dir (`platformdirs`), so users can send it
   when reporting problems.
 
@@ -90,15 +108,17 @@ One process. Modules:
 pytest, minimum that catches real breakage:
 - `tests/test_store.py` — real SQLite in a temp dir: upsert keeps one row per
   (symbol, ts); prune drops rows older than 30 days; `latest_ts` correct.
-- `tests/test_feed.py` — fake Alpaca client, no network: batching, resume after a
-  429, gap fill after reconnect.
+- `tests/test_feed.py` — fake Alpaca client, no network: batching, retry after a
+  429, gap fill from last bar, poller auth/offline handling, bundled symbol list.
+- `tests/test_settings.py` — missing keychain doesn't crash or write plaintext.
 - UI: manual check — launch, paste key, table fills, chart renders.
 
 ## Distribution
 
 - `.github/workflows/release.yml`: matrix `macos-latest`, `windows-latest`,
-  `ubuntu-latest`; PyInstaller build on version-tag push; uploads `.dmg`,
-  zipped `.exe`, `.AppImage` to a GitHub Release. Share that link.
+  `ubuntu-latest`; tests, then PyInstaller build on version-tag push; uploads
+  `.dmg`, zipped `.exe`, Linux `.tar.gz` to a GitHub Release. Share that link.
+  `macos-latest` is Apple Silicon; an Intel Mac build needs a `macos-13` job.
 - Unsigned. README explains: macOS right-click → Open; Windows SmartScreen →
   More info → Run anyway. Add signing (Apple $99/yr; Windows cert ~$100–400/yr)
   when sharing beyond friends.
@@ -109,7 +129,7 @@ pytest, minimum that catches real breakage:
 stockapp/
   app/{main,store,feed,ui,settings}.py
   app/sp500.csv
-  tests/{test_store,test_feed}.py
+  tests/{test_store,test_feed,test_settings}.py
   pyproject.toml
   README.md
   .github/workflows/release.yml
