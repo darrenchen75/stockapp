@@ -26,7 +26,7 @@ jobs:
             mode: --onedir     # .app bundle, wrapped in a .dmg below
           - os: windows-latest
             mode: --onefile
-          - os: ubuntu-latest
+          - os: ubuntu-22.04   # oldest glibc available, so the AppImage runs on older distros
             mode: --onedir     # wrapped in an AppImage below
     runs-on: ${{ matrix.os }}
     steps:
