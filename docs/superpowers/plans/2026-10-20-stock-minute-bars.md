@@ -14,9 +14,9 @@
 
 - Python `>=3.12`; project managed with `uv`; run with `uv run python -m app.main`.
 - Data source: Alpaca `StockHistoricalDataClient`, `feed=DataFeed.IEX`, `TimeFrame.Minute`. Each user brings their own key.
-- History: rolling 30 days (`DAYS = 30`), pruned on launch.
-- Rate limit: stay under 200 requests/min (one poll is about 5 requests).
-- Bar time `ts` = bar start, Unix seconds, UTC. "Session" = New York (`America/New_York`) calendar date.
+- History: rolling 30 days (`DAYS = 30`), pruned by the poller after its first successful poll and then daily, so a window left open for weeks stays bounded.
+- Rate limit: stay under 200 requests/min (one poll is about 5 requests). On 429, wait `Retry-After` (else Alpaca's `X-RateLimit-Reset`, else exponential backoff), capped at 60s.
+- Bar time `ts` = bar start, Unix seconds, UTC. "Session" = New York (`America/New_York`) calendar date, taken per symbol: a stale symbol (halt, delisting) shows its own last session vs. its own previous close.
 - Keys are stored only in the OS keychain via `keyring`. Never write them to disk in plain text. With no keychain, keep them in memory for the session only.
 - `tzdata` is a dependency, because Windows has no system tz database for `zoneinfo`.
 - No order placement, no trade recommendations, no websocket, no `/clock` call.
@@ -43,6 +43,7 @@
 - Consumes: nothing.
 - Produces (in `app/store.py`):
   - `ET: ZoneInfo` (America/New_York)
+  - `day_start(ts: int) -> int` (midnight New York time on the date of `ts`)
   - `@dataclass(frozen=True) Bar(symbol: str, ts: int, o: float, h: float, l: float, c: float, v: int)`
   - `@dataclass(frozen=True) Summary(last: float, prev_close: float | None, volume: int)` with property `pct -> float | None`
   - `class Store(path: str)` with:
@@ -51,7 +52,7 @@
     - `latest() -> int | None`
     - `bars(symbol: str, since: int) -> list[Bar]`
     - `prune(days: int = 30, now: float | None = None) -> int`
-    - `session_start() -> int | None`
+    - `session_start(symbol: str | None = None) -> int | None`
     - `summary() -> dict[str, Summary]`
 
 - [ ] **Step 1: Scaffold the project**
@@ -163,6 +164,23 @@ def test_session_uses_new_york_date_not_utc(tmp_path):
     assert s.session_start() == ts(2026, 11, 20, 0, 0)
     x = s.summary()["AAPL"]
     assert (x.last, x.prev_close, x.volume, x.pct) == (51.0, None, 3, None)
+
+
+def test_summary_is_per_symbol_when_one_is_stale(tmp_path):
+    # MSFT has no bars in AAPL's latest session (halt, delisting, partial response):
+    # it keeps its own last-session change instead of a fake 0%.
+    s = store(tmp_path)
+    s.upsert([
+        bar("AAPL", ts(2026, 10, 15, 15, 59), c=100.0, v=5),
+        bar("AAPL", ts(2026, 10, 16, 15, 59), c=102.0, v=20),
+        bar("MSFT", ts(2026, 10, 14, 15, 59), c=200.0, v=7),
+        bar("MSFT", ts(2026, 10, 15, 15, 59), c=210.0, v=9),
+    ])
+    a, m = s.summary()["AAPL"], s.summary()["MSFT"]
+    assert (a.last, a.prev_close, a.volume) == (102.0, 100.0, 20)
+    assert (m.last, m.prev_close, m.volume) == (210.0, 200.0, 9)
+    assert s.session_start() == ts(2026, 10, 16, 0, 0)
+    assert s.session_start("MSFT") == ts(2026, 10, 15, 0, 0)
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -182,6 +200,12 @@ from datetime import time as clock
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
+
+
+def day_start(ts: int) -> int:
+    """Midnight New York time on the date of `ts`."""
+    day = datetime.fromtimestamp(ts, ET).date()
+    return int(datetime.combine(day, clock(), ET).timestamp())
 
 
 @dataclass(frozen=True)
@@ -243,36 +267,35 @@ class Store:
         with self.db:
             return self.db.execute("DELETE FROM bars WHERE ts < ?", (cutoff,)).rowcount
 
-    def session_start(self) -> int | None:
-        """Midnight New York time on the date of the newest bar."""
-        ts = self.latest()
-        if ts is None:
-            return None
-        day = datetime.fromtimestamp(ts, ET).date()
-        return int(datetime.combine(day, clock(), ET).timestamp())
+    def session_start(self, symbol: str | None = None) -> int | None:
+        """Midnight New York time on the date of the newest bar (of `symbol`, if given)."""
+        ts = self.latest() if symbol is None else self.db.execute(
+            "SELECT MAX(ts) FROM bars WHERE symbol = ?", (symbol,)
+        ).fetchone()[0]
+        return None if ts is None else day_start(ts)
 
     def summary(self) -> dict[str, Summary]:
-        start = self.session_start()
-        if start is None:
-            return {}
-        last = dict(self.db.execute(
-            "SELECT symbol, c FROM bars WHERE (symbol, ts) IN "
-            "(SELECT symbol, MAX(ts) FROM bars GROUP BY symbol)"
-        ))
-        prev = dict(self.db.execute(
-            "SELECT symbol, c FROM bars WHERE (symbol, ts) IN "
-            "(SELECT symbol, MAX(ts) FROM bars WHERE ts < ? GROUP BY symbol)", (start,)
-        ))
-        volume = dict(self.db.execute(
-            "SELECT symbol, SUM(v) FROM bars WHERE ts >= ? GROUP BY symbol", (start,)
-        ))
-        return {s: Summary(c, prev.get(s), volume.get(s, 0)) for s, c in last.items()}
+        """Each symbol's latest session vs. its own previous close (primary-key lookups)."""
+        out = {}
+        for s, ts in self.latest_all().items():
+            start = day_start(ts)
+            last = self.db.execute(
+                "SELECT c FROM bars WHERE symbol = ? AND ts = ?", (s, ts)
+            ).fetchone()[0]
+            prev = self.db.execute(
+                "SELECT c FROM bars WHERE symbol = ? AND ts < ? ORDER BY ts DESC LIMIT 1", (s, start)
+            ).fetchone()
+            volume = self.db.execute(
+                "SELECT SUM(v) FROM bars WHERE symbol = ? AND ts >= ?", (s, start)
+            ).fetchone()[0]
+            out[s] = Summary(last, prev[0] if prev else None, volume)
+        return out
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_store.py -v`
-Expected: 8 passed
+Expected: 9 passed
 
 - [ ] **Step 6: Commit**
 
@@ -292,12 +315,13 @@ git commit -m "feat: add SQLite bar store with session summary"
 **Interfaces:**
 - Consumes: `Bar`, `Store` (`upsert`, `latest_all`) from Task 1.
 - Produces (in `app/feed.py`):
-  - constants `DAYS = 30`, `MAX_SYMBOLS = 100`, `MAX_SPAN = 432_000`, `RETRIES = 5`
+  - constants `DAYS = 30`, `MAX_SYMBOLS = 100`, `MAX_SPAN = 432_000`, `RETRIES = 5`, `MAX_WAIT = 60`
+  - `retry_wait(error, attempt: int) -> float`
   - `load_symbols() -> list[str]`
   - `plan(symbols: list[str], latest: dict[str, int], now: datetime, include_empty: bool) -> list[tuple[list[str], datetime]]`
   - `fetch(client, symbols: list[str], start: datetime, end: datetime, sleep=time.sleep) -> list[Bar]`
   - `backfill(client, store: Store, symbols: list[str], include_empty: bool = True, now: datetime | None = None, sleep=time.sleep, progress=lambda done, total: None) -> int`
-  - `client` is anything with `get_stock_bars(StockBarsRequest)` returning an object with `.data: dict[str, list[<obj with timestamp, open, high, low, close, volume>]]` (alpaca-py `StockHistoricalDataClient`, or a test fake). Errors carry an HTTP status as `.status_code` (alpaca-py `APIError`).
+  - `client` is anything with `get_stock_bars(StockBarsRequest)` returning an object with `.data: dict[str, list[<obj with timestamp, open, high, low, close, volume>]]` (alpaca-py `StockHistoricalDataClient`, or a test fake). Errors carry an HTTP status as `.status_code` and response headers as `.response.headers` (alpaca-py `APIError`).
 
 - [ ] **Step 1: Bundle the S&P 500 list**
 
@@ -313,13 +337,14 @@ Class-B tickers use dots (`BRK.B`, `BF.B`), which matches Alpaca's format. Leave
 `tests/test_feed.py`:
 
 ```python
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from app import feed
-from app.store import Store
+from app.store import Bar, Store
 
 NOW = datetime(2026, 10, 19, 15, 0, tzinfo=timezone.utc)
 NOW_TS = int(NOW.timestamp())
@@ -331,9 +356,10 @@ def fake_bar(t: datetime, c=10.0):
 
 
 class HTTPError(Exception):
-    def __init__(self, status):
+    def __init__(self, status, headers=None):
         super().__init__(f"HTTP {status}")
         self.status_code = status
+        self.response = SimpleNamespace(headers=headers or {})
 
 
 class FakeClient:
@@ -419,6 +445,27 @@ def test_fetch_retries_after_rate_limit():
     assert sleeps == [5, 10]
 
 
+@pytest.mark.parametrize("headers, wait", [
+    ({"Retry-After": "42"}, 42),
+    ({"Retry-After": "999"}, feed.MAX_WAIT),
+    ({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, 5),  # HTTP-date form: fall back
+])
+def test_fetch_honors_retry_after(headers, wait):
+    client = FakeClient({"AAPL": [fake_bar(NOW)]}, errors=[HTTPError(429, headers)])
+    sleeps = []
+    feed.fetch(client, ["AAPL"], FLOOR, NOW, sleep=sleeps.append)
+    assert sleeps == [wait]
+
+
+def test_fetch_waits_for_rate_limit_reset():
+    reset = time.time() + 30
+    client = FakeClient({"AAPL": [fake_bar(NOW)]},
+                        errors=[HTTPError(429, {"X-RateLimit-Reset": str(int(reset))})])
+    sleeps = []
+    feed.fetch(client, ["AAPL"], FLOOR, NOW, sleep=sleeps.append)
+    assert 28 <= sleeps[0] <= 30
+
+
 def test_fetch_gives_up_after_retries():
     client = FakeClient(errors=[HTTPError(429)] * feed.RETRIES)
     with pytest.raises(HTTPError):
@@ -474,6 +521,7 @@ DAYS = 30
 MAX_SYMBOLS = 100            # symbols per request
 MAX_SPAN = 10 * DAYS * 1440  # symbol-minutes per request (10 symbols x 30 days, ~120k bars) bounds memory
 RETRIES = 5
+MAX_WAIT = 60                # seconds; Alpaca's limit window is one minute
 
 
 def load_symbols() -> list[str]:
@@ -501,6 +549,20 @@ def plan(symbols, latest, now, include_empty):
     return [(b, datetime.fromtimestamp(starts[b[0]], timezone.utc)) for b in jobs]
 
 
+def retry_wait(e, attempt):
+    """Seconds to wait after a 429: Retry-After, else Alpaca's X-RateLimit-Reset (epoch),
+    else exponential backoff."""
+    headers = getattr(getattr(e, "response", None), "headers", None) or {}
+    try:
+        if "Retry-After" in headers:
+            return min(float(headers["Retry-After"]), MAX_WAIT)
+        if "X-RateLimit-Reset" in headers:
+            return min(max(float(headers["X-RateLimit-Reset"]) - time.time(), 1), MAX_WAIT)
+    except ValueError:
+        pass  # shortcut: HTTP-date Retry-After falls back to backoff; parse it if Alpaca ever sends one
+    return 5 * 2**attempt
+
+
 def fetch(client, symbols, start, end, sleep=time.sleep):
     req = StockBarsRequest(
         symbol_or_symbols=symbols, timeframe=TimeFrame.Minute,
@@ -513,7 +575,7 @@ def fetch(client, symbols, start, end, sleep=time.sleep):
         except Exception as e:
             if getattr(e, "status_code", None) != 429 or attempt == RETRIES - 1:
                 raise
-            wait = 5 * 2**attempt
+            wait = retry_wait(e, attempt)
             log.warning("rate limited, retrying in %ss", wait)
             sleep(wait)
     return [
@@ -542,7 +604,7 @@ def backfill(client, store: Store, symbols, include_empty=True, now=None,
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest -v`
-Expected: all pass (8 store + 11 feed)
+Expected: all pass (9 store + 15 feed)
 
 - [ ] **Step 6: Commit**
 
@@ -715,6 +777,16 @@ def test_poller_reports_offline_and_retries(tmp_path):
     p.run()
     assert statuses == ["Offline — retrying in 0s"]
     assert len(client.requests) == 2
+
+
+def test_poller_prunes_while_running(tmp_path):
+    db = str(tmp_path / "bars.db")
+    old = int(time.time()) - 31 * 86400
+    Store(db).upsert([Bar("AAPL", old, 1.0, 1.0, 1.0, 1.0, 1)])
+    p = feed.Poller(FakeClient(), db, ["AAPL"], poll_seconds=0)
+    p.updated.connect(p.stop.set)
+    p.run()
+    assert Store(db).latest_all() == {}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -746,7 +818,7 @@ class Poller(QObject):
 
     def run(self):
         store = Store(self.db_path)  # own connection: sqlite3 connections stay on their thread
-        first = True
+        first, pruned = True, 0.0
         while not self.stop.is_set():
             try:
                 backfill(self.client, store, self.symbols, include_empty=first,
@@ -761,6 +833,9 @@ class Poller(QObject):
                 self.stop.wait(self.retry_seconds)
                 continue
             first = False
+            if time.time() - pruned > 86400:  # keep the cache a rolling 30 days while the app stays open
+                store.prune(DAYS)
+                pruned = time.time()
             self.updated.emit()
             self.stop.wait(self.poll_seconds)
 ```
@@ -825,7 +900,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Stock Bars")
         self.db_path, self.symbols = db_path, symbols
         self.store = Store(db_path)
-        self.store.prune()
         self.symbol: str | None = None
         self.range = "1D"
         self.poller: Poller | None = None
@@ -928,7 +1002,7 @@ class MainWindow(QMainWindow):
         if self.symbol is None:
             return
         days = RANGES[self.range]
-        since = (self.store.session_start() or 0) if days is None else int(time.time()) - days * 86400
+        since = (self.store.session_start(self.symbol) or 0) if days is None else int(time.time()) - days * 86400
         bars = self.store.bars(self.symbol, since)
         self.plot.setTitle(f"{self.symbol} · {self.range}")
         if bars:

@@ -80,10 +80,11 @@ One process. Modules:
 ## Data flow
 
 1. Launch: load key from keychain (show dialog if missing).
-2. `prune(30)`, then render the table from the cache.
+2. Render the table from the cache.
 3. Start the `Poller`: full `backfill()` first (progress in the status bar).
 4. Every 60s: gap `backfill()` from each symbol's last bar → store → signal →
-   table + chart refresh.
+   table + chart refresh. The poller runs `prune(30)` after its first successful poll
+   and then daily, so a long-running window keeps a rolling 30 days.
 
 ## Error handling
 
