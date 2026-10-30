@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon0
+      - run: uv sync
+      - run: uv run pytest -q
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest   # Apple Silicon; add macos-13 for Intel Macs
+            mode: --onedir     # .app bundle, wrapped in a .dmg below
+          - os: windows-latest
+            mode: --onefile
+          - os: ubuntu-latest
+            mode: --onefile
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: >
+          uv run pyinstaller --noconfirm --windowed ${{ matrix.mode }} --name StockBars --paths .
+          --add-data "app/sp500.csv:app" --collect-submodules keyring.backends app/main.py
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: hdiutil create -volname StockBars -srcfolder dist/StockBars.app -ov -format UDZO StockBars-macos.dmg
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/StockBars.exe -DestinationPath StockBars-windows.zip
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: tar czf StockBars-linux.tar.gz -C dist StockBars
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: StockBars-*
