@@ -1,0 +1,42 @@
+import logging
+import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+from platformdirs import user_data_dir, user_log_dir
+from PySide6.QtWidgets import QApplication
+
+from app import settings
+from app.feed import load_symbols
+from app.ui import MainWindow
+
+APP = "stockapp"
+
+
+def main() -> int:
+    log_dir = Path(user_log_dir(APP, appauthor=False))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[RotatingFileHandler(log_dir / "stockapp.log", maxBytes=1_000_000, backupCount=3)],
+    )
+    data_dir = Path(user_data_dir(APP, appauthor=False))
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    app = QApplication(sys.argv)
+    keys = settings.load_keys()
+    if keys is None:
+        keys = settings.ask_keys()
+        if keys is None:
+            return 0
+        settings.remember(None, keys)
+
+    window = MainWindow(str(data_dir / "bars.db"), load_symbols(), keys)
+    window.resize(1200, 700)
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

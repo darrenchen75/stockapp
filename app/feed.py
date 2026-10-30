@@ -1,5 +1,6 @@
 import csv
 import logging
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from alpaca.data.enums import DataFeed
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from PySide6.QtCore import QObject, Signal
 
 from app.store import Bar, Store
 
@@ -94,3 +96,44 @@ def backfill(client, store: Store, symbols, include_empty=True, now=None,
         if missing:
             log.info("no bars for %d symbols: %s", len(missing), ", ".join(missing))
     return count
+
+
+class Poller(QObject):
+    """Runs backfill() on a background thread: full on start, then a gap fill every poll_seconds."""
+
+    progress = Signal(int, int)
+    updated = Signal()
+    status = Signal(str)
+    auth_failed = Signal()
+
+    def __init__(self, client, db_path, symbols, poll_seconds=60, retry_seconds=30):
+        super().__init__()
+        self.client, self.db_path, self.symbols = client, db_path, symbols
+        self.poll_seconds, self.retry_seconds = poll_seconds, retry_seconds
+        self.stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        store = Store(self.db_path)  # own connection: sqlite3 connections stay on their thread
+        first, pruned = True, 0.0
+        while not self.stop.is_set():
+            try:
+                backfill(self.client, store, self.symbols, include_empty=first,
+                         progress=self.progress.emit)
+            except Exception as e:
+                if getattr(e, "status_code", None) in (401, 403):
+                    log.warning("key rejected: %s", e)
+                    self.auth_failed.emit()
+                    return
+                log.exception("poll failed")
+                self.status.emit(f"Offline — retrying in {self.retry_seconds}s")
+                self.stop.wait(self.retry_seconds)
+                continue
+            first = False
+            if time.time() - pruned > 86400:  # keep the cache a rolling 30 days while the app stays open
+                store.prune(DAYS)
+                pruned = time.time()
+            self.updated.emit()
+            self.stop.wait(self.poll_seconds)

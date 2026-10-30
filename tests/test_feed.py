@@ -154,3 +154,32 @@ def test_backfill_resumes_from_last_bar(tmp_path):
     resumed = client.requests[-1]
     assert resumed.symbol_or_symbols == ["AAPL"]
     assert utc(resumed.start) == t2
+
+
+def test_poller_stops_on_rejected_key(tmp_path):
+    p = feed.Poller(FakeClient(errors=[HTTPError(401)]), str(tmp_path / "bars.db"), ["AAPL"])
+    seen = []
+    p.auth_failed.connect(lambda: seen.append("auth"))
+    p.run()  # must return instead of looping
+    assert seen == ["auth"]
+
+
+def test_poller_reports_offline_and_retries(tmp_path):
+    client = FakeClient(errors=[ConnectionError("down")])
+    p = feed.Poller(client, str(tmp_path / "bars.db"), ["AAPL"], poll_seconds=0, retry_seconds=0)
+    statuses = []
+    p.status.connect(statuses.append)
+    p.updated.connect(p.stop.set)  # stop after the first successful poll
+    p.run()
+    assert statuses == ["Offline — retrying in 0s"]
+    assert len(client.requests) == 2
+
+
+def test_poller_prunes_while_running(tmp_path):
+    db = str(tmp_path / "bars.db")
+    old = int(time.time()) - 31 * 86400
+    Store(db).upsert([Bar("AAPL", old, 1.0, 1.0, 1.0, 1.0, 1)])
+    p = feed.Poller(FakeClient(), db, ["AAPL"], poll_seconds=0)
+    p.updated.connect(p.stop.set)
+    p.run()
+    assert Store(db).latest_all() == {}
