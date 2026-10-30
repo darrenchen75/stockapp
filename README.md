@@ -18,12 +18,14 @@ is IEX-only, so it's lower than the whole-market volume you see elsewhere.
 Download the file for your system from the latest GitHub Release.
 
 - **macOS** (Apple Silicon): open `StockBars-macos.dmg` and drag the app to
-  Applications. The first time, right-click the app, choose Open, then confirm.
-  (The app is unsigned.)
+  Applications. The app is unsigned, so the first launch is blocked: open
+  System Settings → Privacy & Security, scroll down, click "Open Anyway",
+  then confirm.
 - **Windows**: unzip and run `StockBars.exe`. If SmartScreen warns, click
   More info, then Run anyway.
-- **Linux**: `tar xzf StockBars-linux.tar.gz && ./StockBars`. If Qt
-  complains about the "xcb" plugin, run `sudo apt install libxcb-cursor0`.
+- **Linux**: download `StockBars-linux.AppImage`, right-click it, open
+  Properties, and turn on "Allow executing file as program" (or "Executable as
+  Program"). Then double-click it.
 
 ## Problems
 
