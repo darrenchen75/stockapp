@@ -1,3 +1,4 @@
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -249,3 +250,40 @@ def test_poller_survives_failed_split_check(tmp_path):
     p = feed.Poller(FakeClient(), str(tmp_path / "bars.db"), ["AAPL"], actions=Broken(), poll_seconds=0)
     p.on_updated = p.stop.set
     p.run()  # bar polling still reports an update
+
+
+def test_backfill_stops_between_batches(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    stop = threading.Event()
+    client = FakeClient()
+    n = feed.backfill(client, store, syms(25), now=NOW, stop=stop,
+                      progress=lambda d, t: stop.set())  # 3 batches of 10; stop after the first
+    assert n == 0 and len(client.requests) == 1
+
+
+def test_repair_splits_stops_between_refetches(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    client = FakeClient({"AAPL": [fake_bar(NOW)], "MSFT": [fake_bar(NOW)]})
+    day = NOW.date() - timedelta(days=1)
+    stop = threading.Event()
+    stop.set()
+    assert feed.repair_splits(client, FakeActions([("AAPL", day), ("MSFT", day)]), store,
+                              ["AAPL", "MSFT"], now=NOW, stop=stop) == 2  # skipped splits stay pending
+    assert client.requests == []
+
+
+def test_poller_halt_ends_during_rate_limit_wait(tmp_path):
+    statuses = []
+    client = FakeClient(errors=[HTTPError(429, {"Retry-After": "60"})] * 5)
+    p = feed.Poller(client, str(tmp_path / "bars.db"), ["AAPL"], on_status=statuses.append)
+    p.start()
+    t0 = time.time()
+    assert p.halt(timeout=5)
+    assert time.time() - t0 < 5
+    assert statuses == []  # a stop is not an outage
+
+
+def test_poller_halt_waits_for_thread(tmp_path):
+    p = feed.Poller(FakeClient(), str(tmp_path / "bars.db"), ["AAPL"], poll_seconds=3600)
+    p.start()
+    assert p.halt(timeout=5) and not p.thread.is_alive()

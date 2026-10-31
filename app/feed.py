@@ -81,11 +81,14 @@ def fetch(client, symbols, start, end, sleep=time.sleep):
 
 
 def backfill(client, store: Store, symbols, include_empty=True, now=None,
-             sleep=time.sleep, progress=lambda done, total: None) -> int:
+             sleep=time.sleep, progress=lambda done, total: None,
+             stop: threading.Event | None = None) -> int:
     now = now or datetime.now(timezone.utc)
     jobs = plan(symbols, store.latest_all(), now, include_empty)
     count = 0
     for i, (batch, start) in enumerate(jobs, 1):
+        if stop and stop.is_set():
+            break
         bars = fetch(client, batch, start, now, sleep)
         store.upsert(bars)  # per batch, so an interrupted backfill resumes where it stopped
         count += len(bars)
@@ -97,11 +100,12 @@ def backfill(client, store: Store, symbols, include_empty=True, now=None,
     return count
 
 
-def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.sleep) -> int:
+def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.sleep,
+                  stop: threading.Event | None = None) -> int:
     """Refetch 30 split-adjusted days for each symbol with an unhandled split in the last 30 days.
     The window is rolling so splits Alpaca posts late still get caught. A split is marked handled
     only after its ex-date, since Alpaca may not have adjusted history yet on the day itself.
-    Returns how many splits are still pending: empty refetch, or ex-date is today."""
+    Returns how many splits are still pending: empty refetch, ex-date is today, or skipped by stop."""
     now = now or datetime.now(timezone.utc)
     today = now.astimezone(ET).date()
     data = actions.get_corporate_actions(CorporateActionsRequest(
@@ -111,6 +115,9 @@ def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.s
     found = {(a.symbol, a.ex_date.isoformat()) for actions_ in data.values() for a in actions_}
     pending = 0
     for symbol, ex_date in sorted(found - store.handled_splits()):
+        if stop and stop.is_set():
+            pending += 1
+            continue
         bars = fetch(client, [symbol], now - timedelta(days=DAYS), now, sleep)
         if not bars:
             log.warning("split refetch for %s came back empty; retrying in an hour", symbol)
@@ -138,7 +145,14 @@ class Poller:
         self.stop = threading.Event()
 
     def start(self):
-        threading.Thread(target=self.run, daemon=True).start()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def halt(self, timeout=60) -> bool:
+        """Stop and wait for the thread; call off the UI thread. True if it ended."""
+        self.stop.set()
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
 
     def run(self):
         store = Store(self.db_path)  # own connection: sqlite3 connections stay on their thread
@@ -146,8 +160,10 @@ class Poller:
         while not self.stop.is_set():
             try:
                 backfill(self.client, store, self.symbols, include_empty=first,
-                         progress=self.on_progress)
+                         progress=self.on_progress, sleep=self.stop.wait, stop=self.stop)
             except Exception as e:
+                if self.stop.is_set():
+                    return  # the wait was cut short by stop; the error is just fallout
                 if getattr(e, "status_code", None) in (401, 403):
                     log.warning("key rejected: %s", e)
                     self.on_auth_failed()
@@ -160,9 +176,10 @@ class Poller:
             if time.time() - pruned > 86400:  # keep the cache a rolling 30 days while the app stays open
                 store.prune(DAYS)
                 pruned = time.time()
-            if self.actions and time.time() >= next_split_check:
+            if self.actions and not self.stop.is_set() and time.time() >= next_split_check:
                 try:
-                    pending = repair_splits(self.client, self.actions, store, self.symbols)
+                    pending = repair_splits(self.client, self.actions, store, self.symbols,
+                                            sleep=self.stop.wait, stop=self.stop)
                 except Exception:
                     log.exception("split check failed")
                     pending = 1
