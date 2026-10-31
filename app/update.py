@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import json
 import logging
 import re
@@ -108,13 +109,16 @@ def prepare(release: Release, target: Path, platform: str, opener=urllib.request
                     shutil.copyfileobj(src, dst)
             else:
                 tmpdir = Path(tempfile.mkdtemp(dir=parent))
-                subprocess.run(["ditto", "-x", "-k", str(archive), str(tmpdir)], check=True)
-                subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(tmpdir / "StockBars.app")], check=True)
+                subprocess.run(["ditto", "-x", "-k", str(archive), str(tmpdir)], check=True, timeout=300)
+                # exits nonzero when there is no quarantine attribute, the normal case here
+                xa = subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(tmpdir / "StockBars.app")], timeout=300)
+                if xa.returncode:
+                    log.debug("xattr exited %s", xa.returncode)
                 shutil.rmtree(out, ignore_errors=True)
                 (tmpdir / "StockBars.app").rename(out)
             archive.unlink()
         return out
-    except (OSError, zipfile.BadZipFile, KeyError, subprocess.CalledProcessError) as e:
+    except (OSError, http.client.HTTPException, zipfile.BadZipFile, KeyError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         for t in temps:
             shutil.rmtree(t, ignore_errors=True) if t.is_dir() else t.unlink(missing_ok=True)
         raise UpdateError(str(e)) from e

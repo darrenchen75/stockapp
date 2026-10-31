@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -147,3 +148,15 @@ def test_prepare_fails_cleanly_on_readonly_dir(tmp_path):
         assert list(d.iterdir()) == []
     finally:
         d.chmod(0o755)
+
+
+def test_prepare_cleans_up_when_download_is_cut_off(tmp_path):
+    class Cut(io.BytesIO):
+        def read(self, n=-1):
+            if self.tell():
+                raise http.client.IncompleteRead(b"")
+            return super().read(2)
+
+    with pytest.raises(update.UpdateError):
+        update.prepare(rel(b"abcdef"), tmp_path / "B.AppImage", "linux", opener=lambda req, timeout=None: Cut(b"abcdef"))
+    assert list(tmp_path.iterdir()) == []
