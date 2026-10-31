@@ -277,13 +277,27 @@ def test_poller_halt_ends_during_rate_limit_wait(tmp_path):
     client = FakeClient(errors=[HTTPError(429, {"Retry-After": "60"})] * 5)
     p = feed.Poller(client, str(tmp_path / "bars.db"), ["AAPL"], on_status=statuses.append)
     p.start()
+    while not client.requests:  # let it reach the 429 wait
+        time.sleep(0.01)
     t0 = time.time()
     assert p.halt(timeout=5)
     assert time.time() - t0 < 5
-    assert statuses == []  # a stop is not an outage
+    assert statuses == [] and len(client.requests) == 1  # a stop is not an outage, and no retry burst
 
 
 def test_poller_halt_waits_for_thread(tmp_path):
     p = feed.Poller(FakeClient(), str(tmp_path / "bars.db"), ["AAPL"], poll_seconds=3600)
     p.start()
     assert p.halt(timeout=5) and not p.thread.is_alive()
+
+
+def test_stopped_poller_does_not_report_update(tmp_path):
+    updated = []
+    p = feed.Poller(FakeClient(), str(tmp_path / "bars.db"), syms(25), on_updated=lambda: updated.append(1))
+    p.on_progress = lambda d, t: p.stop.set()
+    p.run()
+    assert updated == []
+
+
+def test_halt_before_start():
+    assert feed.Poller(FakeClient(), "x.db", ["AAPL"]).halt()

@@ -73,7 +73,8 @@ def fetch(client, symbols, start, end, sleep=time.sleep):
                 raise
             wait = retry_wait(e, attempt)
             log.warning("rate limited, retrying in %ss", wait)
-            sleep(wait)
+            if sleep(wait):  # Event.wait is True once stopped: give up rather than retry at once
+                raise
     return [
         Bar(s, int(b.timestamp.timestamp()), b.open, b.high, b.low, b.close, int(b.volume))
         for s, bars in data.items() for b in bars
@@ -143,6 +144,7 @@ class Poller:
         self.on_progress, self.on_updated = on_progress, on_updated
         self.on_status, self.on_auth_failed = on_status, on_auth_failed
         self.stop = threading.Event()
+        self.thread = None
 
     def start(self):
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -151,8 +153,9 @@ class Poller:
     def halt(self, timeout=60) -> bool:
         """Stop and wait for the thread; call off the UI thread. True if it ended."""
         self.stop.set()
-        self.thread.join(timeout)
-        return not self.thread.is_alive()
+        if self.thread:
+            self.thread.join(timeout)
+        return not (self.thread and self.thread.is_alive())
 
     def run(self):
         store = Store(self.db_path)  # own connection: sqlite3 connections stay on their thread
@@ -172,6 +175,8 @@ class Poller:
                 self.on_status(f"Offline — retrying in {self.retry_seconds}s")
                 self.stop.wait(self.retry_seconds)
                 continue
+            if self.stop.is_set():
+                return
             first = False
             if time.time() - pruned > 86400:  # keep the cache a rolling 30 days while the app stays open
                 store.prune(DAYS)
@@ -181,11 +186,15 @@ class Poller:
                     pending = repair_splits(self.client, self.actions, store, self.symbols,
                                             sleep=self.stop.wait, stop=self.stop)
                 except Exception:
+                    if self.stop.is_set():
+                        return
                     log.exception("split check failed")
                     pending = 1
                 # Next New York midnight; within the hour if something failed, so mixed prices don't linger.
                 tomorrow = datetime.now(ET).date() + timedelta(days=1)
                 next_split_check = (time.time() + 3600 if pending
                                     else datetime.combine(tomorrow, datetime.min.time(), ET).timestamp())
+            if self.stop.is_set():
+                return
             self.on_updated()
             self.stop.wait(self.poll_seconds)
