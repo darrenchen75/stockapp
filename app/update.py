@@ -295,10 +295,12 @@ def apply(release: Release, target: Path, platform: str, data_dir: Path,
         raise UpdateError(str(e)) from e
     try:
         aside = swap(target, new, platform)
-    except UpdateError:
+    except Exception as e:
         _discard(new)
         resume_poller()
-        raise
+        if isinstance(e, UpdateError):
+            raise
+        raise UpdateError(str(e)) from e
     confirm = new_confirm_path(data_dir)
     try:
         try:

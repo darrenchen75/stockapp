@@ -562,6 +562,21 @@ def test_apply_swap_failure_deletes_new_copy(tmp_path, monkeypatch):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["B.AppImage", "data"]
 
 
+def test_apply_any_swap_error_deletes_new_copy_and_resumes(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch)
+
+    def bad_swap(*a):
+        raise ValueError("bad path")
+
+    monkeypatch.setattr(update, "swap", bad_swap)
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert isinstance(e.value.__cause__, ValueError) and e.value.started is False
+    assert t.read_bytes() == b"old"
+    assert calls == ["halt", "resume"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["B.AppImage", "data"]
+
+
 def test_apply_restore_failure_still_resumes_and_names_old_copy(tmp_path, monkeypatch):
     t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, confirmed=False)
 

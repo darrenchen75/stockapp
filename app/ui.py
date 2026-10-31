@@ -69,6 +69,22 @@ class Candles(pg.GraphicsObject):
         return self.bounds
 
 
+class UpdateProgress(QProgressDialog):
+    """Busy dialog that can't be dismissed while the app replaces itself."""
+
+    def __init__(self, parent):
+        super().__init__("Updating Stock Bars…", None, 0, 0, parent)
+        self.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        self.setWindowModality(Qt.WindowModal)
+        self.setMinimumDuration(0)
+
+    def reject(self):  # Escape
+        pass
+
+    def closeEvent(self, event):
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     # The poller calls these from its thread; Qt queues them onto the UI thread.
     progressed = Signal(int, int)
@@ -90,6 +106,7 @@ class MainWindow(QMainWindow):
         self.lock = update_lock(data_dir)
         self.progress: QProgressDialog | None = None
         self.resume_requested = False
+        self.updating = False
         self.store = Store(db_path)
         self.symbol: str | None = None
         self.range = "1D"
@@ -166,6 +183,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Fetching bars… {done}/{total}")
 
     def on_auth_failed(self):
+        if self.updating:
+            # A new poller now would race apply's; the restarted poller re-reports this after a rollback.
+            log.warning("key rejected during an update; asking again after it ends")
+            return
         keys = settings.ask_keys(self, "Alpaca rejected that key. Check it and try again.")
         if keys is None:
             self.close()
@@ -202,11 +223,10 @@ class MainWindow(QMainWindow):
             self.lock.unlock()
             self.show_update_failed("Couldn't update automatically.")
             return
-        self.progress = QProgressDialog("Updating Stock Bars…", None, 0, 0, self)
-        self.progress.setWindowModality(Qt.WindowModal)
-        self.progress.setMinimumDuration(0)
+        self.progress = UpdateProgress(self)
         self.progress.show()
         self.resume_requested = False
+        self.updating = True
         threading.Thread(target=self.run_update, args=(release, target, self.poller.halt), daemon=True).start()
 
     def run_update(self, release, target, halt_poller):
@@ -223,6 +243,8 @@ class MainWindow(QMainWindow):
         self.hide()
 
     def on_update_done(self, error: Exception | None):
+        self.updating = False
+        self.progress.deleteLater()
         started = getattr(error, "started", False)
         # poller_resume is queued before update_done, so its slot has already run.
         paused = started and not self.resume_requested  # the new copy is still running
@@ -233,16 +255,15 @@ class MainWindow(QMainWindow):
             return
         log.warning("update failed: %s", error)
         self.show()
-        self.progress.hide()
         if paused:
             # No poller restart: a second poller would share bars.db. The lock stays held until close,
             # so the new copy can't clean up the only backup and no new update is offered.
             self.statusBar().showMessage("Paused for update")
             self.show_update_failed("Couldn't update automatically.", str(error))
         elif started:
-            self.show_update_failed(f"The update didn't start, so you're still on {VERSION}.")
+            self.show_update_failed(f"The update didn't start, so you're still on {VERSION}.", str(error))
         else:
-            self.show_update_failed("Couldn't update automatically.")
+            self.show_update_failed("Couldn't update automatically.", str(error))
 
     def show_update_failed(self, text: str, detail: str = ""):
         box = QMessageBox(QMessageBox.Warning, "Stock Bars", text, parent=self)
@@ -310,7 +331,10 @@ class MainWindow(QMainWindow):
             self.plot.addItem(Candles(bars))
 
     def closeEvent(self, event):
+        if self.updating:  # quitting mid-swap could leave no app installed
+            event.ignore()
+            return
         if self.poller:
             self.poller.stop.set()
-        self.lock.unlock()  # held here only while paused for update; a no-op otherwise
+        self.lock.unlock()  # still held only when paused for update; a no-op otherwise
         super().closeEvent(event)
