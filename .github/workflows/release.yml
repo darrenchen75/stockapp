@@ -36,12 +36,17 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxcb-cursor0  # PyInstaller bundles it
       - run: uv sync
+      - name: Stamp version
+        shell: bash
+        run: echo "VERSION = \"${GITHUB_REF_NAME#v}\"" > app/version.py
       - run: >
           uv run pyinstaller --noconfirm --windowed ${{ matrix.mode }} --name StockBars --paths .
           --add-data "app/sp500.csv:app" --collect-submodules keyring.backends app/main.py
       - name: Package macOS
         if: runner.os == 'macOS'
-        run: hdiutil create -volname StockBars -srcfolder dist/StockBars.app -ov -format UDZO StockBars-macos.dmg
+        run: |
+          hdiutil create -volname StockBars -srcfolder dist/StockBars.app -ov -format UDZO StockBars-macos.dmg
+          ditto -c -k --keepParent dist/StockBars.app StockBars-macos.zip
       - name: Package Windows
         if: runner.os == 'Windows'
         run: Compress-Archive -Path dist/StockBars.exe -DestinationPath StockBars-windows.zip

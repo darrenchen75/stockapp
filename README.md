@@ -114,6 +114,19 @@ asks each time you open it.)
 If the app ever says Alpaca rejected your key, make a new key in Alpaca (Step 1)
 and paste it in.
 
+## Updates
+
+When a new version is out, the app asks you. Click **Update** and the app
+installs it and restarts by itself. Your key and your saved prices stay as
+they were.
+
+If an update can't install, the app keeps working as before and offers you the
+download page, so you can get the new version by hand.
+
+If you have version 0.1.2 or older, those versions can't update themselves.
+Download the app once more by hand (Step 2 of Setup). After that, updates come
+through the app.
+
 ## Something wrong?
 
 Send the app's log file to whoever gave you the app. It's in this folder:
