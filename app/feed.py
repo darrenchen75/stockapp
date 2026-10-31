@@ -8,7 +8,6 @@ from pathlib import Path
 from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from PySide6.QtCore import QObject, Signal
 
 from app.store import ET, Bar, Store
 
@@ -120,19 +119,18 @@ def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.s
     return repaired
 
 
-class Poller(QObject):
-    """Runs backfill() on a background thread: full on start, then a gap fill every poll_seconds."""
+class Poller:
+    """Runs backfill() on a background thread: full on start, then a gap fill every poll_seconds.
+    Plain Python so it runs without a GUI; callbacks fire on the poller thread."""
 
-    progress = Signal(int, int)
-    updated = Signal()
-    status = Signal(str)
-    auth_failed = Signal()
-
-    def __init__(self, client, db_path, symbols, actions=None, poll_seconds=60, retry_seconds=30):
-        super().__init__()
+    def __init__(self, client, db_path, symbols, actions=None, poll_seconds=60, retry_seconds=30,
+                 on_progress=lambda done, total: None, on_updated=lambda: None,
+                 on_status=lambda text: None, on_auth_failed=lambda: None):
         self.client, self.db_path, self.symbols = client, db_path, symbols
         self.actions = actions  # corporate-actions client; None skips split repair
         self.poll_seconds, self.retry_seconds = poll_seconds, retry_seconds
+        self.on_progress, self.on_updated = on_progress, on_updated
+        self.on_status, self.on_auth_failed = on_status, on_auth_failed
         self.stop = threading.Event()
 
     def start(self):
@@ -144,14 +142,14 @@ class Poller(QObject):
         while not self.stop.is_set():
             try:
                 backfill(self.client, store, self.symbols, include_empty=first,
-                         progress=self.progress.emit)
+                         progress=self.on_progress)
             except Exception as e:
                 if getattr(e, "status_code", None) in (401, 403):
                     log.warning("key rejected: %s", e)
-                    self.auth_failed.emit()
+                    self.on_auth_failed()
                     return
                 log.exception("poll failed")
-                self.status.emit(f"Offline — retrying in {self.retry_seconds}s")
+                self.on_status(f"Offline — retrying in {self.retry_seconds}s")
                 self.stop.wait(self.retry_seconds)
                 continue
             first = False
@@ -165,5 +163,5 @@ class Poller(QObject):
                     repair_splits(self.client, self.actions, store, self.symbols)
                 except Exception:
                     log.exception("split check failed")
-            self.updated.emit()
+            self.on_updated()
             self.stop.wait(self.poll_seconds)

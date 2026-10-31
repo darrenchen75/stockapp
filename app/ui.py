@@ -4,7 +4,7 @@ from datetime import datetime
 import pyqtgraph as pg
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
-from PySide6.QtCore import QPointF, QRectF, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QPointF, QRectF, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPicture, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QHBoxLayout, QMainWindow,
                                QPushButton, QSplitter, QTableView, QVBoxLayout, QWidget)
@@ -46,6 +46,12 @@ class Candles(pg.GraphicsObject):
 
 
 class MainWindow(QMainWindow):
+    # The poller calls these from its thread; Qt queues them onto the UI thread.
+    progressed = Signal(int, int)
+    polled = Signal()
+    status_changed = Signal(str)
+    key_rejected = Signal()
+
     def __init__(self, db_path: str, symbols: list[str], keys: tuple[str, str]):
         super().__init__()
         self.setWindowTitle("Stock Bars")
@@ -93,17 +99,19 @@ class MainWindow(QMainWindow):
         split.setSizes([420, 780])
         self.setCentralWidget(split)
 
+        # Bound methods of QObjects on the UI thread: Qt queues these cross-thread calls.
+        self.progressed.connect(self.on_progress)
+        self.polled.connect(self.refresh)
+        self.status_changed.connect(self.statusBar().showMessage)
+        self.key_rejected.connect(self.on_auth_failed)
         self.refresh()
         self.start_poller(keys)
 
     def start_poller(self, keys: tuple[str, str]):
         self.poller = Poller(StockHistoricalDataClient(*keys), self.db_path, self.symbols,
-                             actions=CorporateActionsClient(*keys))
-        # Bound methods of QObjects on the UI thread: Qt queues these cross-thread calls.
-        self.poller.progress.connect(self.on_progress)
-        self.poller.updated.connect(self.refresh)
-        self.poller.status.connect(self.statusBar().showMessage)
-        self.poller.auth_failed.connect(self.on_auth_failed)
+                             actions=CorporateActionsClient(*keys),
+                             on_progress=self.progressed.emit, on_updated=self.polled.emit,
+                             on_status=self.status_changed.emit, on_auth_failed=self.key_rejected.emit)
         self.poller.start()
 
     def on_progress(self, done: int, total: int):
