@@ -438,7 +438,7 @@ def test_stop_process_kills_term_ignoring_descendant(tmp_path):
     pytest.fail("descendant survived")
 
 
-def setup_apply(tmp_path, monkeypatch, *, halt=True, launch_exc=None, confirmed=True, stopped=True):
+def setup_apply(tmp_path, monkeypatch, *, halt=True, launch_exc=None, confirmed=True, stopped=True, launched=None):
     t = tmp_path / "B.AppImage"
     t.write_bytes(b"old")
     data_dir = tmp_path / "data"
@@ -457,7 +457,20 @@ def setup_apply(tmp_path, monkeypatch, *, halt=True, launch_exc=None, confirmed=
     def fake_stop(proc, platform):
         calls.append("stop")
         seen["confirm"].touch()  # the new copy confirms too late
+        if isinstance(stopped, Exception):
+            raise stopped
         return stopped
+
+    def fake_halt():
+        calls.append("halt")
+        if isinstance(halt, Exception):
+            raise halt
+        return halt
+
+    def fake_launched():
+        calls.append("launched")
+        if launched:
+            raise launched
 
     monkeypatch.setattr(update, "launch", fake_launch)
     monkeypatch.setattr(update, "wait_confirmed", lambda p, timeout=30: p.exists())
@@ -466,9 +479,9 @@ def setup_apply(tmp_path, monkeypatch, *, halt=True, launch_exc=None, confirmed=
     def go(data=b"new"):
         update.apply(
             rel(data), t, "linux", data_dir,
-            halt_poller=lambda: calls.append("halt") or halt,
+            halt_poller=fake_halt,
             resume_poller=lambda: calls.append("resume"),
-            on_launched=lambda: calls.append("launched"),
+            on_launched=fake_launched,
             opener=fake_bytes(b"new"),
         )
 
@@ -561,3 +574,49 @@ def test_apply_restore_failure_still_resumes_and_names_old_copy(tmp_path, monkey
     assert "disk full" in str(e.value) and str(update.aside_path(t, "linux")) in str(e.value)
     assert e.value.started is True
     assert calls[-1] == "resume"
+
+
+def test_apply_survives_on_launched_error_when_confirmed(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, launched=RuntimeError("ui"))
+    go()
+    assert t.read_bytes() == b"new"
+    assert calls == ["halt", "launch", "launched"]
+
+
+def test_apply_on_launched_error_then_timeout_rolls_back(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, confirmed=False, launched=RuntimeError("ui"))
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert e.value.started is True
+    assert t.read_bytes() == b"old"
+    assert calls == ["halt", "launch", "launched", "stop", "resume"]
+
+
+def test_apply_halt_error_discards_and_resumes(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, halt=RuntimeError("stuck"))
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert isinstance(e.value.__cause__, RuntimeError)
+    assert t.read_bytes() == b"old"
+    assert calls == ["halt", "resume"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["B.AppImage", "data"]
+
+
+def test_apply_rolls_back_on_any_launch_error(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, launch_exc=ValueError("bad arg"))
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert isinstance(e.value.__cause__, ValueError) and e.value.started is False
+    assert t.read_bytes() == b"old"
+    assert calls == ["halt", "launch", "resume"]
+
+
+def test_apply_stop_error_leaves_new_copy(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, confirmed=False, stopped=OSError("denied"))
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert e.value.started is True and "still running" in str(e.value)
+    assert isinstance(e.value.__cause__, OSError)
+    assert t.read_bytes() == b"new"
+    assert "resume" not in calls
+    assert list(data_dir.iterdir()) == []

@@ -284,10 +284,15 @@ def apply(release: Release, target: Path, platform: str, data_dir: Path,
           halt_poller: Callable[[], bool], resume_poller: Callable[[], None], on_launched: Callable[[], None],
           opener=urllib.request.urlopen, timeout: float = 30) -> None:
     new = prepare(release, target, platform, opener)
-    if not halt_poller():
+    try:
+        if not halt_poller():
+            raise UpdateError("the app could not pause to update")
+    except Exception as e:
         _discard(new)
         resume_poller()
-        raise UpdateError("the app could not pause to update")
+        if isinstance(e, UpdateError):
+            raise
+        raise UpdateError(str(e)) from e
     try:
         aside = swap(target, new, platform)
     except UpdateError:
@@ -298,13 +303,21 @@ def apply(release: Release, target: Path, platform: str, data_dir: Path,
     try:
         try:
             proc = launch(target, platform, confirm)
-        except UpdateError as e:
+        except Exception as e:
             raise _roll_back(target, aside, resume_poller, str(e), started=False) from e
-        on_launched()
+        try:
+            on_launched()
+        except Exception:
+            log.exception("on_launched failed")  # UI hiccup must not abandon a running update
         if wait_confirmed(confirm, timeout):
             return  # aside stays for the new copy's cleanup
-        if not stop_process(proc, platform):
-            raise UpdateError(f"the new version did not confirm and is still running; the previous version is at {aside}", started=True)
+        alive = f"the new version did not confirm and is still running; the previous version is at {aside}"
+        try:
+            stopped = stop_process(proc, platform)
+        except Exception as e:
+            raise UpdateError(alive, started=True) from e
+        if not stopped:
+            raise UpdateError(alive, started=True)
         raise _roll_back(target, aside, resume_poller, "the new version did not start", started=True)
     finally:
         _discard(confirm)  # it may appear late, after a timeout
