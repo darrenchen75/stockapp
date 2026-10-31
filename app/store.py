@@ -104,18 +104,22 @@ class Store:
     def summary(self) -> dict[str, Summary]:
         """Each symbol's latest session vs. its own previous close (primary-key lookups)."""
         out = {}
-        for s, ts in self.latest_all().items():
-            start = day_start(ts)
-            last = self.db.execute(
-                "SELECT c FROM bars WHERE symbol = ? AND ts = ?", (s, ts)
-            ).fetchone()[0]
-            prev = self.db.execute(
-                "SELECT c FROM bars WHERE symbol = ? AND ts < ? ORDER BY ts DESC LIMIT 1", (s, start)
-            ).fetchone()
-            volume = self.db.execute(
-                "SELECT SUM(v) FROM bars WHERE symbol = ? AND ts >= ?", (s, start)
-            ).fetchone()[0]
-            out[s] = Summary(last, prev[0] if prev else None, volume)
+        self.db.execute("BEGIN")  # one snapshot, so a split repair committing mid-read can't pull rows away
+        try:
+            for s, ts in self.latest_all().items():
+                start = day_start(ts)
+                last = self.db.execute(
+                    "SELECT c FROM bars WHERE symbol = ? AND ts = ?", (s, ts)
+                ).fetchone()[0]
+                prev = self.db.execute(
+                    "SELECT c FROM bars WHERE symbol = ? AND ts < ? ORDER BY ts DESC LIMIT 1", (s, start)
+                ).fetchone()
+                volume = self.db.execute(
+                    "SELECT SUM(v) FROM bars WHERE symbol = ? AND ts >= ?", (s, start)
+                ).fetchone()[0]
+                out[s] = Summary(last, prev[0] if prev else None, volume)
+        finally:
+            self.db.commit()
         return out
 
     def gaps(self, symbols: Iterable[str], days: int = 30, now: float | None = None) -> dict[str, int]:

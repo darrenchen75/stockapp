@@ -98,6 +98,23 @@ def test_summary_is_per_symbol_when_one_is_stale(tmp_path):
     assert s.session_start("MSFT") == ts(2026, 10, 15, 0, 0)
 
 
+def test_summary_reads_one_snapshot_while_history_is_replaced(tmp_path):
+    # The poller's split repair commits on its own connection between summary()'s queries.
+    s, writer = store(tmp_path), store(tmp_path)
+    s.upsert([bar("AAPL", ts(2026, 10, 16, 15, 59), c=100.0)])
+    latest_all = s.latest_all
+
+    def racing():
+        out = latest_all()
+        writer.replace("AAPL", [bar("AAPL", ts(2026, 10, 16, 15, 58), c=50.0)], None)
+        return out
+
+    s.latest_all = racing
+    assert s.summary()["AAPL"].last == 100.0  # pre-repair snapshot, not a crash on the vanished minute
+    s.latest_all = latest_all
+    assert s.summary()["AAPL"].last == 50.0
+
+
 def test_replace_swaps_all_rows_and_records_split(tmp_path):
     s = store(tmp_path)
     s.upsert([bar("AAPL", 60, c=100.0), bar("AAPL", 120, c=100.0), bar("MSFT", 60)])

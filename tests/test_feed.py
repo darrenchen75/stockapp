@@ -231,9 +231,12 @@ def test_repair_splits_refetches_again_after_ex_date(tmp_path):
     store = Store(str(tmp_path / "bars.db"))
     client = FakeClient({"AAPL": [fake_bar(NOW - timedelta(minutes=1), c=50.0)]})
     actions = FakeActions([("AAPL", NOW.date())])
-    assert feed.repair_splits(client, actions, store, ["AAPL"], now=NOW) == 0
+    assert feed.repair_splits(client, actions, store, ["AAPL"], now=NOW) == 1  # pending: retry hourly today
     assert store.bars("AAPL", 0)[0].c == 50.0
     assert store.handled_splits() == set()
+    client.data["AAPL"] = [fake_bar(NOW - timedelta(minutes=1), c=25.0)]  # Alpaca adjusts later that day
+    assert feed.repair_splits(client, actions, store, ["AAPL"], now=NOW + timedelta(hours=1)) == 1
+    assert store.bars("AAPL", 0)[0].c == 25.0
     feed.repair_splits(client, actions, store, ["AAPL"], now=NOW + timedelta(days=1))
     assert store.handled_splits() == {("AAPL", NOW.date().isoformat())}
 

@@ -101,7 +101,7 @@ def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.s
     """Refetch 30 split-adjusted days for each symbol with an unhandled split in the last 30 days.
     The window is rolling so splits Alpaca posts late still get caught. A split is marked handled
     only after its ex-date, since Alpaca may not have adjusted history yet on the day itself.
-    Returns how many splits are still pending because their refetch came back empty."""
+    Returns how many splits are still pending: empty refetch, or ex-date is today."""
     now = now or datetime.now(timezone.utc)
     today = now.astimezone(ET).date()
     data = actions.get_corporate_actions(CorporateActionsRequest(
@@ -116,7 +116,9 @@ def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.s
             log.warning("split refetch for %s came back empty; retrying in an hour", symbol)
             pending += 1
             continue
-        store.replace(symbol, bars, ex_date if ex_date < today.isoformat() else None)
+        confirmed = ex_date < today.isoformat()
+        store.replace(symbol, bars, ex_date if confirmed else None)
+        pending += not confirmed  # on the ex-date itself, retry hourly until Alpaca has adjusted history
         log.info("repaired %s for split on %s", symbol, ex_date)
     return pending
 
