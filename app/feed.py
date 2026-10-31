@@ -99,7 +99,9 @@ def backfill(client, store: Store, symbols, include_empty=True, now=None,
 
 def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.sleep) -> int:
     """Refetch 30 split-adjusted days for each symbol with an unhandled split in the last 30 days.
-    The window is rolling so splits Alpaca posts late still get caught. Returns symbols repaired."""
+    The window is rolling so splits Alpaca posts late still get caught. A split is marked handled
+    only after its ex-date, since Alpaca may not have adjusted history yet on the day itself.
+    Returns how many splits are still pending because their refetch came back empty."""
     now = now or datetime.now(timezone.utc)
     today = now.astimezone(ET).date()
     data = actions.get_corporate_actions(CorporateActionsRequest(
@@ -107,16 +109,16 @@ def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.s
         types=[CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT],
     )).data
     found = {(a.symbol, a.ex_date.isoformat()) for actions_ in data.values() for a in actions_}
-    repaired = 0
+    pending = 0
     for symbol, ex_date in sorted(found - store.handled_splits()):
         bars = fetch(client, [symbol], now - timedelta(days=DAYS), now, sleep)
         if not bars:
-            log.warning("split refetch for %s came back empty; retrying tomorrow", symbol)
+            log.warning("split refetch for %s came back empty; retrying in an hour", symbol)
+            pending += 1
             continue
-        store.replace(symbol, bars, ex_date)
+        store.replace(symbol, bars, ex_date if ex_date < today.isoformat() else None)
         log.info("repaired %s for split on %s", symbol, ex_date)
-        repaired += 1
-    return repaired
+    return pending
 
 
 class Poller:
@@ -138,7 +140,7 @@ class Poller:
 
     def run(self):
         store = Store(self.db_path)  # own connection: sqlite3 connections stay on their thread
-        first, pruned, split_day = True, 0.0, None
+        first, pruned, next_split_check = True, 0.0, 0.0
         while not self.stop.is_set():
             try:
                 backfill(self.client, store, self.symbols, include_empty=first,
@@ -156,12 +158,15 @@ class Poller:
             if time.time() - pruned > 86400:  # keep the cache a rolling 30 days while the app stays open
                 store.prune(DAYS)
                 pruned = time.time()
-            today = datetime.now(ET).date()
-            if self.actions and today != split_day:  # once per New York day
-                split_day = today  # set before the check: a failure retries tomorrow, not every poll
+            if self.actions and time.time() >= next_split_check:
                 try:
-                    repair_splits(self.client, self.actions, store, self.symbols)
+                    pending = repair_splits(self.client, self.actions, store, self.symbols)
                 except Exception:
                     log.exception("split check failed")
+                    pending = 1
+                # Next New York midnight; within the hour if something failed, so mixed prices don't linger.
+                tomorrow = datetime.now(ET).date() + timedelta(days=1)
+                next_split_check = (time.time() + 3600 if pending
+                                    else datetime.combine(tomorrow, datetime.min.time(), ET).timestamp())
             self.on_updated()
             self.stop.wait(self.poll_seconds)

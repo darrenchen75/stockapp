@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
 
         self.model = QStandardItemModel(0, len(COLUMNS))
         self.model.setHorizontalHeaderLabels(COLUMNS)
-        self.model.setHeaderData(4, Qt.Horizontal, "Trading days with no bars in the last 30 days", Qt.ToolTipRole)
+        self.model.setHeaderData(COLUMNS.index("Gaps"), Qt.Horizontal, "Trading days with no bars in the last 30 days", Qt.ToolTipRole)
         for s in symbols:
             self.model.appendRow([QStandardItem(s)] + [QStandardItem() for _ in COLUMNS[1:]])
         self.rows = {s: i for i, s in enumerate(symbols)}

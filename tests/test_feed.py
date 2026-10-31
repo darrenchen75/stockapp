@@ -208,8 +208,8 @@ def test_repair_splits_refetches_once(tmp_path):
     t = NOW - timedelta(minutes=1)
     store.upsert([Bar("AAPL", int(t.timestamp()), 100, 100, 100, 100, 1)])
     client = FakeClient({"AAPL": [fake_bar(t, c=50.0)]})
-    actions = FakeActions([("AAPL", NOW.date())])
-    assert feed.repair_splits(client, actions, store, ["AAPL"], now=NOW) == 1
+    actions = FakeActions([("AAPL", NOW.date() - timedelta(days=1))])
+    assert feed.repair_splits(client, actions, store, ["AAPL"], now=NOW) == 0  # nothing pending
     assert store.bars("AAPL", 0)[0].c == 50.0
     assert utc(client.requests[0].start) == FLOOR
 
@@ -221,9 +221,21 @@ def test_repair_splits_keeps_cache_on_empty_refetch(tmp_path):
     store = Store(str(tmp_path / "bars.db"))
     store.upsert([Bar("AAPL", NOW_TS - 60, 100, 100, 100, 100, 1)])
     actions = FakeActions([("AAPL", NOW.date())])
-    assert feed.repair_splits(FakeClient(), actions, store, ["AAPL"], now=NOW) == 0
+    assert feed.repair_splits(FakeClient(), actions, store, ["AAPL"], now=NOW) == 1
     assert store.bars("AAPL", 0)[0].c == 100
     assert store.handled_splits() == set()  # still pending
+
+
+def test_repair_splits_refetches_again_after_ex_date(tmp_path):
+    # On the ex-date Alpaca may not have adjusted history yet: repair now, confirm tomorrow.
+    store = Store(str(tmp_path / "bars.db"))
+    client = FakeClient({"AAPL": [fake_bar(NOW - timedelta(minutes=1), c=50.0)]})
+    actions = FakeActions([("AAPL", NOW.date())])
+    assert feed.repair_splits(client, actions, store, ["AAPL"], now=NOW) == 0
+    assert store.bars("AAPL", 0)[0].c == 50.0
+    assert store.handled_splits() == set()
+    feed.repair_splits(client, actions, store, ["AAPL"], now=NOW + timedelta(days=1))
+    assert store.handled_splits() == {("AAPL", NOW.date().isoformat())}
 
 
 def test_poller_survives_failed_split_check(tmp_path):

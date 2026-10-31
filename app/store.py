@@ -62,16 +62,17 @@ class Store:
                 [(b.symbol, b.ts, b.o, b.h, b.l, b.c, b.v) for b in bars],
             )
 
-    def replace(self, symbol: str, bars: Iterable[Bar], ex_date: str) -> None:
-        """Swap all of `symbol`'s rows for split-adjusted `bars` and mark the split handled, atomically.
-        Deleting first means no raw-priced minute survives next to adjusted ones."""
+    def replace(self, symbol: str, bars: Iterable[Bar], ex_date: str | None) -> None:
+        """Swap all of `symbol`'s rows for split-adjusted `bars` and mark the split handled (unless
+        `ex_date` is None), atomically. Deleting first means no raw-priced minute survives."""
         with self.db:
             self.db.execute("DELETE FROM bars WHERE symbol = ?", (symbol,))
             self.db.executemany(
                 "INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?)",
                 [(b.symbol, b.ts, b.o, b.h, b.l, b.c, b.v) for b in bars],
             )
-            self.db.execute("INSERT OR IGNORE INTO splits VALUES (?,?)", (symbol, ex_date))
+            if ex_date:
+                self.db.execute("INSERT OR IGNORE INTO splits VALUES (?,?)", (symbol, ex_date))
 
     def handled_splits(self) -> set[tuple[str, str]]:
         return set(self.db.execute("SELECT symbol, ex_date FROM splits"))
@@ -120,12 +121,13 @@ class Store:
     def gaps(self, symbols: Iterable[str], days: int = 30, now: float | None = None) -> dict[str, int]:
         """Trading days (days any symbol has bars) on which each symbol has none: fetch holes, halts,
         stale feeds. Counted by day, not minute, because IEX-only data has many empty minutes.
-        The oldest day is skipped since prune cuts it mid-day. Symbols with no rows are left out."""
+        The oldest day is skipped since prune cuts it mid-day, and today since sparse symbols may
+        not have traded yet. Symbols with no rows are left out."""
         today = datetime.fromtimestamp(time.time() if now is None else now, ET).date()
         starts = [int(datetime.combine(today - timedelta(days=i), clock(), ET).timestamp())
-                  for i in range(days, -2, -1)]  # one past today closes the last range
+                  for i in range(days, -1, -1)]  # today's midnight closes yesterday's range
         have = {s: {a for a, b in zip(starts, starts[1:]) if self.db.execute(
             "SELECT 1 FROM bars WHERE symbol = ? AND ts >= ? AND ts < ? LIMIT 1", (s, a, b)
         ).fetchone()} for s in symbols}  # primary-key probes: ~0.1s for 500 symbols, vs ~1s for a scan
-        sessions = sorted(set().union(*have.values()))[1:]
-        return {s: len(set(sessions) - got) for s, got in have.items() if got}
+        sessions = set(sorted(set().union(*have.values()))[1:])
+        return {s: len(sessions - got) for s, got in have.items() if got}
