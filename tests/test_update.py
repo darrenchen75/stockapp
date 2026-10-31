@@ -3,6 +3,9 @@ import http.client
 import io
 import json
 import os
+import subprocess
+import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -306,3 +309,107 @@ def test_restore_bundle_keeps_target_when_replace_fails(tmp_path, monkeypatch):
         update.restore(t, aside)
     assert (t / "marker").read_bytes() == b"new" and (aside / "marker").read_bytes() == b"old"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["StockBars.app", "StockBars.old.app"]
+
+
+def test_confirm_writes_only_the_named_file(tmp_path):
+    update.confirm_from_argv(["app"])
+    assert list(tmp_path.iterdir()) == []
+    ok = tmp_path / "update-ab.ok"
+    update.confirm_from_argv(["app", update.CONFIRM_FLAG, str(ok)])
+    assert [p.name for p in tmp_path.iterdir()] == ["update-ab.ok"]
+    update.confirm_from_argv([update.CONFIRM_FLAG, str(tmp_path / "no" / "x.ok")])  # OSError ignored
+
+
+def test_new_confirm_path_is_unique_and_absent(tmp_path):
+    a, b = update.new_confirm_path(tmp_path), update.new_confirm_path(tmp_path)
+    assert a != b and a.parent == tmp_path and not a.exists()
+    assert a.name.startswith("update-") and a.suffix == ".ok"
+
+
+def test_wait_confirmed_true_when_file_appears(tmp_path):
+    ok, calls = tmp_path / "update-a.ok", []
+
+    def sleep(s):
+        calls.append(s)
+        if len(calls) == 2:
+            ok.write_text("")
+
+    assert update.wait_confirmed(ok, sleep=sleep) is True
+    assert len(calls) == 2
+
+
+def test_wait_confirmed_times_out(tmp_path):
+    t, calls = [0.0], []
+
+    def sleep(s):
+        calls.append(s)
+        t[0] += 1
+
+    assert update.wait_confirmed(tmp_path / "update-a.ok", poll=1, sleep=sleep, clock=lambda: t[0]) is False
+    assert len(calls) == 30
+
+
+def test_wait_ignores_other_files(tmp_path):
+    (tmp_path / "update-other.ok").write_text("")
+    t = [0.0]
+
+    def sleep(s):
+        t[0] += 10
+
+    assert update.wait_confirmed(tmp_path / "update-a.ok", sleep=sleep, clock=lambda: t[0]) is False
+
+
+def test_clean_confirmations_keeps_fresh_files(tmp_path):
+    old, new, other = tmp_path / "update-old.ok", tmp_path / "update-new.ok", tmp_path / "keep.txt"
+    for p in (old, new, other):
+        p.write_text("")
+    now = 1_000_000.0
+    os.utime(old, (now - 120, now - 120))
+    os.utime(new, (now - 10, now - 10))
+    os.utime(other, (now - 120, now - 120))
+    update.clean_confirmations(tmp_path, now=now)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["keep.txt", "update-new.ok"]
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
+def test_launch_command(tmp_path, monkeypatch, platform):
+    seen = {}
+
+    def popen(cmd, **kw):
+        seen.update(cmd=cmd, **kw)
+        return "proc"
+
+    monkeypatch.setattr(update.subprocess, "Popen", popen)
+    ok = tmp_path / "update-a.ok"
+    assert update.launch(tmp_path / "StockBars", platform, ok) == "proc"
+    exe = tmp_path / "StockBars" / "Contents/MacOS/StockBars" if platform == "darwin" else tmp_path / "StockBars"
+    assert seen["cmd"] == [str(exe), "--confirm-update", str(ok)]
+    assert seen.get("start_new_session", False) is (platform != "win32")
+    assert (seen.get("env") or {}).get("PYINSTALLER_RESET_ENVIRONMENT") == ("1" if platform == "win32" else None)
+
+
+def test_launch_failure_is_update_error(tmp_path):
+    f = tmp_path / "StockBars"
+    f.write_text("x")
+    with pytest.raises(update.UpdateError):
+        update.launch(f, "linux", tmp_path / "a.ok")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="posix process groups")
+def test_stop_process_kills_tree(tmp_path):
+    pidfile = tmp_path / "pid"
+    proc = subprocess.Popen(["sh", "-c", f"sleep 60 & echo $! > {pidfile}; wait"], start_new_session=True)
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        time.sleep(0.05)
+    grand = int(pidfile.read_text())
+    os.kill(grand, 0)
+    assert update.stop_process(proc, "linux") is True
+    for _ in range(100):
+        try:
+            os.kill(grand, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    pytest.fail("grandchild survived")

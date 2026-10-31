@@ -4,10 +4,13 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 from collections.abc import Mapping
@@ -23,6 +26,7 @@ ASSETS = {
     "win32": "StockBars-windows.zip",
     "darwin": "StockBars-macos.zip",
 }
+CONFIRM_FLAG = "--confirm-update"
 
 
 class UpdateError(Exception):
@@ -183,3 +187,61 @@ def cleanup(target: Path | None, platform: str) -> None:
         _rm(aside_path(target, platform))
     except OSError as e:
         log.debug("could not remove old copy: %s", e)
+
+
+def new_confirm_path(data_dir: Path) -> Path:
+    return data_dir / f"update-{secrets.token_hex(8)}.ok"
+
+
+def launch(target: Path, platform: str, confirm: Path) -> subprocess.Popen:
+    exe = target / "Contents/MacOS/StockBars" if platform == "darwin" else target
+    kw = {"env": {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}} if platform == "win32" else {"start_new_session": True}
+    try:
+        return subprocess.Popen([str(exe), CONFIRM_FLAG, str(confirm)], **kw)
+    except OSError as e:
+        raise UpdateError(str(e)) from e
+
+
+def stop_process(proc: subprocess.Popen, platform: str, timeout: float = 5) -> bool:
+    try:
+        if platform == "win32":  # the onefile bootloader's child survives a plain terminate
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=timeout)
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)  # child leads its own session, so pgid == pid
+                proc.wait(timeout)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout)
+    except ProcessLookupError:
+        proc.wait(timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def confirm_from_argv(argv: list[str]) -> None:
+    if CONFIRM_FLAG in argv and argv.index(CONFIRM_FLAG) + 1 < len(argv):
+        try:
+            Path(argv[argv.index(CONFIRM_FLAG) + 1]).touch()
+        except OSError as e:
+            log.debug("could not write confirmation: %s", e)
+
+
+def wait_confirmed(path: Path, timeout: float = 30, poll: float = 0.2, sleep=time.sleep, clock=time.monotonic) -> bool:
+    deadline = clock() + timeout
+    while not path.exists():
+        if clock() >= deadline:
+            return False
+        sleep(poll)
+    return True
+
+
+def clean_confirmations(data_dir: Path, now: float | None = None, max_age: float = 60) -> None:
+    now = time.time() if now is None else now
+    for p in data_dir.glob("update-*.ok"):
+        try:
+            if now - p.stat().st_mtime > max_age:
+                p.unlink()
+        except OSError:
+            pass
