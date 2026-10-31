@@ -311,7 +311,8 @@ def test_restore_bundle_keeps_target_when_replace_fails(tmp_path, monkeypatch):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["StockBars.app", "StockBars.old.app"]
 
 
-def test_confirm_writes_only_the_named_file(tmp_path):
+def test_confirm_writes_only_the_named_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     update.confirm_from_argv(["app"])
     assert list(tmp_path.iterdir()) == []
     ok = tmp_path / "update-ab.ok"
@@ -413,3 +414,25 @@ def test_stop_process_kills_tree(tmp_path):
             return
         time.sleep(0.05)
     pytest.fail("grandchild survived")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="posix process groups")
+def test_stop_process_kills_term_ignoring_descendant(tmp_path):
+    pidfile = tmp_path / "pid"
+    script = f"sh -c \"trap '' TERM; sleep 60\" & echo $! > {pidfile}; exit 0"
+    proc = subprocess.Popen(["sh", "-c", script], start_new_session=True)
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        time.sleep(0.05)
+    grand = int(pidfile.read_text())
+    proc.wait()  # leader already gone; only the TERM-ignoring descendant remains
+    os.kill(grand, 0)
+    assert update.stop_process(proc, "linux", timeout=1) is True
+    for _ in range(100):
+        try:
+            os.kill(grand, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    pytest.fail("descendant survived")

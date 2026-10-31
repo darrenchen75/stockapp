@@ -202,22 +202,36 @@ def launch(target: Path, platform: str, confirm: Path) -> subprocess.Popen:
         raise UpdateError(str(e)) from e
 
 
+def _group_gone(proc: subprocess.Popen, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        proc.poll()  # reap the leader: a zombie keeps its group alive
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def stop_process(proc: subprocess.Popen, platform: str, timeout: float = 5) -> bool:
-    try:
-        if platform == "win32":  # the onefile bootloader's child survives a plain terminate
+    if platform == "win32":  # the onefile bootloader's child survives a plain terminate
+        try:
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=timeout)
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)  # child leads its own session, so pgid == pid
-                proc.wait(timeout)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout)
-    except ProcessLookupError:
-        proc.wait(timeout)
-    except subprocess.TimeoutExpired:
-        return False
-    return True
+            proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+    # child leads its own session, so pgid == pid; a descendant may outlive the leader
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        if _group_gone(proc, timeout):
+            return True
+    return False
 
 
 def confirm_from_argv(argv: list[str]) -> None:
