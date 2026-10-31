@@ -6,9 +6,9 @@ from pathlib import Path
 from platformdirs import user_data_dir, user_log_dir
 from PySide6.QtWidgets import QApplication
 
-from app import settings
+from app import settings, update
 from app.feed import load_symbols
-from app.ui import MainWindow
+from app.ui import MainWindow, clean_after_update
 
 APP = "stockapp"
 
@@ -25,6 +25,9 @@ def main() -> int:
     data_dir.mkdir(parents=True, exist_ok=True)
 
     app = QApplication(sys.argv)
+    # Confirm first: a slow or missing keychain must not run out the old copy's timeout.
+    update.confirm_from_argv(sys.argv)
+    clean_after_update(data_dir)
     keys = settings.load_keys()
     if keys is None:
         keys = settings.ask_keys()
@@ -32,7 +35,7 @@ def main() -> int:
             return 0
         settings.remember(None, keys)
 
-    window = MainWindow(str(data_dir / "bars.db"), load_symbols(), keys)
+    window = MainWindow(str(data_dir / "bars.db"), load_symbols(), keys, data_dir)
     window.resize(1200, 700)
     window.show()
     return app.exec()

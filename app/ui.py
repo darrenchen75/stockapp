@@ -1,22 +1,46 @@
+import logging
+import os
+import sys
+import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 import pyqtgraph as pg
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
-from PySide6.QtCore import QPointF, QRectF, QSortFilterProxyModel, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPicture, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QHBoxLayout, QMainWindow,
-                               QPushButton, QSplitter, QTableView, QVBoxLayout, QWidget)
+from PySide6.QtCore import QLockFile, QPointF, QRectF, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPicture, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QHBoxLayout, QMainWindow,
+                               QMessageBox, QProgressDialog, QPushButton, QSplitter, QTableView,
+                               QVBoxLayout, QWidget)
 
-from app import settings
+from app import settings, update
 from app.feed import Poller
 from app.store import ET, Bar, Store
+from app.version import VERSION
+
+log = logging.getLogger(__name__)
 
 COLUMNS = ["Symbol", "Last", "% Chg", "Volume", "Gaps"]
 RANGES = {"1D": None, "5D": 5, "30D": 30}  # None = since the start of the latest session
 UP, DOWN = QColor("#26a69a"), QColor("#ef5350")
 LIVE_SECONDS = 300
+
+
+def update_lock(data_dir: Path) -> QLockFile:
+    return QLockFile(str(data_dir / "update.lock"))
+
+
+def clean_after_update(data_dir: Path):
+    lock = update_lock(data_dir)
+    if not lock.tryLock(0):  # an update is running; the old copy and its files are still in use
+        return
+    try:
+        update.clean_confirmations(data_dir)
+        update.cleanup(update.target(sys.platform, sys.executable, os.environ), sys.platform)
+    finally:
+        lock.unlock()
 
 
 class Candles(pg.GraphicsObject):
@@ -51,11 +75,21 @@ class MainWindow(QMainWindow):
     polled = Signal()
     status_changed = Signal(str)
     key_rejected = Signal()
+    # Update worker threads emit these.
+    update_found = Signal(object)
+    update_launched = Signal()
+    update_done = Signal(object)
+    poller_resume = Signal()
+    poller_joined = Signal()
 
-    def __init__(self, db_path: str, symbols: list[str], keys: tuple[str, str]):
+    def __init__(self, db_path: str, symbols: list[str], keys: tuple[str, str], data_dir: Path):
         super().__init__()
         self.setWindowTitle("Stock Bars")
-        self.db_path, self.symbols = db_path, symbols
+        self.db_path, self.symbols, self.keys, self.data_dir = db_path, symbols, keys, data_dir
+        self.declined: set[str] = set()
+        self.lock = update_lock(data_dir)
+        self.progress: QProgressDialog | None = None
+        self.resume_requested = False
         self.store = Store(db_path)
         self.symbol: str | None = None
         self.range = "1D"
@@ -105,8 +139,21 @@ class MainWindow(QMainWindow):
         self.polled.connect(self.refresh)
         self.status_changed.connect(self.statusBar().showMessage)
         self.key_rejected.connect(self.on_auth_failed)
+        self.update_found.connect(self.offer_update)
+        self.update_launched.connect(self.on_update_launched)
+        self.update_done.connect(self.on_update_done)
+        self.poller_resume.connect(self.on_poller_resume)
+        self.poller_joined.connect(self.restart_poller)
         self.refresh()
         self.start_poller(keys)
+
+        # A freshly updated copy starts while the old one still holds the lock.
+        QTimer.singleShot(60_000, self.clean_after_update)
+        if VERSION != "dev":
+            self.update_timer = QTimer(self, interval=24 * 3600 * 1000)
+            self.update_timer.timeout.connect(self.check_for_update)
+            self.update_timer.start()
+            self.check_for_update()
 
     def start_poller(self, keys: tuple[str, str]):
         self.poller = Poller(StockHistoricalDataClient(*keys), self.db_path, self.symbols,
@@ -124,7 +171,95 @@ class MainWindow(QMainWindow):
             self.close()
             return
         settings.remember(self, keys)
+        self.keys = keys
         self.start_poller(keys)
+
+    def clean_after_update(self):
+        clean_after_update(self.data_dir)
+
+    def check_for_update(self):
+        threading.Thread(target=self.find_update, daemon=True).start()
+
+    def find_update(self):
+        release = update.latest(VERSION)
+        if release is not None:
+            self.update_found.emit(release)
+
+    def offer_update(self, release: update.Release):
+        if release.version in self.declined or not self.lock.tryLock(0):
+            return
+        box = QMessageBox(QMessageBox.Question, "Stock Bars",
+                          f"Stock Bars {release.version} is available (you have {VERSION}). Update now?", parent=self)
+        yes = box.addButton("Update", QMessageBox.AcceptRole)
+        box.addButton("Later", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not yes:
+            self.declined.add(release.version)
+            self.lock.unlock()
+            return
+        target = update.target(sys.platform, sys.executable, os.environ)
+        if target is None:
+            self.lock.unlock()
+            self.show_update_failed("Couldn't update automatically.")
+            return
+        self.progress = QProgressDialog("Updating Stock Bars…", None, 0, 0, self)
+        self.progress.setWindowModality(Qt.WindowModal)
+        self.progress.setMinimumDuration(0)
+        self.progress.show()
+        self.resume_requested = False
+        threading.Thread(target=self.run_update, args=(release, target, self.poller.halt), daemon=True).start()
+
+    def run_update(self, release, target, halt_poller):
+        try:
+            update.apply(release, target, sys.platform, self.data_dir, halt_poller=halt_poller,
+                         resume_poller=self.poller_resume.emit, on_launched=self.update_launched.emit)
+        except Exception as e:  # anything, so the slot still unlocks and shows the window
+            self.update_done.emit(e)
+        else:
+            self.update_done.emit(None)
+
+    def on_update_launched(self):
+        self.progress.hide()  # hide, not close: closing the last visible window quits the app
+        self.hide()
+
+    def on_update_done(self, error: Exception | None):
+        self.lock.unlock()
+        if error is None:
+            QApplication.quit()
+            return
+        log.warning("update failed: %s", error)
+        self.show()
+        self.progress.hide()
+        started = getattr(error, "started", False)
+        # poller_resume is queued before update_done, so its slot has already run.
+        if started and not self.resume_requested:  # the new copy is still running: a second poller would share bars.db
+            self.statusBar().showMessage("Paused for update")
+            self.show_update_failed("Couldn't update automatically.", str(error))
+        elif started:
+            self.show_update_failed(f"The update didn't start, so you're still on {VERSION}.")
+        else:
+            self.show_update_failed("Couldn't update automatically.")
+
+    def show_update_failed(self, text: str, detail: str = ""):
+        box = QMessageBox(QMessageBox.Warning, "Stock Bars", text, parent=self)
+        box.setInformativeText(detail)
+        page = box.addButton("Open download page", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Close)
+        box.exec()
+        if box.clickedButton() is page:
+            QDesktopServices.openUrl(QUrl(update.RELEASES_PAGE))
+
+    def on_poller_resume(self):
+        self.resume_requested = True
+        threading.Thread(target=self.join_poller, args=(self.poller.thread,), daemon=True).start()
+
+    def join_poller(self, thread: threading.Thread | None):
+        if thread:
+            thread.join()  # halt may have timed out mid-batch; never run two pollers on bars.db
+        self.poller_joined.emit()
+
+    def restart_poller(self):
+        self.start_poller(self.keys)
 
     def refresh(self):
         summaries, gaps = self.store.summary(), self.store.gaps(self.symbols)
