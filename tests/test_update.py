@@ -1,4 +1,11 @@
+import hashlib
+import io
 import json
+import os
+import zipfile
+from pathlib import Path
+
+import pytest
 
 from app import update
 
@@ -67,3 +74,76 @@ def test_latest_ignores_asset_without_digest():
 
 def test_latest_returns_none_on_network_error():
     assert update.latest("0.1.2", "linux", opener=fake(exc=OSError("down"))) is None
+
+
+def fake_bytes(data):
+    def opener(req, timeout=None):
+        return io.BytesIO(data)
+
+    return opener
+
+
+def rel(data):
+    return update.Release("0.1.3", "https://x/a", hashlib.sha256(data).hexdigest())
+
+
+def test_download_writes_verified_file(tmp_path):
+    update.download(rel(b"hello"), tmp_path / "f", opener=fake_bytes(b"hello"))
+    assert (tmp_path / "f").read_bytes() == b"hello"
+
+
+def test_download_rejects_digest_mismatch(tmp_path):
+    with pytest.raises(update.UpdateError):
+        update.download(update.Release("0.1.3", "https://x/a", "00" * 32), tmp_path / "f", opener=fake_bytes(b"x"))
+    assert not (tmp_path / "f").exists()
+
+
+def test_download_rejects_empty_digest(tmp_path):
+    with pytest.raises(update.UpdateError):
+        update.download(update.Release("0.1.3", "https://x/a", ""), tmp_path / "f", opener=fake_bytes(b""))
+
+
+def test_target_per_platform():
+    assert update.target("linux", "/x", {"APPIMAGE": "/a/B.AppImage"}) == Path("/a/B.AppImage")
+    assert update.target("linux", "/x", {}) is None
+    assert update.target("darwin", "/A/StockBars.app/Contents/MacOS/StockBars", {}) == Path("/A/StockBars.app")
+    assert update.target("win32", "C:/S/StockBars.exe", {}, frozen=True) == Path("C:/S/StockBars.exe")
+    assert update.target("win32", "C:/S/StockBars.exe", {}, frozen=False) is None
+
+
+def test_prepare_linux_is_executable(tmp_path):
+    t = tmp_path / "B.AppImage"
+    out = update.prepare(rel(b"elf"), t, "linux", opener=fake_bytes(b"elf"))
+    assert out.stat().st_mode & 0o111
+    assert out.parent == t.parent
+    assert out.read_bytes() == b"elf"
+
+
+def test_prepare_windows_extracts_exe(tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("StockBars.exe", b"MZ")
+    data = buf.getvalue()
+    out = update.prepare(rel(data), tmp_path / "StockBars.exe", "win32", opener=fake_bytes(data))
+    assert out == tmp_path / "StockBars.new.exe"
+    assert out.read_bytes() == b"MZ"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["StockBars.new.exe"]
+
+
+def test_prepare_windows_bad_zip_cleans_up(tmp_path):
+    with pytest.raises(update.UpdateError):
+        update.prepare(rel(b"nope"), tmp_path / "StockBars.exe", "win32", opener=fake_bytes(b"nope"))
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+def test_prepare_fails_cleanly_on_readonly_dir(tmp_path):
+    d = tmp_path / "ro"
+    d.mkdir()
+    d.chmod(0o555)
+    try:
+        with pytest.raises(update.UpdateError):
+            update.prepare(rel(b"x"), d / "B.AppImage", "linux", opener=fake_bytes(b"x"))
+        assert list(d.iterdir()) == []
+    finally:
+        d.chmod(0o755)
