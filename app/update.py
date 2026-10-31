@@ -13,7 +13,7 @@ import tempfile
 import time
 import urllib.request
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,7 +30,9 @@ CONFIRM_FLAG = "--confirm-update"
 
 
 class UpdateError(Exception):
-    pass
+    def __init__(self, *args, started: bool = False):
+        super().__init__(*args)
+        self.started = started  # the new copy launched but never confirmed
 
 
 @dataclass(frozen=True)
@@ -259,3 +261,50 @@ def clean_confirmations(data_dir: Path, now: float | None = None, max_age: float
                 p.unlink()
         except OSError:
             pass
+
+
+def _discard(p: Path) -> None:
+    try:
+        _rm(p)
+    except OSError as e:
+        log.warning("could not remove %s: %s", p, e)
+
+
+def _roll_back(target: Path, aside: Path, resume_poller: Callable[[], None], why: str, started: bool) -> UpdateError:
+    try:
+        restore(target, aside)
+    except (UpdateError, OSError) as e:
+        why = f"{why}; could not put the previous version back ({e}); it is at {aside}"
+    finally:
+        resume_poller()
+    return UpdateError(why, started=started)
+
+
+def apply(release: Release, target: Path, platform: str, data_dir: Path,
+          halt_poller: Callable[[], bool], resume_poller: Callable[[], None], on_launched: Callable[[], None],
+          opener=urllib.request.urlopen, timeout: float = 30) -> None:
+    new = prepare(release, target, platform, opener)
+    if not halt_poller():
+        _discard(new)
+        resume_poller()
+        raise UpdateError("the app could not pause to update")
+    try:
+        aside = swap(target, new, platform)
+    except UpdateError:
+        _discard(new)
+        resume_poller()
+        raise
+    confirm = new_confirm_path(data_dir)
+    try:
+        try:
+            proc = launch(target, platform, confirm)
+        except UpdateError as e:
+            raise _roll_back(target, aside, resume_poller, str(e), started=False) from e
+        on_launched()
+        if wait_confirmed(confirm, timeout):
+            return  # aside stays for the new copy's cleanup
+        if not stop_process(proc, platform):
+            raise UpdateError(f"the new version did not confirm and is still running; the previous version is at {aside}", started=True)
+        raise _roll_back(target, aside, resume_poller, "the new version did not start", started=True)
+    finally:
+        _discard(confirm)  # it may appear late, after a timeout

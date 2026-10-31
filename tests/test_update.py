@@ -436,3 +436,128 @@ def test_stop_process_kills_term_ignoring_descendant(tmp_path):
             return
         time.sleep(0.05)
     pytest.fail("descendant survived")
+
+
+def setup_apply(tmp_path, monkeypatch, *, halt=True, launch_exc=None, confirmed=True, stopped=True):
+    t = tmp_path / "B.AppImage"
+    t.write_bytes(b"old")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    calls, seen = [], {}
+
+    def fake_launch(target, platform, confirm):
+        calls.append("launch")
+        seen["confirm"] = confirm
+        if launch_exc:
+            raise launch_exc
+        if confirmed:
+            confirm.touch()
+        return "proc"
+
+    def fake_stop(proc, platform):
+        calls.append("stop")
+        seen["confirm"].touch()  # the new copy confirms too late
+        return stopped
+
+    monkeypatch.setattr(update, "launch", fake_launch)
+    monkeypatch.setattr(update, "wait_confirmed", lambda p, timeout=30: p.exists())
+    monkeypatch.setattr(update, "stop_process", fake_stop)
+
+    def go(data=b"new"):
+        update.apply(
+            rel(data), t, "linux", data_dir,
+            halt_poller=lambda: calls.append("halt") or halt,
+            resume_poller=lambda: calls.append("resume"),
+            on_launched=lambda: calls.append("launched"),
+            opener=fake_bytes(b"new"),
+        )
+
+    return t, data_dir, calls, go
+
+
+def test_apply_confirmed(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch)
+    go()
+    assert t.read_bytes() == b"new"
+    assert update.aside_path(t, "linux").read_bytes() == b"old"
+    assert calls == ["halt", "launch", "launched"]
+    assert list(data_dir.iterdir()) == []
+
+
+def test_apply_rolls_back_when_launch_raises(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, launch_exc=update.UpdateError("no exec"))
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert e.value.started is False
+    assert t.read_bytes() == b"old"
+    assert calls == ["halt", "launch", "resume"]
+
+
+def test_apply_rolls_back_on_timeout(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, confirmed=False)
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert e.value.started is True
+    assert t.read_bytes() == b"old"
+    assert not update.aside_path(t, "linux").exists()
+    assert calls == ["halt", "launch", "launched", "stop", "resume"]
+    assert list(data_dir.iterdir()) == []
+
+
+def test_apply_leaves_new_copy_if_it_wont_die(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, confirmed=False, stopped=False)
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert e.value.started is True
+    assert "still running" in str(e.value)
+    assert t.read_bytes() == b"new"
+    assert update.aside_path(t, "linux").read_bytes() == b"old"
+    assert "resume" not in calls
+    assert list(data_dir.iterdir()) == []
+
+
+def test_apply_aborts_when_poller_wont_stop(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, halt=False)
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert e.value.started is False
+    assert t.read_bytes() == b"old"
+    assert calls == ["halt", "resume"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["B.AppImage", "data"]
+
+
+def test_apply_prepare_failure_touches_nothing(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch)
+    with pytest.raises(update.UpdateError):
+        go(data=b"other")  # digest of other bytes than the download
+    assert calls == []
+    assert t.read_bytes() == b"old"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["B.AppImage", "data"]
+
+
+def test_apply_swap_failure_deletes_new_copy(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch)
+
+    def no_link(*a):
+        raise OSError("no links here")
+
+    monkeypatch.setattr(update.os, "link", no_link)
+    with pytest.raises(update.UpdateError):
+        go()
+    assert t.read_bytes() == b"old"
+    assert calls == ["halt", "resume"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["B.AppImage", "data"]
+
+
+def test_apply_restore_failure_still_resumes_and_names_old_copy(tmp_path, monkeypatch):
+    t, data_dir, calls, go = setup_apply(tmp_path, monkeypatch, confirmed=False)
+
+    def bad_restore(target, aside):
+        raise update.UpdateError("disk full")
+
+    monkeypatch.setattr(update, "restore", bad_restore)
+    with pytest.raises(update.UpdateError) as e:
+        go()
+    assert "disk full" in str(e.value) and str(update.aside_path(t, "linux")) in str(e.value)
+    assert e.value.started is True
+    assert calls[-1] == "resume"
