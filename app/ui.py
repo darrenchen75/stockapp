@@ -223,16 +223,20 @@ class MainWindow(QMainWindow):
         self.hide()
 
     def on_update_done(self, error: Exception | None):
-        self.lock.unlock()
+        started = getattr(error, "started", False)
+        # poller_resume is queued before update_done, so its slot has already run.
+        paused = started and not self.resume_requested  # the new copy is still running
+        if not paused:
+            self.lock.unlock()
         if error is None:
             QApplication.quit()
             return
         log.warning("update failed: %s", error)
         self.show()
         self.progress.hide()
-        started = getattr(error, "started", False)
-        # poller_resume is queued before update_done, so its slot has already run.
-        if started and not self.resume_requested:  # the new copy is still running: a second poller would share bars.db
+        if paused:
+            # No poller restart: a second poller would share bars.db. The lock stays held until close,
+            # so the new copy can't clean up the only backup and no new update is offered.
             self.statusBar().showMessage("Paused for update")
             self.show_update_failed("Couldn't update automatically.", str(error))
         elif started:
@@ -308,4 +312,5 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.poller:
             self.poller.stop.set()
+        self.lock.unlock()  # held here only while paused for update; a no-op otherwise
         super().closeEvent(event)
