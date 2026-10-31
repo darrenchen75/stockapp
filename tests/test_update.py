@@ -386,7 +386,52 @@ def test_launch_command(tmp_path, monkeypatch, platform):
     exe = tmp_path / "StockBars" / "Contents/MacOS/StockBars" if platform == "darwin" else tmp_path / "StockBars"
     assert seen["cmd"] == [str(exe), "--confirm-update", str(ok)]
     assert seen.get("start_new_session", False) is (platform != "win32")
-    assert (seen.get("env") or {}).get("PYINSTALLER_RESET_ENVIRONMENT") == ("1" if platform == "win32" else None)
+    assert seen["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+
+
+@pytest.mark.parametrize("orig,expected", [("/orig", "/orig"), (None, None)])
+def test_launch_linux_library_path(tmp_path, monkeypatch, orig, expected):
+    seen = {}
+    monkeypatch.setattr(update.subprocess, "Popen", lambda cmd, **kw: seen.update(kw))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/bundle")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+    if orig:
+        monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", orig)
+    update.launch(tmp_path / "B", "linux", tmp_path / "a.ok")
+    assert seen["env"].get("LD_LIBRARY_PATH") == expected
+
+
+def test_restore_retries_permission_error(tmp_path, monkeypatch):
+    t, aside = tmp_path / "B.AppImage", tmp_path / "B.AppImage.old"
+    t.write_bytes(b"new")
+    aside.write_bytes(b"old")
+    real, n, naps = os.replace, [0], []
+
+    def replace(a, b):
+        n[0] += 1
+        if n[0] <= 2:
+            raise PermissionError("in use")
+        real(a, b)
+
+    monkeypatch.setattr(os, "replace", replace)
+    update.restore(t, aside, sleep=naps.append)
+    assert t.read_bytes() == b"old" and naps == [0.25, 0.25]
+
+
+def test_restore_gives_up_after_20_permission_errors(tmp_path, monkeypatch):
+    t, aside = tmp_path / "B.AppImage", tmp_path / "B.AppImage.old"
+    t.write_bytes(b"new")
+    aside.write_bytes(b"old")
+    n = [0]
+
+    def replace(a, b):
+        n[0] += 1
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(os, "replace", replace)
+    with pytest.raises(update.UpdateError):
+        update.restore(t, aside, sleep=lambda s: None)
+    assert n[0] == 20 and aside.read_bytes() == b"old" and t.read_bytes() == b"new"
 
 
 def test_launch_failure_is_update_error(tmp_path):

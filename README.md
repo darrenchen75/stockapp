@@ -118,7 +118,8 @@ and paste it in.
 
 When a new version is out, the app asks you. Click **Update** and the app
 installs it and restarts by itself. Your key and your saved prices stay as
-they were.
+they were. On a Mac, it may ask for your password once after an update;
+enter it and click **Always Allow**.
 
 If an update can't install, the app keeps working as before and offers you the
 download page, so you can get the new version by hand.

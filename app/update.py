@@ -164,7 +164,7 @@ def swap(target: Path, new: Path, platform: str) -> Path:
     return aside
 
 
-def restore(target: Path, aside: Path) -> None:
+def restore(target: Path, aside: Path, *, sleep: Callable[[float], None] = time.sleep) -> None:
     if not aside.exists():
         raise UpdateError("the previous version is missing")
     # never delete target first: a failed replace must leave something installed
@@ -173,7 +173,14 @@ def restore(target: Path, aside: Path) -> None:
         if keep:
             _rm(keep)
             os.rename(target, keep)
-        os.replace(aside, target)
+        for attempt in range(20):  # taskkill returns before Windows releases the exe
+            try:
+                os.replace(aside, target)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                sleep(0.25)
     except OSError as e:
         if keep and keep.exists() and not target.exists():
             os.rename(keep, target)
@@ -197,7 +204,13 @@ def new_confirm_path(data_dir: Path) -> Path:
 
 def launch(target: Path, platform: str, confirm: Path) -> subprocess.Popen:
     exe = target / "Contents/MacOS/StockBars" if platform == "darwin" else target
-    kw = {"env": {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}} if platform == "win32" else {"start_new_session": True}
+    env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+    if platform == "linux":  # PyInstaller's advice for spawning external programs
+        if "LD_LIBRARY_PATH_ORIG" in env:
+            env["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH_ORIG"]
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    kw = {"env": env} if platform == "win32" else {"env": env, "start_new_session": True}
     try:
         return subprocess.Popen([str(exe), CONFIRM_FLAG, str(confirm)], **kw)
     except OSError as e:

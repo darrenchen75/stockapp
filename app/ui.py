@@ -244,6 +244,7 @@ class MainWindow(QMainWindow):
 
     def on_update_done(self, error: Exception | None):
         self.updating = False
+        self.progress.hide()
         self.progress.deleteLater()
         started = getattr(error, "started", False)
         # poller_resume is queued before update_done, so its slot has already run.
