@@ -2,6 +2,7 @@ import hashlib
 import http.client
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -125,3 +126,49 @@ def prepare(release: Release, target: Path, platform: str, opener=urllib.request
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _rm(p: Path) -> None:
+    shutil.rmtree(p) if p.is_dir() else p.unlink(missing_ok=True)
+
+
+def aside_path(target: Path, platform: str) -> Path:
+    return target.with_name({"win32": "StockBars.old.exe", "darwin": "StockBars.old.app"}.get(platform, target.name + ".old"))
+
+
+def swap(target: Path, new: Path, platform: str) -> Path:
+    aside = aside_path(target, platform)
+    try:
+        _rm(aside)
+        if platform == "linux":
+            os.link(target, aside)  # hard link keeps the old build; replace keeps target always present
+            os.replace(new, target)
+            return aside
+        os.rename(target, aside)
+    except OSError as e:
+        raise UpdateError(str(e)) from e
+    try:
+        os.rename(new, target)
+    except OSError as e:
+        os.rename(aside, target)
+        raise UpdateError(str(e)) from e
+    return aside
+
+
+def restore(target: Path, aside: Path) -> None:
+    if not aside.exists():
+        raise UpdateError("the previous version is missing")
+    try:
+        _rm(target)
+        os.replace(aside, target)
+    except OSError as e:
+        raise UpdateError(str(e)) from e
+
+
+def cleanup(target: Path | None, platform: str) -> None:
+    if target is None:
+        return
+    try:
+        _rm(aside_path(target, platform))
+    except OSError as e:
+        log.debug("could not remove old copy: %s", e)

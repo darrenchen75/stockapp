@@ -160,3 +160,91 @@ def test_prepare_cleans_up_when_download_is_cut_off(tmp_path):
     with pytest.raises(update.UpdateError):
         update.prepare(rel(b"abcdef"), tmp_path / "B.AppImage", "linux", opener=lambda req, timeout=None: Cut(b"abcdef"))
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_swap_then_restore_files(tmp_path, platform):
+    t = tmp_path / ("StockBars.exe" if platform == "win32" else "B.AppImage")
+    new = tmp_path / "new"
+    t.write_bytes(b"old")
+    new.write_bytes(b"new")
+    aside = update.swap(t, new, platform)
+    assert aside == update.aside_path(t, platform)
+    assert t.read_bytes() == b"new" and aside.read_bytes() == b"old" and not new.exists()
+    update.restore(t, aside)
+    assert t.read_bytes() == b"old" and not aside.exists()
+
+
+def test_swap_bundle_directory(tmp_path):
+    t, new = tmp_path / "StockBars.app", tmp_path / "StockBars.new.app"
+    for d, v in ((t, b"old"), (new, b"new")):
+        d.mkdir()
+        (d / "marker").write_bytes(v)
+    stale = tmp_path / "StockBars.old.app"
+    stale.mkdir()
+    (stale / "junk").write_bytes(b"x")
+    aside = update.swap(t, new, "darwin")
+    assert aside == stale and (t / "marker").read_bytes() == b"new"
+    assert (aside / "marker").read_bytes() == b"old" and not (aside / "junk").exists()
+    update.restore(t, aside)
+    assert (t / "marker").read_bytes() == b"old" and not aside.exists()
+
+
+def test_swap_linux_target_never_missing(tmp_path, monkeypatch):
+    t, new = tmp_path / "B.AppImage", tmp_path / "new"
+    t.write_bytes(b"old")
+    new.write_bytes(b"new")
+    real = os.replace
+    seen = []
+
+    def replace(a, b):
+        seen.append(Path(b).exists())
+        real(a, b)
+
+    monkeypatch.setattr(os, "replace", replace)
+    update.swap(t, new, "linux")
+    assert seen == [True]
+
+
+def test_swap_rolls_back_when_second_rename_fails(tmp_path, monkeypatch):
+    t, new = tmp_path / "StockBars.exe", tmp_path / "StockBars.new.exe"
+    t.write_bytes(b"old")
+    new.write_bytes(b"new")
+    real = os.rename
+    calls = []
+
+    def rename(a, b):
+        calls.append(1)
+        if len(calls) == 2:
+            raise PermissionError("locked")
+        real(a, b)
+
+    monkeypatch.setattr(os, "rename", rename)
+    with pytest.raises(update.UpdateError):
+        update.swap(t, new, "win32")
+    assert t.read_bytes() == b"old" and not update.aside_path(t, "win32").exists()
+
+
+def test_restore_keeps_target_when_aside_missing(tmp_path):
+    t = tmp_path / "B.AppImage"
+    t.write_bytes(b"new")
+    with pytest.raises(update.UpdateError):
+        update.restore(t, tmp_path / "B.AppImage.old")
+    assert t.read_bytes() == b"new"
+
+
+def test_cleanup_removes_aside_and_ignores_errors(tmp_path, monkeypatch):
+    t = tmp_path / "B.AppImage"
+    aside = update.aside_path(t, "linux")
+    aside.write_bytes(b"old")
+    update.cleanup(t, "linux")
+    assert not aside.exists()
+    update.cleanup(t, "linux")  # already gone
+    update.cleanup(None, "linux")
+    d = update.aside_path(tmp_path / "StockBars.app", "darwin")
+    d.mkdir()
+    update.cleanup(tmp_path / "StockBars.app", "darwin")
+    assert not d.exists()
+    aside.write_bytes(b"old")
+    monkeypatch.setattr(Path, "unlink", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError()))
+    update.cleanup(t, "linux")
