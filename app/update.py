@@ -150,7 +150,10 @@ def swap(target: Path, new: Path, platform: str) -> Path:
     try:
         os.rename(new, target)
     except OSError as e:
-        os.rename(aside, target)
+        try:
+            os.rename(aside, target)
+        except OSError:
+            raise UpdateError(f"{e}; the previous version is at {aside}") from e
         raise UpdateError(str(e)) from e
     return aside
 
@@ -158,11 +161,19 @@ def swap(target: Path, new: Path, platform: str) -> Path:
 def restore(target: Path, aside: Path) -> None:
     if not aside.exists():
         raise UpdateError("the previous version is missing")
+    # never delete target first: a failed replace must leave something installed
+    keep = target.with_name(target.name + ".restoring") if target.is_dir() else None
     try:
-        _rm(target)
+        if keep:
+            _rm(keep)
+            os.rename(target, keep)
         os.replace(aside, target)
     except OSError as e:
+        if keep and keep.exists() and not target.exists():
+            os.rename(keep, target)
         raise UpdateError(str(e)) from e
+    if keep:
+        shutil.rmtree(keep, ignore_errors=True)
 
 
 def cleanup(target: Path | None, platform: str) -> None:

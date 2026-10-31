@@ -248,3 +248,61 @@ def test_cleanup_removes_aside_and_ignores_errors(tmp_path, monkeypatch):
     aside.write_bytes(b"old")
     monkeypatch.setattr(Path, "unlink", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError()))
     update.cleanup(t, "linux")
+
+
+def test_swap_reports_aside_when_rollback_fails(tmp_path, monkeypatch):
+    t, new = tmp_path / "StockBars.exe", tmp_path / "StockBars.new.exe"
+    t.write_bytes(b"old")
+    new.write_bytes(b"new")
+    real = os.rename
+    calls = []
+
+    def rename(a, b):
+        calls.append(1)
+        if len(calls) >= 2:
+            raise PermissionError("locked")
+        real(a, b)
+
+    monkeypatch.setattr(os, "rename", rename)
+    aside = update.aside_path(t, "win32")
+    with pytest.raises(update.UpdateError, match=str(aside).replace("\\", "\\\\")):
+        update.swap(t, new, "win32")
+    assert aside.read_bytes() == b"old"
+
+
+def test_swap_linux_link_failure_keeps_target(tmp_path, monkeypatch):
+    t, new = tmp_path / "B.AppImage", tmp_path / "new"
+    t.write_bytes(b"old")
+    new.write_bytes(b"new")
+    monkeypatch.setattr(os, "link", lambda *a: (_ for _ in ()).throw(OSError("nope")))
+    with pytest.raises(update.UpdateError):
+        update.swap(t, new, "linux")
+    assert t.read_bytes() == b"old"
+
+
+def test_restore_file_never_leaves_target_missing(tmp_path, monkeypatch):
+    t, aside = tmp_path / "B.AppImage", tmp_path / "B.AppImage.old"
+    t.write_bytes(b"new")
+    aside.write_bytes(b"old")
+    real = os.replace
+    seen = []
+
+    def replace(a, b):
+        seen.append(Path(b).exists())
+        real(a, b)
+
+    monkeypatch.setattr(os, "replace", replace)
+    update.restore(t, aside)
+    assert seen == [True] and t.read_bytes() == b"old"
+
+
+def test_restore_bundle_keeps_target_when_replace_fails(tmp_path, monkeypatch):
+    t, aside = tmp_path / "StockBars.app", tmp_path / "StockBars.old.app"
+    for d, v in ((t, b"new"), (aside, b"old")):
+        d.mkdir()
+        (d / "marker").write_bytes(v)
+    monkeypatch.setattr(os, "replace", lambda a, b: (_ for _ in ()).throw(OSError("busy")))
+    with pytest.raises(update.UpdateError):
+        update.restore(t, aside)
+    assert (t / "marker").read_bytes() == b"new" and (aside / "marker").read_bytes() == b"old"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["StockBars.app", "StockBars.old.app"]
