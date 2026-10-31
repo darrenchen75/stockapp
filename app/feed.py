@@ -5,12 +5,12 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from alpaca.data.enums import DataFeed
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
+from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from PySide6.QtCore import QObject, Signal
 
-from app.store import Bar, Store
+from app.store import ET, Bar, Store
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def retry_wait(e, attempt):
 def fetch(client, symbols, start, end, sleep=time.sleep):
     req = StockBarsRequest(
         symbol_or_symbols=symbols, timeframe=TimeFrame.Minute,
-        start=start, end=end, feed=DataFeed.IEX,
+        start=start, end=end, feed=DataFeed.IEX, adjustment=Adjustment.SPLIT,
     )
     for attempt in range(RETRIES):
         try:
@@ -98,6 +98,28 @@ def backfill(client, store: Store, symbols, include_empty=True, now=None,
     return count
 
 
+def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.sleep) -> int:
+    """Refetch 30 split-adjusted days for each symbol with an unhandled split in the last 30 days.
+    The window is rolling so splits Alpaca posts late still get caught. Returns symbols repaired."""
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(ET).date()
+    data = actions.get_corporate_actions(CorporateActionsRequest(
+        symbols=symbols, start=today - timedelta(days=DAYS), end=today,
+        types=[CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT],
+    )).data
+    found = {(a.symbol, a.ex_date.isoformat()) for actions_ in data.values() for a in actions_}
+    repaired = 0
+    for symbol, ex_date in sorted(found - store.handled_splits()):
+        bars = fetch(client, [symbol], now - timedelta(days=DAYS), now, sleep)
+        if not bars:
+            log.warning("split refetch for %s came back empty; retrying tomorrow", symbol)
+            continue
+        store.replace(symbol, bars, ex_date)
+        log.info("repaired %s for split on %s", symbol, ex_date)
+        repaired += 1
+    return repaired
+
+
 class Poller(QObject):
     """Runs backfill() on a background thread: full on start, then a gap fill every poll_seconds."""
 
@@ -106,9 +128,10 @@ class Poller(QObject):
     status = Signal(str)
     auth_failed = Signal()
 
-    def __init__(self, client, db_path, symbols, poll_seconds=60, retry_seconds=30):
+    def __init__(self, client, db_path, symbols, actions=None, poll_seconds=60, retry_seconds=30):
         super().__init__()
         self.client, self.db_path, self.symbols = client, db_path, symbols
+        self.actions = actions  # corporate-actions client; None skips split repair
         self.poll_seconds, self.retry_seconds = poll_seconds, retry_seconds
         self.stop = threading.Event()
 
@@ -117,7 +140,7 @@ class Poller(QObject):
 
     def run(self):
         store = Store(self.db_path)  # own connection: sqlite3 connections stay on their thread
-        first, pruned = True, 0.0
+        first, pruned, split_day = True, 0.0, None
         while not self.stop.is_set():
             try:
                 backfill(self.client, store, self.symbols, include_empty=first,
@@ -135,5 +158,12 @@ class Poller(QObject):
             if time.time() - pruned > 86400:  # keep the cache a rolling 30 days while the app stays open
                 store.prune(DAYS)
                 pruned = time.time()
+            today = datetime.now(ET).date()
+            if self.actions and today != split_day:  # once per New York day
+                split_day = today  # set before the check: a failure retries tomorrow, not every poll
+                try:
+                    repair_splits(self.client, self.actions, store, self.symbols)
+                except Exception:
+                    log.exception("split check failed")
             self.updated.emit()
             self.stop.wait(self.poll_seconds)

@@ -3,6 +3,7 @@ from datetime import datetime
 
 import pyqtgraph as pg
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from PySide6.QtCore import QPointF, QRectF, QSortFilterProxyModel, Qt
 from PySide6.QtGui import QColor, QPainter, QPicture, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QHBoxLayout, QMainWindow,
@@ -96,7 +97,8 @@ class MainWindow(QMainWindow):
         self.start_poller(keys)
 
     def start_poller(self, keys: tuple[str, str]):
-        self.poller = Poller(StockHistoricalDataClient(*keys), self.db_path, self.symbols)
+        self.poller = Poller(StockHistoricalDataClient(*keys), self.db_path, self.symbols,
+                             actions=CorporateActionsClient(*keys))
         # Bound methods of QObjects on the UI thread: Qt queues these cross-thread calls.
         self.poller.progress.connect(self.on_progress)
         self.poller.updated.connect(self.refresh)

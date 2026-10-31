@@ -183,3 +183,54 @@ def test_poller_prunes_while_running(tmp_path):
     p.updated.connect(p.stop.set)
     p.run()
     assert Store(db).latest_all() == {}
+
+
+class FakeActions:
+    def __init__(self, splits):
+        self.splits = splits  # (symbol, ex_date) pairs
+        self.requests = []
+
+    def get_corporate_actions(self, req):
+        self.requests.append(req)
+        return SimpleNamespace(data={"forward_splits": [
+            SimpleNamespace(symbol=s, ex_date=d) for s, d in self.splits
+        ]})
+
+
+def test_fetch_requests_split_adjusted_bars():
+    client = FakeClient()
+    feed.fetch(client, ["AAPL"], FLOOR, NOW)
+    assert client.requests[0].adjustment == feed.Adjustment.SPLIT
+
+
+def test_repair_splits_refetches_once(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    t = NOW - timedelta(minutes=1)
+    store.upsert([Bar("AAPL", int(t.timestamp()), 100, 100, 100, 100, 1)])
+    client = FakeClient({"AAPL": [fake_bar(t, c=50.0)]})
+    actions = FakeActions([("AAPL", NOW.date())])
+    assert feed.repair_splits(client, actions, store, ["AAPL"], now=NOW) == 1
+    assert store.bars("AAPL", 0)[0].c == 50.0
+    assert utc(client.requests[0].start) == FLOOR
+
+    assert feed.repair_splits(client, actions, store, ["AAPL"], now=NOW) == 0
+    assert len(client.requests) == 1  # already handled: no refetch
+
+
+def test_repair_splits_keeps_cache_on_empty_refetch(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    store.upsert([Bar("AAPL", NOW_TS - 60, 100, 100, 100, 100, 1)])
+    actions = FakeActions([("AAPL", NOW.date())])
+    assert feed.repair_splits(FakeClient(), actions, store, ["AAPL"], now=NOW) == 0
+    assert store.bars("AAPL", 0)[0].c == 100
+    assert store.handled_splits() == set()  # still pending
+
+
+def test_poller_survives_failed_split_check(tmp_path):
+    class Broken:
+        def get_corporate_actions(self, req):
+            raise ConnectionError("down")
+
+    p = feed.Poller(FakeClient(), str(tmp_path / "bars.db"), ["AAPL"], actions=Broken(), poll_seconds=0)
+    p.updated.connect(p.stop.set)
+    p.run()  # bar polling still reports an update

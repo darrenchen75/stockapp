@@ -96,3 +96,12 @@ def test_summary_is_per_symbol_when_one_is_stale(tmp_path):
     assert (m.last, m.prev_close, m.volume) == (210.0, 200.0, 9)
     assert s.session_start() == ts(2026, 10, 16, 0, 0)
     assert s.session_start("MSFT") == ts(2026, 10, 15, 0, 0)
+
+
+def test_replace_swaps_all_rows_and_records_split(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("AAPL", 60, c=100.0), bar("AAPL", 120, c=100.0), bar("MSFT", 60)])
+    s.replace("AAPL", [bar("AAPL", 120, c=50.0)], "2026-10-20")
+    assert s.bars("AAPL", 0) == [bar("AAPL", 120, c=50.0)]  # minute missing from the refetch is gone, not left raw
+    assert s.bars("MSFT", 0) == [bar("MSFT", 60)]
+    assert s.handled_splits() == {("AAPL", "2026-10-20")}

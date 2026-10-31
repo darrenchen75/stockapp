@@ -49,6 +49,11 @@ class Store:
             "o REAL, h REAL, l REAL, c REAL, v INTEGER,"
             "PRIMARY KEY(symbol, ts)) WITHOUT ROWID"
         )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS splits("
+            "symbol TEXT NOT NULL, ex_date TEXT NOT NULL,"
+            "PRIMARY KEY(symbol, ex_date)) WITHOUT ROWID"
+        )
 
     def upsert(self, bars: Iterable[Bar]) -> None:
         with self.db:
@@ -56,6 +61,20 @@ class Store:
                 "INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?)",
                 [(b.symbol, b.ts, b.o, b.h, b.l, b.c, b.v) for b in bars],
             )
+
+    def replace(self, symbol: str, bars: Iterable[Bar], ex_date: str) -> None:
+        """Swap all of `symbol`'s rows for split-adjusted `bars` and mark the split handled, atomically.
+        Deleting first means no raw-priced minute survives next to adjusted ones."""
+        with self.db:
+            self.db.execute("DELETE FROM bars WHERE symbol = ?", (symbol,))
+            self.db.executemany(
+                "INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?)",
+                [(b.symbol, b.ts, b.o, b.h, b.l, b.c, b.v) for b in bars],
+            )
+            self.db.execute("INSERT OR IGNORE INTO splits VALUES (?,?)", (symbol, ex_date))
+
+    def handled_splits(self) -> set[tuple[str, str]]:
+        return set(self.db.execute("SELECT symbol, ex_date FROM splits"))
 
     def latest_all(self) -> dict[str, int]:
         return dict(self.db.execute("SELECT symbol, MAX(ts) FROM bars GROUP BY symbol"))
