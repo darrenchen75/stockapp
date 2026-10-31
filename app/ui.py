@@ -13,7 +13,7 @@ from app import settings
 from app.feed import Poller
 from app.store import ET, Bar, Store
 
-COLUMNS = ["Symbol", "Last", "% Chg", "Volume"]
+COLUMNS = ["Symbol", "Last", "% Chg", "Volume", "Gaps"]
 RANGES = {"1D": None, "5D": 5, "30D": 30}  # None = since the start of the latest session
 UP, DOWN = QColor("#26a69a"), QColor("#ef5350")
 LIVE_SECONDS = 300
@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
 
         self.model = QStandardItemModel(0, len(COLUMNS))
         self.model.setHorizontalHeaderLabels(COLUMNS)
+        self.model.setHeaderData(4, Qt.Horizontal, "Trading days with no bars in the last 30 days", Qt.ToolTipRole)
         for s in symbols:
             self.model.appendRow([QStandardItem(s)] + [QStandardItem() for _ in COLUMNS[1:]])
         self.rows = {s: i for i, s in enumerate(symbols)}
@@ -96,7 +97,7 @@ class MainWindow(QMainWindow):
         split = QSplitter()
         split.addWidget(self.table)
         split.addWidget(right)
-        split.setSizes([420, 780])
+        split.setSizes([520, 680])
         self.setCentralWidget(split)
 
         # Bound methods of QObjects on the UI thread: Qt queues these cross-thread calls.
@@ -126,11 +127,12 @@ class MainWindow(QMainWindow):
         self.start_poller(keys)
 
     def refresh(self):
-        summaries = self.store.summary()
+        summaries, gaps = self.store.summary(), self.store.gaps(self.symbols)
         for symbol, row in self.rows.items():
             x = summaries.get(symbol)
             pct = x.pct if x else None
             values = [round(x.last, 2), None if pct is None else round(pct, 2), x.volume] if x else [None] * 3
+            values.append(gaps.get(symbol))  # None (no data) = blank, like the other columns
             for col, value in enumerate(values, start=1):
                 self.model.item(row, col).setData(value, Qt.DisplayRole)  # None = blank cell
             color = None if pct is None else (UP if pct >= 0 else DOWN)

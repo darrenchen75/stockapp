@@ -105,3 +105,13 @@ def test_replace_swaps_all_rows_and_records_split(tmp_path):
     assert s.bars("AAPL", 0) == [bar("AAPL", 120, c=50.0)]  # minute missing from the refetch is gone, not left raw
     assert s.bars("MSFT", 0) == [bar("MSFT", 60)]
     assert s.handled_splits() == {("AAPL", "2026-10-20")}
+
+
+def test_gaps_counts_trading_days_missing_per_symbol(tmp_path):
+    s = store(tmp_path)
+    days = [19, 20, 21, 22, 23]
+    s.upsert([bar("AAPL", ts(2026, 10, d, 10, 0)) for d in days])
+    s.upsert([bar("MSFT", ts(2026, 10, d, 10, 0)) for d in (20, 22)])  # 19 is the oldest day: skipped
+    s.upsert([bar("NVDA", ts(2026, 10, 19, 10, 0))])
+    now = ts(2026, 10, 23, 16, 0)
+    assert s.gaps(["AAPL", "MSFT", "NVDA", "GONE"], now=now) == {"AAPL": 0, "MSFT": 2, "NVDA": 4}

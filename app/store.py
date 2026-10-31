@@ -2,7 +2,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import time as clock
 from zoneinfo import ZoneInfo
 
@@ -116,3 +116,16 @@ class Store:
             ).fetchone()[0]
             out[s] = Summary(last, prev[0] if prev else None, volume)
         return out
+
+    def gaps(self, symbols: Iterable[str], days: int = 30, now: float | None = None) -> dict[str, int]:
+        """Trading days (days any symbol has bars) on which each symbol has none: fetch holes, halts,
+        stale feeds. Counted by day, not minute, because IEX-only data has many empty minutes.
+        The oldest day is skipped since prune cuts it mid-day. Symbols with no rows are left out."""
+        today = datetime.fromtimestamp(time.time() if now is None else now, ET).date()
+        starts = [int(datetime.combine(today - timedelta(days=i), clock(), ET).timestamp())
+                  for i in range(days, -2, -1)]  # one past today closes the last range
+        have = {s: {a for a, b in zip(starts, starts[1:]) if self.db.execute(
+            "SELECT 1 FROM bars WHERE symbol = ? AND ts >= ? AND ts < ? LIMIT 1", (s, a, b)
+        ).fetchone()} for s in symbols}  # primary-key probes: ~0.1s for 500 symbols, vs ~1s for a scan
+        sessions = sorted(set().union(*have.values()))[1:]
+        return {s: len(set(sessions) - got) for s, got in have.items() if got}
