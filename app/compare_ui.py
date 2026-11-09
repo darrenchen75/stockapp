@@ -97,7 +97,7 @@ class RunWorker(QObject):
 
 MAX_TICKED = 6
 # on the plot's black background; lightness differs as well as hue, so lines stay apart for colour-blind eyes
-COLORS = ["#3a6bff", "#ffd24a", "#ef5350", "#4dd0c8", "#b266e0", "#ff8c3a"]
+COLORS = ["#3a6bff", "#ffd24a", "#ef5350", "#4dd0c8", "#7b3fb0", "#ff8c3a"]
 SPY_COLOR = "#9e9e9e"
 ROWS = [("total_return", "Total return"), ("cagr", "Yearly growth"), ("worst_drop", "Worst drop"),
         ("rebalances", "Rebalances"), ("warnings", "Warnings")]
