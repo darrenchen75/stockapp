@@ -205,3 +205,20 @@ def test_main_rejects_an_absurd_cost_with_one_line(command, capsys):
     assert main(command + ["--cost-bps", "20000"]) == 1
     lines = [l for l in capsys.readouterr().err.splitlines() if not l.startswith("downloaded")]  # progress lines
     assert len(lines) == 1 and "cost_bps" in lines[0]
+
+
+def test_main_reports_a_download_that_lacks_spy(command, monkeypatch, capsys):
+    monkeypatch.setattr(backtest, "StockHistoricalDataClient", lambda *keys: FakeClient({}))
+    assert main(command) == 1
+    lines = [l for l in capsys.readouterr().err.splitlines() if not l.startswith("downloaded")]
+    assert len(lines) == 1 and "Could not download" in lines[0] and "SPY" in lines[0]
+
+
+def test_main_refuses_to_run_when_spy_ends_before_another_symbol(command, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(backtest, "universe", lambda: ["SPY", "A"])
+    monkeypatch.setattr(backtest, "StockHistoricalDataClient", lambda *keys: FakeClient(
+        {"SPY": [fake_day(d) for d in D[:3]], "A": [fake_day(d) for d in D]}))
+    assert main(command) == 1
+    lines = [l for l in capsys.readouterr().err.splitlines() if not l.startswith("downloaded")]
+    assert len(lines) == 1 and lines[0].startswith("SPY data is incomplete")
+    assert not (tmp_path / "out").exists()

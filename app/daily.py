@@ -22,6 +22,10 @@ CUTOFF = clock(20, 30)  # a day's bar is final, and visible to strategies, from 
 COLUMNS = ["symbol", "date", "o", "h", "l", "c", "v", "factor_all", "factor_split"]
 
 
+class IncompleteDownload(Exception):
+    """A download finished without data the run cannot do without."""
+
+
 def decision_time(day: date) -> datetime:
     return datetime.combine(day, CUTOFF, ET)
 
@@ -114,7 +118,8 @@ def fetch_daily(client, actions, symbols, through: date, sleep=time.sleep) -> di
 def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.sleep,
                   progress=lambda done, total: None) -> bool:
     """Download everything again unless the stored data already reaches the latest final day.
-    Each symbol is replaced in one transaction; the marker is set last, so a failure retries all."""
+    Each symbol is replaced in one transaction; the marker is set last, so a failure retries all.
+    Raises IncompleteDownload, with no marker, if SPY comes back empty."""
     through = last_final_date(now or datetime.now(timezone.utc))
     if store.daily_through() == through.isoformat():
         return False
@@ -124,10 +129,12 @@ def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.s
             store.replace_daily(s, bars)
             got.add(s)
         progress(done, total)
-    store.set_daily_through(through.isoformat())
     missing = sorted(set(symbols) - got)
-    if missing:
-        log.info("no daily bars for %d symbols: %s", len(missing), ", ".join(missing))
+    if missing:  # delisted or renamed symbols keep their old rows and must not force a download every run
+        log.warning("no daily bars for %d symbols: %s", len(missing), ", ".join(missing))
+    if "SPY" in missing:  # SPY sets the run's calendar, so a stale copy would silently shrink it
+        raise IncompleteDownload("no daily bars for SPY; the marker is not set, so the next run retries")
+    store.set_daily_through(through.isoformat())
     return True
 
 

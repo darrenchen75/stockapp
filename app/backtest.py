@@ -226,7 +226,12 @@ def main(argv=None) -> int:
                           progress=lambda done, total: print(f"downloaded {done}/{total}", file=sys.stderr))
         except Exception as e:
             return fail(f"Could not download daily data: {e}")
-        result = run(strategy, load_bars(store), args.start, args.end, args.capital, args.cost_bps, args.dividends)
+        bars = load_bars(store)
+        last = bars.groupby("symbol")["date"].max()
+        if "SPY" not in last or last["SPY"] < last.max():
+            return fail(f"SPY data is incomplete: it stops before {str(last.max())[:10]}, "
+                        "the latest day of other symbols. Try again later.")
+        result = run(strategy, bars, args.start, args.end, args.capital, args.cost_bps, args.dividends)
         write_results(result, args.out, SOURCE)
     except (StrategyError, ValueError) as e:
         return fail(str(e))

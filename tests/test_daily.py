@@ -6,7 +6,7 @@ import pytest
 from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.timeframe import TimeFrame
 
-from app.daily import (HISTORY_START, build_factors, fetch_daily, last_final_date, load_bars,
+from app.daily import (HISTORY_START, IncompleteDownload, build_factors, fetch_daily, last_final_date, load_bars,
                        refresh_daily, universe)
 from app.store import ET, DailyBar, Store
 from tests.test_feed import HTTPError, utc
@@ -252,6 +252,35 @@ def test_symbol_with_an_empty_bar_list_keeps_old_rows_and_is_logged(tmp_path, ca
         assert refresh_daily(client, FakeActions(), store, ["A", "GONE"], now=NOW) is True
     assert [r[1] for r in store.daily_rows("2099-01-01") if r[0] == "GONE"] == ["2019-01-02"]
     assert "GONE" in caplog.text
+
+
+def test_symbol_without_bars_is_logged_as_a_warning(tmp_path, caplog):
+    store = Store(str(tmp_path / "bars.db"))
+    with caplog.at_level("INFO", logger="app.daily"):
+        assert refresh_daily(good_client(["A"]), FakeActions(), store, ["A", "GONE"], now=NOW) is True
+    assert [(r.levelname, "GONE" in r.getMessage()) for r in caplog.records] == [("WARNING", True)]
+
+
+def test_missing_spy_raises_without_the_marker_and_keeps_old_spy_rows(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    store.replace_daily("SPY", [row("2019-01-02", "SPY")])
+    with pytest.raises(IncompleteDownload, match="SPY"):
+        refresh_daily(good_client(["A"]), FakeActions(), store, ["A", "SPY"], now=NOW)
+    assert store.daily_through() is None
+    rows = list(store.daily_rows("2099-01-01"))
+    assert [r[1] for r in rows if r[0] == "SPY"] == ["2019-01-02"]  # old rows kept
+    assert [r[1] for r in rows if r[0] == "A"] == ["2020-01-02"]  # the others were still written
+    assert refresh_daily(good_client(["A", "SPY"]), FakeActions(), store, ["A", "SPY"], now=NOW) is True
+    assert store.daily_through() == "2026-11-05"
+    assert [r[1] for r in store.daily_rows("2099-01-01") if r[0] == "SPY"] == ["2020-01-02"]
+
+
+def test_spy_with_an_empty_bar_list_also_raises(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    client = FakeClient({"A": [fake_day("2020-01-02")], "SPY": []})
+    with pytest.raises(IncompleteDownload, match="SPY"):
+        refresh_daily(client, FakeActions(), store, ["A", "SPY"], now=NOW)
+    assert store.daily_through() is None
 
 
 def test_load_bars_hides_a_day_before_its_cutoff(tmp_path):
