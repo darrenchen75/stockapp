@@ -1,6 +1,7 @@
 """Backtest price view: on decision day T a strategy sees earlier prices restated only for events up to T."""
 import argparse
 import importlib.util
+import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -93,6 +94,8 @@ def rebalance(shares, cash, targets, open_px, last_px, cost_bps=0.0) -> Fill:
             new[s] += delta
         else:
             buys[s] = delta
+    if cash < -tol:  # sale costs above the proceeds
+        raise ValueError(f"sales would leave negative cash: {cash}")
     need = sum(d * open_px[s] for s, d in buys.items()) * (1 + cost)
     scale = cash / need if need > cash else 1.0
     for s, d in buys.items():
@@ -113,6 +116,10 @@ class Result:
 
 def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=True, now=None) -> Result:
     """Decide on each day's final bar, fill at the next open, value at that day's close."""
+    if not (math.isfinite(capital) and capital > 0):
+        raise ValueError(f"capital must be a finite number above 0, got {capital}")
+    if not (math.isfinite(cost_bps) and 0 <= cost_bps < 10_000):
+        raise ValueError(f"cost_bps must be at least 0 and below 10000, got {cost_bps}")
     through = pd.Timestamp(last_final_date(now or datetime.now(timezone.utc)))  # drop today's unfinished bar
     bars = bars[pd.to_datetime(bars["date"]) <= through]
     prices = prepare(bars, dividends)

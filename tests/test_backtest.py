@@ -182,3 +182,26 @@ def test_run_with_only_unfinished_days_has_no_trading_days():
     with pytest.raises(ValueError, match="no trading days"):
         run(all_in("A"), live, "2026-11-05", "2026-11-30", now=now)
 
+
+
+@pytest.mark.parametrize("capital", [0, -1, float("nan"), float("inf")])
+def test_run_rejects_bad_capital(capital):
+    with pytest.raises(ValueError, match="capital"):
+        run(all_in("A"), plain, D[0], D[3], capital=capital)
+
+
+@pytest.mark.parametrize("cost_bps", [-1, 10000, 20000, float("nan"), float("inf")])
+def test_run_rejects_bad_cost(cost_bps):
+    with pytest.raises(ValueError, match="cost"):
+        run(all_in("A"), plain, D[0], D[3], cost_bps=cost_bps)
+
+
+def test_rebalance_rejects_negative_cash_after_sales():
+    with pytest.raises(ValueError, match="negative cash"):
+        rebalance({"A": 10}, 0, {}, {"A": 10}, {"A": 10}, cost_bps=20000)
+
+
+def test_main_rejects_an_absurd_cost_with_one_line(command, capsys):
+    assert main(command + ["--cost-bps", "20000"]) == 1
+    lines = [l for l in capsys.readouterr().err.splitlines() if not l.startswith("downloaded")]  # progress lines
+    assert len(lines) == 1 and "cost_bps" in lines[0]
