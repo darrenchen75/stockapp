@@ -10,15 +10,24 @@ from PyInstaller.utils.hooks import collect_submodules
 _SKIP = {"tkinter", "_tkinter", "turtle", "idlelib", "test", "lib2to3", "ensurepip", "venv"}
 
 
-def _importable(name):
+def _spec(name):
     # find_spec does not execute the module: importing would run side effects
     # (`antigravity` opens a browser, `this` prints). A missing module is None.
     try:
-        return find_spec(name) is not None
+        return find_spec(name)
     except (ImportError, ValueError):
-        return False
+        return None
 
 
-hiddenimports = sorted(n for n in sys.stdlib_module_names - _SKIP if _importable(n))
-hiddenimports += collect_submodules("pandas")
-hiddenimports += collect_submodules("numpy")
+def _no_tests(name):
+    return ".test" not in name and ".idle_test" not in name
+
+
+_stdlib = {n: s for n in sys.stdlib_module_names - _SKIP if (s := _spec(n)) is not None}
+hiddenimports = sorted(_stdlib)
+# a package's submodules (email.mime.text, xml.dom.minidom) are not found from its top-level name
+for _name, _s in sorted(_stdlib.items()):
+    if _s.submodule_search_locations is not None:
+        hiddenimports += collect_submodules(_name, filter=_no_tests)
+hiddenimports += collect_submodules("pandas", filter=lambda m: ".tests" not in m)
+hiddenimports += collect_submodules("numpy", filter=lambda m: ".tests" not in m)
