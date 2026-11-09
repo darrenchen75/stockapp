@@ -71,6 +71,14 @@ def test_later_prices_and_splits_do_not_change_earlier_decisions():
             pd.testing.assert_frame_equal(seen_a[day][field], seen_b[day][field])
 
 
+def test_first_fill_is_at_the_next_days_open_not_the_decision_days():
+    # D[0] opens at 10, D[1] at 20: a runner that filled at its own decision day's open would pay 10
+    data = bars([("A", D[0], 10, 10, 1, 1, 1), ("A", D[1], 20, 20, 1, 1, 1), ("A", D[2], 20, 20, 1, 1, 1)])
+    first = run(all_in("A"), data, D[0], D[2], capital=1000).positions.iloc[0]
+    assert first["fill_price"] == 20 and first["date"] == pd.Timestamp(D[1])
+    assert first["shares"] == 50 and first["decided_on"] == pd.Timestamp(D[0])
+
+
 def test_strategy_never_receives_bars_after_its_decision_day():
     record(plain)  # the strategy asserts history["c"].index.max() == as_of on every call
 
