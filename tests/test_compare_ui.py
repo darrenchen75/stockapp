@@ -540,6 +540,11 @@ def test_rerun_uses_saved_copy_when_original_is_gone(window_with_runs):
     dialog = w.rerun(w.records[0].id)
     assert dialog.values()[0] == str(w.records[0].folder / "strategy.py")
     assert "Original file not found; using the copy saved with this run" in dialog.note()
+    dialog.run_button.click()
+    wait(lambda: not w.busy)
+    new = w.records[0]  # newest first
+    assert len(w.records) == 2 and new.id != w.records[1].id
+    assert new.name == "strategy_under_test.py" and new.strategy_path == str(w.fakes.strategy)
 
 
 def test_new_and_rerun_disabled_while_busy(window_with_runs):

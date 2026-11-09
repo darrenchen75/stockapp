@@ -35,9 +35,10 @@ class RunWorker(QObject):
     stopped = Signal()
 
     def __init__(self, strategy_path: str, settings: Settings, make_clients: Callable[[], tuple], db_path: str,
-                 root: Path, app_version: str):
+                 root: Path, app_version: str, record_path: str | None = None):
         super().__init__()
         self.strategy_path, self.settings, self.make_clients = strategy_path, settings, make_clients
+        self.record_path = record_path or strategy_path  # the path the saved run names; differs when re-run from a copy
         self.db_path, self.root, self.app_version = db_path, Path(root), app_version
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
@@ -76,7 +77,7 @@ class RunWorker(QObject):
                               download_progress=lambda done, total: self.progressed.emit("download", done, total),
                               progress=lambda done, total: self.progressed.emit("run", done, total),
                               cancelled=cancelled)
-            record = save_run(self.root, result, s, self.strategy_path, data, store.daily_through(),
+            record = save_run(self.root, result, s, self.record_path, data, store.daily_through(),
                               self.app_version, cancelled=cancelled)
             outcome = self.finished, (record,)
         except Cancelled:
@@ -154,7 +155,9 @@ class NewRunDialog(QDialog):
         s = settings or Settings("2016-01-04", last_final_date(datetime.now(timezone.utc)).isoformat(), 100_000.0, 0.0,
                                  True)
         note = ""
+        self.copy_of: tuple[str, str] | None = None  # (saved copy, original path) when the original is gone
         if strategy_path and not Path(strategy_path).is_file() and fallback_path and Path(fallback_path).is_file():
+            self.copy_of = fallback_path, strategy_path
             strategy_path, note = fallback_path, COPY_NOTE
         self.path = QLineEdit(strategy_path)
         browse = QPushButton("Browse…")
@@ -502,7 +505,9 @@ class CompareWindow(QWidget):
         if self.busy or dialog is None:
             return
         path, s = dialog.values()
-        worker = RunWorker(path, s, self.make_clients, self.db_path, self.root, self.app_version)
+        copy = dialog.copy_of
+        record_path = copy[1] if copy and path == copy[0] else path  # still the copy: keep the original's name and path
+        worker = RunWorker(path, s, self.make_clients, self.db_path, self.root, self.app_version, record_path)
         worker.progressed.connect(dialog.show_progress)
         worker.finished.connect(self.on_run_finished)
         worker.failed.connect(lambda text: self.on_run_ended(text))
