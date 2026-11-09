@@ -523,7 +523,7 @@ class CompareWindow(QWidget):
 
     def closeEvent(self, event):
         if self.busy:
-            if QMessageBox.question(self, "Compare backtests", "A backtest is running. Stop it and quit?") != QMessageBox.Yes:
+            if QMessageBox.question(self, "Compare backtests", "A backtest is running. Stop it and close?") != QMessageBox.Yes:
                 event.ignore()
                 return
             self.cancel_run()

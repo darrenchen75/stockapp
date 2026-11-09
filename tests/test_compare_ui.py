@@ -710,7 +710,7 @@ def test_compare_window_close_while_running_asks_and_cancels(window_with_runs, m
     asked = ask(monkeypatch, answer)
     event = QCloseEvent()
     w.closeEvent(event)
-    assert asked == ["A backtest is running. Stop it and quit?"]
+    assert asked == ["A backtest is running. Stop it and close?"]
     assert event.isAccepted() is closes
     assert w.run_worker.cancel.called is closes
     w.run_worker = None
