@@ -1,6 +1,9 @@
+import sqlite3
 from datetime import datetime
 
-from app.store import ET, Bar, Store
+import pytest
+
+from app.store import ET, Bar, DailyBar, Store
 
 
 def ts(y, m, d, hh, mm):
@@ -132,3 +135,53 @@ def test_gaps_counts_trading_days_missing_per_symbol(tmp_path):
     s.upsert([bar("NVDA", ts(2026, 10, 19, 10, 0))])
     now = ts(2026, 10, 23, 16, 0)  # today (23) is still in progress: skipped
     assert s.gaps(["AAPL", "MSFT", "NVDA", "GONE"], now=now) == {"AAPL": 0, "MSFT": 1, "NVDA": 3}
+
+
+def daily(symbol, date, c=10.0, f=1.0):
+    return DailyBar(symbol, date, c, c, c, c, 100.0, f, f)
+
+
+def test_replace_daily_swaps_all_rows_of_one_symbol(tmp_path):
+    s = store(tmp_path)
+    s.replace_daily("A", [daily("A", "2020-01-02"), daily("A", "2020-01-03")])
+    s.replace_daily("B", [daily("B", "2020-01-02")])
+    s.replace_daily("A", [daily("A", "2020-01-03", f=0.5)])
+    rows = list(s.daily_rows("2099-01-01"))
+    assert [(r[0], r[1], r[7]) for r in rows] == [("B", "2020-01-02", 1.0), ("A", "2020-01-03", 0.5)]
+
+
+def test_daily_rows_stop_at_through(tmp_path):
+    s = store(tmp_path)
+    s.replace_daily("A", [daily("A", "2020-01-02"), daily("A", "2020-01-03")])
+    assert [r[1] for r in s.daily_rows("2020-01-02")] == ["2020-01-02"]
+
+
+def test_failed_replace_keeps_old_rows(tmp_path):
+    s = store(tmp_path)
+    s.replace_daily("A", [daily("A", "2020-01-02")])
+    with pytest.raises(sqlite3.Error):
+        s.replace_daily("A", [daily("A", "2020-01-03"), daily("A", "2020-01-03")])
+    assert [r[1] for r in s.daily_rows("2099-01-01")] == ["2020-01-02"]
+
+
+def test_prune_leaves_daily_rows(tmp_path):
+    s = store(tmp_path)
+    s.replace_daily("A", [daily("A", "2016-01-04")])
+    s.prune(30)
+    assert len(list(s.daily_rows("2099-01-01"))) == 1
+
+
+def test_daily_through_round_trips(tmp_path):
+    s = store(tmp_path)
+    assert s.daily_through() is None
+    s.set_daily_through("2026-11-05")
+    assert s.daily_through() == "2026-11-05"
+
+
+def test_daily_write_while_another_connection_reads(tmp_path):
+    a, b = store(tmp_path), store(tmp_path)
+    a.replace_daily("A", [daily("A", "2020-01-02")])
+    b.db.execute("BEGIN")
+    b.db.execute("SELECT * FROM bars").fetchall()
+    a.replace_daily("A", [daily("A", "2020-01-03")])  # must not raise "database is locked"
+    b.db.commit()
