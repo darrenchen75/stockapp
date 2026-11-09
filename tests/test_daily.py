@@ -231,6 +231,16 @@ def test_symbol_without_bars_keeps_old_rows_and_finishes(tmp_path):
     assert store.daily_through() == "2026-11-05"
 
 
+def test_symbol_with_an_empty_bar_list_keeps_old_rows_and_is_logged(tmp_path, caplog):
+    store = Store(str(tmp_path / "bars.db"))
+    store.replace_daily("GONE", [row("2019-01-02", "GONE")])
+    client = FakeClient({"A": [fake_day("2020-01-02")], "GONE": []})  # BarSet can keep a key with no bars
+    with caplog.at_level("INFO", logger="app.daily"):
+        assert refresh_daily(client, FakeActions(), store, ["A", "GONE"], now=NOW) is True
+    assert [r[1] for r in store.daily_rows("2099-01-01") if r[0] == "GONE"] == ["2019-01-02"]
+    assert "GONE" in caplog.text
+
+
 def test_load_bars_hides_a_day_before_its_cutoff(tmp_path):
     store = Store(str(tmp_path / "bars.db"))
     store.replace_daily("A", [row("2026-11-04"), row("2026-11-05")])

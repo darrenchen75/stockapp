@@ -91,6 +91,8 @@ def batches(client, actions, symbols, through: date, sleep=time.sleep):
             limit=None)).data, sleep))  # the default limit of 1000 would stop paging and drop later actions
         out = {}
         for s, raw in bars.items():
+            if not raw:  # an empty list would make replace_daily delete the stored rows
+                continue
             raw = sorted(raw, key=lambda b: b.timestamp)
             days = [b.timestamp.astimezone(ET).date().isoformat() for b in raw]
             splits, dividends = acts.get(s, ([], []))
