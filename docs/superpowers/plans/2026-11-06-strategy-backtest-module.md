@@ -681,6 +681,8 @@ Expected: 4 passed. On a failure, check the event's date against Alpaca's corpor
 Run: `uv run python -m app.backtest tests/fixtures/buy_spy.py --start 2020-01-02 --end 2025-12-31 --out <scratchpad>/spy`
 Expected: exit 0, and `portfolio.csv` shows a total return close to SPY's published total return for that span. Report the number and the download time.
 
+Then check a symbol that sat in the middle of a full 100-symbol batch, because single-symbol tests cannot catch per-batch truncation of corporate actions. From the refreshed `bars.db`, NVDA's `factor_split` on 2024-06-10 divided by its value on 2024-06-07 should be 10 (its 10-for-1 split). Report the ratio, and the number of cash-dividend ex-dates stored for AAPL since 2016 (about 43 expected).
+
 - [ ] **Step 4: Confirm the default run skips the live tests**
 
 Run: `uv run pytest -q`
