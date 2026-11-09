@@ -1,3 +1,5 @@
+import warnings
+
 import pandas as pd
 import pytest
 
@@ -37,3 +39,11 @@ def test_best_marks_return_growth_and_smallest_drop_only():
     b = best({"a": {"total_return": .5, "cagr": .1, "worst_drop": -.3, "rebalances": 9, "warnings": 0},
               "b": {"total_return": .2, "cagr": .2, "worst_drop": -.1, "rebalances": 1, "warnings": 5}})
     assert b == {"total_return": "a", "cagr": "b", "worst_drop": "b"}
+
+
+def test_all_nan_warning_column_counts_zero_without_pandas_warning():
+    pos = pd.DataFrame({"decided_on": ["d0", "d1"], "fill_price": [10.0, 11.0], "warning": [float("nan")] * 2})
+    assert pos["warning"].dtype == "float64"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert summary(portfolio([100, 121]), pos)["warnings"] == 0

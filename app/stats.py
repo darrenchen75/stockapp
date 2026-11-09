@@ -23,7 +23,7 @@ def summary(portfolio: pd.DataFrame, positions: pd.DataFrame) -> dict[str, float
             "cagr": float(ratio ** (365.25 / days) - 1) if days else None,
             "worst_drop": float(drawdown(portfolio).min()),
             "rebalances": int(filled["decided_on"].nunique()),
-            "warnings": int(positions["warning"].fillna("").ne("").sum())}
+            "warnings": int(positions["warning"].dropna().astype(str).str.strip().ne("").sum())}
 
 
 def best(column_values: dict[str, dict[str, float | None]]) -> dict[str, str]:
