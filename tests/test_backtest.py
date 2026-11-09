@@ -129,6 +129,25 @@ def test_results_carry_the_required_note(tmp_path):
     assert len(pd.read_csv(tmp_path / "portfolio.csv", comment="#")) == 4
 
 
+def test_failed_export_leaves_existing_files_untouched_and_no_temp_files(tmp_path, monkeypatch):
+    for name in ("portfolio.csv", "positions.csv"):
+        (tmp_path / name).write_text(f"old {name}\n")
+    result, real, calls = run(all_in("A"), plain, D[0], D[3]), pd.DataFrame.to_csv, []
+
+    def second_write_fails(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", second_write_fails)
+    with pytest.raises(OSError, match="disk full"):
+        write_results(result, str(tmp_path), "Alpaca SIP daily")
+    assert (tmp_path / "portfolio.csv").read_text() == "old portfolio.csv\n"
+    assert (tmp_path / "positions.csv").read_text() == "old positions.csv\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["portfolio.csv", "positions.csv"]
+
+
 @pytest.fixture
 def command(tmp_path, monkeypatch):
     """Patch the key loader, db path, universe and both clients; returns the args and the keys to set."""

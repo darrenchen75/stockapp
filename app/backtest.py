@@ -2,6 +2,7 @@
 import argparse
 import importlib.util
 import math
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -188,11 +189,22 @@ def load_strategy(path: str):
 def write_results(result: Result, out_dir: str, source: str) -> None:
     note = (f"# Today's S&P 500 members only, so results have survivorship bias. "
             f"Data: {source}. Dividends: {'on' if result.dividends else 'off'}.\n")
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    for name, frame in (("portfolio.csv", result.portfolio), ("positions.csv", result.positions)):
-        with open(Path(out_dir) / name, "w", newline="") as f:
-            f.write(note)
-            frame.to_csv(f, index=False)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    frames = {"portfolio.csv": result.portfolio, "positions.csv": result.positions}
+    temps = {name: out / f".{name}.tmp" for name in frames}
+    try:
+        for name, frame in frames.items():
+            with open(temps[name], "w", newline="") as f:
+                f.write(note)
+                frame.to_csv(f, index=False)
+        # shortcut: the two renames are not one atomic step; only a failure while writing is covered
+        for name, tmp in temps.items():
+            os.replace(tmp, out / name)
+    except BaseException:
+        for tmp in temps.values():
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 SOURCE = "Alpaca SIP daily; Alpaca dividends miss some payouts (e.g. SPY 2016-03-18, 2018-06-15)"
