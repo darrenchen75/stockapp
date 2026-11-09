@@ -36,8 +36,9 @@ class FakeClient:
 
 
 class FakeActions:
-    def __init__(self, splits=(), dividends=(), error=None):
+    def __init__(self, splits=(), dividends=(), error=None, reverse_splits=()):
         self.splits = list(splits)  # (symbol, ex_date, old_rate, new_rate)
+        self.reverse_splits = list(reverse_splits)  # same shape, reported under "reverse_splits"
         self.dividends = list(dividends)  # (symbol, ex_date, rate)
         self.error = error
         self.requests = []
@@ -49,6 +50,9 @@ class FakeActions:
         data = {}
         for s, ex, old, new in self.splits:
             data.setdefault("forward_splits", []).append(
+                SimpleNamespace(symbol=s, ex_date=ex, old_rate=old, new_rate=new))
+        for s, ex, old, new in self.reverse_splits:
+            data.setdefault("reverse_splits", []).append(
                 SimpleNamespace(symbol=s, ex_date=ex, old_rate=old, new_rate=new))
         for s, ex, rate in self.dividends:
             data.setdefault("cash_dividends", []).append(
@@ -88,6 +92,17 @@ def test_fetch_daily_requests_splits_and_cash_dividends():
     assert {t for r in actions.requests for t in r.types} == {
         CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT, CorporateActionsType.CASH_DIVIDEND}
     assert all(r.start == HISTORY_START and r.end == NOV5 for r in actions.requests)
+    # alpaca-py's default limit of 1000 would stop paging early and drop later splits and dividends
+    assert all(r.limit is None for r in actions.requests)
+
+
+def test_fetch_daily_applies_reverse_split_and_cash_dividend():
+    client = FakeClient({"A": [fake_day("2020-01-02", 2.0), fake_day("2020-01-03", 2.0), fake_day("2020-01-06", 20.0)]})
+    actions = FakeActions(reverse_splits=[("A", date(2020, 1, 6), 10.0, 1.0)],
+                          dividends=[("A", date(2020, 1, 3), 0.2)])
+    f = [x for b in fetch_daily(client, actions, ["A"], NOV5)["A"] for x in (b.factor_all, b.factor_split)]
+    # 1:10 reverse split: split factor 10 before its ex-date; dividend 0.2 on a raw close of 2.0 is 0.9
+    assert f == pytest.approx([9.0, 10.0, 10.0, 10.0, 1.0, 1.0])
 
 
 def test_fetch_daily_batches_at_most_100_symbols():

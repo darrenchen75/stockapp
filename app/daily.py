@@ -87,7 +87,8 @@ def batches(client, actions, symbols, through: date, sleep=time.sleep):
         acts = parse_actions(with_retries(lambda: actions.get_corporate_actions(CorporateActionsRequest(
             symbols=batch, start=HISTORY_START, end=through,
             types=[CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT,
-                   CorporateActionsType.CASH_DIVIDEND])).data, sleep))
+                   CorporateActionsType.CASH_DIVIDEND],
+            limit=None)).data, sleep))  # the default limit of 1000 would stop paging and drop later actions
         out = {}
         for s, raw in bars.items():
             raw = sorted(raw, key=lambda b: b.timestamp)
