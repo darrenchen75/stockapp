@@ -30,10 +30,12 @@ def qapp():
 class Sink(QObject):
     """Receives the worker's signals through bound methods, so Qt queues them onto this (the main) thread."""
 
-    def __init__(self, worker):
+    def __init__(self, worker, join=True):
         super().__init__()
+        self.join = join
         self.progress, self.finished, self.failed, self.stopped, self.threads = [], [], [], [], set()
         self.on_progress = None
+        self.worker, self.at_end = worker, []  # at_end: what a terminal slot sees when it runs
         worker.progressed.connect(self.got_progress)
         worker.finished.connect(self.got_finished)
         worker.failed.connect(self.got_failed)
@@ -45,14 +47,24 @@ class Sink(QObject):
         if self.on_progress:
             self.on_progress(stage, done, total)
 
+    def snapshot(self):
+        if self.join:
+            self.worker._thread.join(timeout=1)  # the terminal signal is the thread's last statement
+        root = self.worker.root
+        self.at_end.append((self.worker._thread.is_alive(), self.worker.busy,
+                            sorted(p.name for p in root.iterdir()) if root.exists() else []))
+
     def got_finished(self, record):
+        self.snapshot()
         self.threads.add(threading.current_thread())
         self.finished.append(record)
 
     def got_failed(self, text):
+        self.snapshot()
         self.failed.append(text)
 
     def got_stopped(self):
+        self.snapshot()
         self.stopped.append(True)
 
 
@@ -82,9 +94,9 @@ def fakes(tmp_path, monkeypatch):
                            strategy=strategy, make_clients=lambda: clients)
 
 
-def worker_for(fakes, strategy=None, settings_=SETTINGS):
+def worker_for(fakes, strategy=None, settings_=SETTINGS, join=True):
     w = RunWorker(str(strategy or fakes.strategy), settings_, fakes.make_clients, fakes.db_path, fakes.root, "0.1.4")
-    return w, Sink(w)
+    return w, Sink(w, join)
 
 
 def wait(condition, timeout=10.0):
@@ -98,7 +110,7 @@ def wait(condition, timeout=10.0):
 def run_to_end(worker, sink):
     worker.start()
     wait(lambda: sink.finished or sink.failed or sink.stopped)
-    wait(lambda: not worker.busy)
+    wait(lambda: not worker.busy)  # still needed: the thread may be a moment from exiting when the slot has run
     QApplication.processEvents()
 
 
@@ -207,6 +219,22 @@ def test_unloadable_strategy_fails_with_its_own_text(qapp, tmp_path, fakes):
     w, sink = worker_for(fakes)
     run_to_end(w, sink)
     assert "target_weights" in sink.failed[0] and list_runs(fakes.root) == []
+    assert str(fakes.strategy) in sink.failed[0] and ".strategy-" not in sink.failed[0]  # the user's file, not the scratch copy
+
+
+@pytest.mark.parametrize("how", ["finished", "failed", "stopped"])
+def test_terminal_signal_comes_after_cleanup(qapp, tmp_path, fakes, how):
+    if how == "failed":
+        fakes.strategy.write_text("x = 1\n")
+    w, sink = worker_for(fakes)
+    if how == "stopped":
+        fakes.stock.hook = w.cancel
+    run_to_end(w, sink)
+    assert bool(sink.finished) == (how == "finished") and bool(sink.failed) == (how == "failed")
+    assert bool(sink.stopped) == (how == "stopped")
+    [(alive, busy, left)] = sink.at_end
+    assert not alive and not busy  # the thread had ended by the time the slot could join it
+    assert not [n for n in left if n.startswith(".")]  # no scratch folder (a saved run folder may be there)
 
 
 def test_download_failure_saves_nothing(qapp, tmp_path, fakes, monkeypatch):
@@ -217,3 +245,25 @@ def test_download_failure_saves_nothing(qapp, tmp_path, fakes, monkeypatch):
     [text] = sink.failed
     assert text.startswith("Could not download daily data")
     assert list_runs(fakes.root) == [] and not sink.finished
+
+
+def test_slow_cleanup_finishes_before_the_terminal_signal(qapp, tmp_path, fakes, monkeypatch):
+    from app import compare_ui
+    real = compare_ui.shutil.rmtree
+
+    def slow_rmtree(*args, **kwargs):
+        time.sleep(0.3)  # an early terminal signal would reach its slot during this wait
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(compare_ui.shutil, "rmtree", slow_rmtree)
+    w, sink = worker_for(fakes, join=False)  # a joining sink slot would block this thread past the cleanup
+    seen = []
+
+    class Probe(QObject):
+        def look(self, *args):
+            seen.append(sorted(p.name for p in fakes.root.iterdir() if p.name.startswith(".")))
+
+    probe = Probe()
+    w.finished.connect(probe.look)
+    run_to_end(w, sink)
+    assert seen == [[]]

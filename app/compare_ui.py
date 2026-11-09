@@ -47,13 +47,17 @@ class RunWorker(QObject):
 
     def _work(self) -> None:
         store, scratch = None, None
+        outcome = None  # (signal, args), emitted last
         try:
             data = Path(self.strategy_path).read_bytes()  # read once: the code that runs is the code saved
             self.root.mkdir(parents=True, exist_ok=True)
             # a hidden folder, so list_runs skips it; importing the copy also writes a __pycache__ beside it
             scratch = Path(tempfile.mkdtemp(prefix=".strategy-", dir=self.root))
             (scratch / "strategy.py").write_bytes(data)
-            strategy = load_strategy(str(scratch / "strategy.py"))
+            try:
+                strategy = load_strategy(str(scratch / "strategy.py"))
+            except StrategyError as e:  # name the user's file, not the scratch copy
+                raise StrategyError(str(e).replace(str(scratch / "strategy.py"), self.strategy_path)) from e
             store = Store(self.db_path)  # sqlite3 connections belong to the thread that made them
             client, actions = self.make_clients()
             s, cancelled = self.settings, self._cancel.is_set
@@ -63,15 +67,17 @@ class RunWorker(QObject):
                               cancelled=cancelled)
             record = save_run(self.root, result, s, self.strategy_path, data, store.daily_through(),
                               self.app_version, cancelled=cancelled)
-            self.finished.emit(record)
+            outcome = self.finished, (record,)
         except Cancelled:
-            self.stopped.emit()
+            outcome = self.stopped, ()
         except (StrategyError, DownloadError, ValueError) as e:
-            self.failed.emit(one_line(str(e)))
+            outcome = self.failed, (one_line(str(e)),)
         except Exception as e:  # e.g. an unreadable strategy file or a full disk: the screen still needs an answer
-            self.failed.emit(one_line(f"{type(e).__name__}: {e}"))
+            outcome = self.failed, (one_line(f"{type(e).__name__}: {e}"),)
         finally:
             if store:
                 store.db.close()
             if scratch:
                 shutil.rmtree(scratch, ignore_errors=True)
+        # last statement, after cleanup: a slot that runs on this signal finds the store closed and the scratch gone
+        outcome[0].emit(*outcome[1])
