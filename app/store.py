@@ -74,6 +74,7 @@ class Store:
             "PRIMARY KEY(symbol, date)) WITHOUT ROWID"
         )
         self.db.execute("CREATE TABLE IF NOT EXISTS daily_meta(through TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS daily_symbols(symbol TEXT PRIMARY KEY) WITHOUT ROWID")
 
     def upsert(self, bars: Iterable[Bar]) -> None:
         with self.db:
@@ -116,6 +117,15 @@ class Store:
         with self.db:
             self.db.execute("DELETE FROM daily_meta")
             self.db.execute("INSERT INTO daily_meta VALUES (?)", (date,))
+
+    def daily_symbols(self) -> set[str]:
+        """The symbols the last finished daily download asked for."""
+        return {r[0] for r in self.db.execute("SELECT symbol FROM daily_symbols")}
+
+    def set_daily_symbols(self, symbols: Iterable[str]) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM daily_symbols")
+            self.db.executemany("INSERT INTO daily_symbols VALUES (?)", [(s,) for s in set(symbols)])
 
     def handled_splits(self) -> set[tuple[str, str]]:
         return set(self.db.execute("SELECT symbol, ex_date FROM splits"))

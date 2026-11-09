@@ -220,13 +220,13 @@ def main(argv=None) -> int:
         return fail("No Alpaca key found. Open Stock Bars once and enter your Alpaca key.")
     try:
         strategy = load_strategy(args.strategy)
-        store = Store(default_db_path())
+        store, symbols = Store(default_db_path()), universe()
         try:
-            refresh_daily(StockHistoricalDataClient(*keys), CorporateActionsClient(*keys), store, universe(),
+            refresh_daily(StockHistoricalDataClient(*keys), CorporateActionsClient(*keys), store, symbols,
                           progress=lambda done, total: print(f"downloaded {done}/{total}", file=sys.stderr))
         except Exception as e:
             return fail(f"Could not download daily data: {e}")
-        bars = load_bars(store)
+        bars = load_bars(store, symbols=symbols)
         last = bars.groupby("symbol")["date"].max()
         if "SPY" not in last or last["SPY"] < last.max():
             return fail(f"SPY data is incomplete: it stops before {str(last.max())[:10]}, "

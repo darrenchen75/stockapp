@@ -185,3 +185,11 @@ def test_daily_write_while_another_connection_reads(tmp_path):
     b.db.execute("SELECT * FROM bars").fetchall()
     a.replace_daily("A", [daily("A", "2020-01-03")])  # must not raise "database is locked"
     b.db.commit()
+
+
+def test_daily_symbols_round_trip(tmp_path):
+    s = Store(str(tmp_path / "bars.db"))
+    assert s.daily_symbols() == set()
+    s.set_daily_symbols(["B", "A"])
+    s.set_daily_symbols(["C", "A"])
+    assert s.daily_symbols() == {"A", "C"}

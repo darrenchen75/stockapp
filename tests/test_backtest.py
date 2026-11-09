@@ -7,6 +7,7 @@ import pytest
 from app import backtest
 from app.backtest import (StrategyError, history_as_of, load_strategy, main, prepare, rebalance, run,
                           validate_weights, write_results)
+from app.store import DailyBar
 from tests.backtest_cases import D, DIVIDEND, SPLIT, all_in, bars, plain
 from tests.test_daily import FakeActions, FakeClient, fake_day
 from tests.test_feed import HTTPError
@@ -222,3 +223,10 @@ def test_main_refuses_to_run_when_spy_ends_before_another_symbol(command, monkey
     lines = [l for l in capsys.readouterr().err.splitlines() if not l.startswith("downloaded")]
     assert len(lines) == 1 and lines[0].startswith("SPY data is incomplete")
     assert not (tmp_path / "out").exists()
+
+
+def test_main_ignores_cached_symbols_that_left_the_universe(command, tmp_path, capsys):
+    from app.store import Store
+    Store(str(tmp_path / "bars.db")).replace_daily("OLD", [DailyBar("OLD", "2020-01-09", 1, 1, 1, 1, 1, 1, 1)])
+    assert main(command) == 0  # OLD's later date would otherwise make SPY look incomplete
+    assert (tmp_path / "out" / "portfolio.csv").exists()

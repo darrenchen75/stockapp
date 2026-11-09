@@ -170,9 +170,35 @@ def test_fetch_daily_uses_new_york_date():
 def test_refresh_is_skipped_when_current(tmp_path):
     store = Store(str(tmp_path / "bars.db"))
     store.set_daily_through("2026-11-05")
+    store.set_daily_symbols(["A"])
     client, actions = good_client(["A"]), FakeActions()
     assert refresh_daily(client, actions, store, ["A"], now=NOW) is False
     assert client.requests == [] and actions.requests == []
+
+
+def test_refresh_after_a_refresh_with_the_same_symbols_is_skipped(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    assert refresh_daily(good_client(["A", "B"]), FakeActions(), store, ["A", "B"], now=NOW) is True
+    client = good_client(["A", "B"])
+    assert refresh_daily(client, FakeActions(), store, ["B", "A"], now=NOW) is False  # order does not matter
+    assert client.requests == []
+
+
+def test_refresh_with_a_different_symbol_set_downloads_again(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    refresh_daily(good_client(["A"]), FakeActions(), store, ["A"], now=NOW)
+    client = good_client(["A", "B"])
+    assert refresh_daily(client, FakeActions(), store, ["A", "B"], now=NOW) is True
+    assert client.requests and store.daily_symbols() == {"A", "B"}
+    assert {r[0] for r in store.daily_rows("2099-01-01")} == {"A", "B"}
+
+
+def test_failed_refresh_does_not_record_the_new_symbol_set(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    refresh_daily(good_client(["A"]), FakeActions(), store, ["A"], now=NOW)
+    with pytest.raises(HTTPError):
+        refresh_daily(good_client(["A", "B"]), FakeActions(error=HTTPError(500)), store, ["A", "B"], now=NOW)
+    assert store.daily_symbols() == {"A"}
 
 
 def test_refresh_sets_marker_only_when_finished(tmp_path):
@@ -292,6 +318,16 @@ def test_load_bars_hides_a_day_before_its_cutoff(tmp_path):
     assert after["date"].max() == pd.Timestamp("2026-11-05")
     assert list(after.columns) == ["symbol", "date", "o", "h", "l", "c", "v", "factor_all", "factor_split"]
     assert str(after["date"].dtype).startswith("datetime64")
+
+
+def test_load_bars_can_limit_the_symbols(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    store.replace_daily("A", [row("2026-11-04", "A")])
+    store.replace_daily("OLD", [row("2026-11-05", "OLD")])  # left over from a universe that has since changed
+    assert set(load_bars(store, now=NOW)["symbol"]) == {"A", "OLD"}
+    only = load_bars(store, now=NOW, symbols=["A", "SPY"])
+    assert set(only["symbol"]) == {"A"} and list(only.index) == [0]
+    assert load_bars(store, now=NOW, symbols=[]).empty
 
 
 def test_load_bars_empty_store(tmp_path):

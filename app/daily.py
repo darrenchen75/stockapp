@@ -117,11 +117,12 @@ def fetch_daily(client, actions, symbols, through: date, sleep=time.sleep) -> di
 
 def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.sleep,
                   progress=lambda done, total: None) -> bool:
-    """Download everything again unless the stored data already reaches the latest final day.
+    """Download everything again unless the stored data already reaches the latest final day
+    for the same symbols.
     Each symbol is replaced in one transaction; the marker is set last, so a failure retries all.
     Raises IncompleteDownload, with no marker, if SPY comes back empty."""
     through = last_final_date(now or datetime.now(timezone.utc))
-    if store.daily_through() == through.isoformat():
+    if store.daily_through() == through.isoformat() and store.daily_symbols() == set(symbols):
         return False
     total, got = -(-len(symbols) // MAX_SYMBOLS), set()
     for done, batch in enumerate(batches(client, actions, symbols, through, sleep), 1):
@@ -134,12 +135,14 @@ def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.s
         log.warning("no daily bars for %d symbols: %s", len(missing), ", ".join(missing))
     if "SPY" in missing:  # SPY sets the run's calendar, so a stale copy would silently shrink it
         raise IncompleteDownload("no daily bars for SPY; the marker is not set, so the next run retries")
+    store.set_daily_symbols(symbols)  # before the marker: a crash between them only costs a download
     store.set_daily_through(through.isoformat())
     return True
 
 
-def load_bars(store: Store, now=None) -> pd.DataFrame:
+def load_bars(store: Store, now=None, symbols=None) -> pd.DataFrame:
+    """All stored bars through the last final day, or only those of `symbols` if given."""
     through = last_final_date(now or datetime.now(timezone.utc))
     df = pd.DataFrame.from_records(list(store.daily_rows(through.isoformat())), columns=COLUMNS)
     df["date"] = pd.to_datetime(df["date"])
-    return df
+    return df if symbols is None else df[df["symbol"].isin(symbols)].reset_index(drop=True)
