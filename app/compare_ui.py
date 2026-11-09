@@ -515,6 +515,14 @@ class CompareWindow(QWidget):
         if self.run_worker:
             self.run_worker.cancel()
 
+    def closeEvent(self, event):
+        if self.busy:
+            if QMessageBox.question(self, "Compare backtests", "A backtest is running. Stop it and quit?") != QMessageBox.Yes:
+                event.ignore()
+                return
+            self.cancel_run()
+        super().closeEvent(event)
+
     def on_run_ended(self, text: str) -> None:
         self.run_worker = None  # the worker has finished its cleanup: it signals last
         self.run_dialog.set_running(False)

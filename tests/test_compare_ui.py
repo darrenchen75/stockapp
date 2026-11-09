@@ -2,13 +2,16 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from app import backtest, settings
 from app.backtest import main
@@ -584,3 +587,92 @@ def test_export_cancelled_writes_nothing(window_with_runs, monkeypatch):
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: ""))
     monkeypatch.setattr(compare_ui, "export_run", lambda *a: pytest.fail("exported after the user backed out"))
     window_with_runs.export(window_with_runs.records[0].id)
+
+
+# --- entry from the main window, and its guards ---
+@pytest.fixture
+def main_window(qapp, tmp_path, monkeypatch):
+    from app import ui
+    monkeypatch.setattr(ui.MainWindow, "start_poller", lambda self, keys: None)
+    monkeypatch.setattr(ui.MainWindow, "check_for_update", lambda self: None)
+    w = ui.MainWindow(str(tmp_path / "bars.db"), [], ("k", "s"), tmp_path)
+    yield w
+    w.compare = None
+    w.close()
+
+
+@pytest.fixture
+def main_window_with_busy_compare(main_window):
+    main_window.compare = SimpleNamespace(busy=True, cancel_run=Mock(), hide=Mock())
+    return main_window
+
+
+def ask(monkeypatch, answer):
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda parent, title, text, *a: asked.append(text) or answer))
+    return asked
+
+
+def test_viewer_still_does_not_import_backtest_modules():
+    text = Path("app/ui.py").read_text()
+    assert "import app.compare_ui" not in text.split("def open_backtests")[0]  # lazy import only
+    assert "from app.compare_ui" not in text.split("def open_backtests")[0]
+    assert "from app.runs" not in text.split("def open_backtests")[0]
+
+
+def test_backtests_menu_opens_one_compare_window(main_window, tmp_path, monkeypatch):
+    from app import runs
+    monkeypatch.setattr(runs, "runs_dir", lambda: tmp_path / "runs")
+    assert main_window.compare is None
+    action = [a for top in main_window.menuBar().actions() if top.text().replace("&", "") == "Tools"
+              for a in top.menu().actions() if a.text() == "Backtests…"]
+    assert len(action) == 1
+    action[0].trigger()
+    first = main_window.compare
+    assert isinstance(first, CompareWindow) and first.isVisible()
+    action[0].trigger()
+    assert main_window.compare is first
+    first.close()
+
+
+@pytest.mark.parametrize("answer, closes", [(QMessageBox.Yes, True), (QMessageBox.No, False)])
+def test_close_while_running_asks_and_cancels(main_window_with_busy_compare, monkeypatch, answer, closes):
+    w = main_window_with_busy_compare
+    asked = ask(monkeypatch, answer)
+    event = QCloseEvent()
+    w.closeEvent(event)
+    assert asked == ["A backtest is running. Stop it and quit?"]
+    assert event.isAccepted() is closes
+    assert w.compare.cancel_run.called is closes
+
+
+def test_updating_guard_runs_before_the_backtest_question(main_window_with_busy_compare, monkeypatch):
+    w = main_window_with_busy_compare
+    w.updating = True
+    asked = ask(monkeypatch, QMessageBox.Yes)
+    event = QCloseEvent()
+    w.closeEvent(event)
+    assert not event.isAccepted() and asked == [] and not w.compare.cancel_run.called
+    w.updating = False
+
+
+def test_update_offer_waits_while_running(main_window_with_busy_compare, monkeypatch):
+    w = main_window_with_busy_compare
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: pytest.fail("offered an update mid-run"))
+    w.offer_update(SimpleNamespace(version="9.9.9"))
+    assert w.lock.tryLock(0)  # the offer did not take the update lock
+    w.lock.unlock()
+    assert "9.9.9" not in w.declined
+
+
+@pytest.mark.parametrize("answer, closes", [(QMessageBox.Yes, True), (QMessageBox.No, False)])
+def test_compare_window_close_while_running_asks_and_cancels(window_with_runs, monkeypatch, answer, closes):
+    w = window_with_runs
+    w.run_worker = SimpleNamespace(cancel=Mock())
+    asked = ask(monkeypatch, answer)
+    event = QCloseEvent()
+    w.closeEvent(event)
+    assert asked == ["A backtest is running. Stop it and quit?"]
+    assert event.isAccepted() is closes
+    assert w.run_worker.cancel.called is closes
+    w.run_worker = None
