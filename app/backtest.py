@@ -1,7 +1,16 @@
 """Backtest price view: on decision day T a strategy sees earlier prices restated only for events up to T."""
+import argparse
+import importlib.util
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import pandas as pd
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
+
+from app.daily import default_db_path, load_bars, refresh_daily, universe
+from app.store import Store
 
 
 @dataclass(frozen=True)
@@ -149,3 +158,67 @@ def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=T
     portfolio["return"] = portfolio["value"].pct_change().fillna(0.0)
     cols = ["decided_on", "date", "symbol", "target_weight", "fill_price", "shares", "warning"]
     return Result(portfolio, pd.DataFrame(pos, columns=cols), dividends)
+
+
+def load_strategy(path: str):
+    try:
+        spec = importlib.util.spec_from_file_location("strategy", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:
+        raise StrategyError(f"cannot load {path}: {type(e).__name__}: {e}") from e
+    if not callable(getattr(module, "target_weights", None)):
+        raise StrategyError(f"{path} must define target_weights(history, as_of)")
+    return module.target_weights
+
+
+def write_results(result: Result, out_dir: str, source: str) -> None:
+    note = (f"# Today's S&P 500 members only, so results have survivorship bias. "
+            f"Data: {source}. Dividends: {'on' if result.dividends else 'off'}.\n")
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    for name, frame in (("portfolio.csv", result.portfolio), ("positions.csv", result.positions)):
+        with open(Path(out_dir) / name, "w", newline="") as f:
+            f.write(note)
+            frame.to_csv(f, index=False)
+
+
+SOURCE = "Alpaca SIP daily; Alpaca dividends miss some payouts (e.g. SPY 2016-03-18, 2018-06-15)"
+
+
+def main(argv=None) -> int:
+    from app import settings  # imported here because it pulls in Qt
+
+    ap = argparse.ArgumentParser(prog="python -m app.backtest", description="Backtest a strategy file.")
+    ap.add_argument("strategy")
+    ap.add_argument("--start", required=True, help="YYYY-MM-DD")
+    ap.add_argument("--end", required=True, help="YYYY-MM-DD")
+    ap.add_argument("--out", required=True, help="directory for portfolio.csv and positions.csv")
+    ap.add_argument("--capital", type=float, default=100_000.0)
+    ap.add_argument("--cost-bps", type=float, default=0.0)
+    ap.add_argument("--dividends", action=argparse.BooleanOptionalAction, default=True)
+    args = ap.parse_args(argv)
+
+    def fail(message):
+        print(message, file=sys.stderr)
+        return 1
+
+    keys = settings.load_keys()
+    if keys is None:
+        return fail("No Alpaca key found. Open Stock Bars once and enter your Alpaca key.")
+    try:
+        strategy = load_strategy(args.strategy)
+        store = Store(default_db_path())
+        try:
+            refresh_daily(StockHistoricalDataClient(*keys), CorporateActionsClient(*keys), store, universe(),
+                          progress=lambda done, total: print(f"downloaded {done}/{total}", file=sys.stderr))
+        except Exception as e:
+            return fail(f"Could not download daily data: {e}")
+        result = run(strategy, load_bars(store), args.start, args.end, args.capital, args.cost_bps, args.dividends)
+        write_results(result, args.out, SOURCE)
+    except (StrategyError, ValueError) as e:
+        return fail(str(e))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

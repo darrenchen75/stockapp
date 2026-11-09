@@ -1,9 +1,15 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from app.backtest import StrategyError, history_as_of, prepare, rebalance, validate_weights
-from tests.backtest_cases import D, DIVIDEND, SPLIT, bars
+from app import backtest
+from app.backtest import (StrategyError, history_as_of, load_strategy, main, prepare, rebalance, run,
+                          validate_weights, write_results)
+from tests.backtest_cases import D, DIVIDEND, SPLIT, all_in, bars, plain
+from tests.test_daily import FakeActions, FakeClient, fake_day
+from tests.test_feed import HTTPError
 
 # A has bars on D[0] and D[1] only (factors .5), B has all three days
 two_symbols = bars([("A", D[0], 100, 100, 10, .5, .5), ("A", D[1], 100, 100, 10, .5, .5),
@@ -99,3 +105,61 @@ def test_valid_weights_are_accepted():
     assert validate_weights({}, {"A"}, "2020-01-02") == {}
     assert validate_weights({"A": np.float64(.4), "B": np.float32(.5)}, {"A", "B"}, "2020-01-02")["A"] == .4
     assert validate_weights({"A": .5, "B": .5 + 1e-10}, {"A", "B"}, "2020-01-02")
+
+
+def test_load_strategy_runs_the_dummy():
+    fn = load_strategy("tests/fixtures/buy_spy.py")
+    assert fn({}, None) == {"SPY": 1.0}
+
+
+def test_load_strategy_without_function_is_a_clear_error(tmp_path):
+    path = tmp_path / "s.py"
+    path.write_text("x = 1\n")
+    with pytest.raises(StrategyError, match="target_weights"):
+        load_strategy(str(path))
+
+
+def test_results_carry_the_required_note(tmp_path):
+    write_results(run(all_in("A"), plain, D[0], D[3]), str(tmp_path), "Alpaca SIP daily")
+    for name in ("portfolio.csv", "positions.csv"):
+        first = (tmp_path / name).read_text().splitlines()[0]
+        assert first.startswith("#") and "survivorship bias" in first
+        assert "Alpaca SIP daily" in first and "Dividends: on" in first
+    assert len(pd.read_csv(tmp_path / "portfolio.csv", comment="#")) == 4
+
+
+@pytest.fixture
+def command(tmp_path, monkeypatch):
+    """Patch the key loader, db path, universe and both clients; returns the args and the keys to set."""
+    from app import settings
+    monkeypatch.setattr(settings, "load_keys", lambda: ("k", "s"))
+    monkeypatch.setattr(backtest, "default_db_path", lambda: str(tmp_path / "bars.db"))
+    monkeypatch.setattr(backtest, "universe", lambda: ["SPY"])
+    monkeypatch.setattr(backtest, "CorporateActionsClient", lambda *keys: FakeActions())
+    monkeypatch.setattr(backtest, "StockHistoricalDataClient",
+                        lambda *keys: FakeClient({"SPY": [fake_day(d) for d in D]}))
+    return ["tests/fixtures/buy_spy.py", "--start", D[0], "--end", D[3], "--out", str(tmp_path / "out")]
+
+
+def test_main_runs_end_to_end(command, tmp_path):
+    assert main(command) == 0
+    assert (tmp_path / "out" / "portfolio.csv").exists()
+
+
+def test_main_without_a_key_explains_what_to_do(command, monkeypatch, capsys):
+    from app import settings
+    monkeypatch.setattr(settings, "load_keys", lambda: None)
+    assert main(command) == 1
+    assert "Alpaca key" in capsys.readouterr().err
+
+
+def test_main_reports_a_failed_download(command, monkeypatch, capsys):
+    monkeypatch.setattr(backtest, "StockHistoricalDataClient", lambda *keys: FakeClient(errors=[HTTPError(403)]))
+    assert main(command) == 1
+    assert "Could not download" in capsys.readouterr().err
+
+
+def test_viewer_does_not_import_the_backtest():
+    for name in ("app/ui.py", "app/main.py"):
+        text = Path(name).read_text()
+        assert "app.backtest" not in text and "app.daily" not in text
