@@ -433,3 +433,33 @@ def test_delete_removes_the_run_and_its_tick(make_window):
     w = make_window(runs=2)
     w.tick(0)
     assert w.delete_row(0) and len(w.records) == 1 and w.ticked() == []
+
+
+def test_failed_benchmark_says_why_and_is_retried(make_window, monkeypatch):
+    from app import compare_ui
+    real = compare_ui.run
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk is locked")
+
+    monkeypatch.setattr(compare_ui, "run", boom)
+    w = make_window()
+    w.tick(0)
+    wait(lambda: not w.workers)
+    QApplication.processEvents()
+    assert "could not compute" in w.spy_note.text() and "RuntimeError: disk is locked" in w.spy_note.text()
+    assert len(lines(w)) == 1 and not w.benchmarks
+    monkeypatch.setattr(compare_ui, "run", real)
+    w.tick(1)  # a later refresh retries
+    spy_ready(w)
+    assert len(lines(w)) == 3 and w.spy_note.text() == ""
+
+
+def test_spy_without_rows_says_no_data(make_window):
+    w = make_window()
+    w.store.db.execute("DELETE FROM daily_bars")
+    w.store.db.commit()
+    w.tick(0)
+    wait(lambda: not w.workers)
+    QApplication.processEvents()
+    assert w.spy_note.text() == "SPY: no data" and len(lines(w)) == 1

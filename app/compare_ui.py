@@ -111,8 +111,9 @@ def percent(value: float | None, sign: bool = False) -> str:
 
 
 class BenchmarkWorker(QObject):
-    """Computes SPY buy-and-hold on a thread. Emits (generation, key, Result or None when SPY has no usable rows)."""
-    done = Signal(int, object, object)
+    """Computes SPY buy-and-hold on a thread. Emits (generation, key, Result, error): a Result; or no Result and
+    an empty error when SPY has no rows; or no Result and a one-line error."""
+    done = Signal(int, object, object, str)
 
     def __init__(self, db_path: str, generation: int, key: tuple, start: str, end: str):
         super().__init__()
@@ -122,18 +123,18 @@ class BenchmarkWorker(QObject):
         threading.Thread(target=self._work, daemon=True).start()
 
     def _work(self) -> None:
-        store, result = None, None
+        store, result, error = None, None, ""
         try:
             store = Store(self.db_path)
             bars = load_bars(store, symbols=["SPY"])
             if not bars.empty:
                 result = run(buy_spy, bars, self.start, self.end, BASE, 0.0, True)
-        except Exception:  # no SPY rows in the range, or unreadable data: shown as "no data"
-            result = None
+        except Exception as e:
+            error = one_line(f"{type(e).__name__}: {e}")
         finally:
             if store:
                 store.db.close()
-        self.done.emit(self.generation, self.key, result)  # last statement, after the store is closed
+        self.done.emit(self.generation, self.key, result, error)  # last statement, after the store is closed
 
 
 class CompareWindow(QWidget):
@@ -148,7 +149,8 @@ class CompareWindow(QWidget):
         self.loaded: dict[str, tuple] = {}  # run id -> (portfolio, positions)
         self.colors: dict[str, str] = {}  # ticked run id -> line colour
         self.mode = "growth"
-        self.benchmarks: dict[tuple, object] = {}  # (daily_through, start, end) -> Result, or None for no data
+        self.benchmarks: dict[tuple, object] = {}  # (daily_through, start, end) -> Result, or None for no SPY rows
+        self.spy_error: tuple | None = None  # (key, message) of the last failed computation; never cached
         self.generation, self.workers, self._updating = 0, {}, False  # workers: generation -> worker
 
         self.list = QListWidget()
@@ -330,16 +332,20 @@ class CompareWindow(QWidget):
         self.generation += 1  # any result still on its way is for an older selection
         if key is not None and key not in self.benchmarks:
             worker = BenchmarkWorker(self.db_path, self.generation, key, key[1], key[2])
+            self.spy_error = None  # a failure is retried, not remembered
             self.workers[self.generation] = worker  # referenced until it reports
             worker.done.connect(self.on_benchmark)
             worker.start_thread()
         self.redraw()
 
-    def on_benchmark(self, generation: int, key: tuple, result) -> None:
+    def on_benchmark(self, generation: int, key: tuple, result, error: str) -> None:
         self.workers.pop(generation, None)
         if generation != self.generation:
             return
-        self.benchmarks[key] = result
+        if error:
+            self.spy_error = key, error
+        else:
+            self.benchmarks[key] = result
         self.redraw()
         if result is not None:
             self.benchmark_ready.emit()
@@ -375,7 +381,8 @@ class CompareWindow(QWidget):
         if key is None:
             self.spy_note.setText("")
         elif key not in self.benchmarks:
-            self.spy_note.setText("SPY: loading…")
+            failed = self.spy_error and self.spy_error[0] == key
+            self.spy_note.setText(f"SPY: could not compute ({self.spy_error[1]})" if failed else "SPY: loading…")
         elif self.benchmarks[key] is None:
             self.spy_note.setText("SPY: no data")
         else:
