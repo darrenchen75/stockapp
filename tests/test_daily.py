@@ -341,6 +341,22 @@ def test_load_bars_can_limit_the_symbols(tmp_path):
     assert load_bars(store, now=NOW, symbols=[]).empty
 
 
+def test_load_bars_reads_only_those_symbols_from_the_store(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    store.replace_daily("A", [row("2026-11-04", "A")])
+    store.replace_daily("OLD", [row("2026-11-05", "OLD")])
+    real, fetched = store.daily_rows, []
+
+    def spy(*args):
+        rows = list(real(*args))
+        fetched.extend(rows)
+        return rows
+
+    store.daily_rows = spy
+    assert set(load_bars(store, now=NOW, symbols=["A"])["symbol"]) == {"A"}
+    assert {r[0] for r in fetched} == {"A"}  # filtered in SQL, not after reading every row
+
+
 def test_load_bars_empty_store(tmp_path):
     bars = load_bars(Store(str(tmp_path / "bars.db")), now=NOW)
     assert bars.empty and str(bars["date"].dtype).startswith("datetime64")

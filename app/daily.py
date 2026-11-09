@@ -151,6 +151,6 @@ def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.s
 def load_bars(store: Store, now=None, symbols=None) -> pd.DataFrame:
     """All stored bars through the last final day, or only those of `symbols` if given."""
     through = last_final_date(now or datetime.now(timezone.utc))
-    df = pd.DataFrame.from_records(list(store.daily_rows(through.isoformat())), columns=COLUMNS)
+    df = pd.DataFrame.from_records(list(store.daily_rows(through.isoformat(), symbols)), columns=COLUMNS)
     df["date"] = pd.to_datetime(df["date"])
-    return df if symbols is None else df[df["symbol"].isin(symbols)].reset_index(drop=True)
+    return df
