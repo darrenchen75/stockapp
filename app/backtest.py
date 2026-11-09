@@ -3,13 +3,14 @@ import argparse
 import importlib.util
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 
-from app.daily import default_db_path, load_bars, refresh_daily, universe
+from app.daily import default_db_path, last_final_date, load_bars, refresh_daily, universe
 from app.store import Store
 
 
@@ -110,8 +111,10 @@ class Result:
     dividends: bool
 
 
-def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=True) -> Result:
+def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=True, now=None) -> Result:
     """Decide on each day's final bar, fill at the next open, value at that day's close."""
+    through = pd.Timestamp(last_final_date(now or datetime.now(timezone.utc)))  # drop today's unfinished bar
+    bars = bars[pd.to_datetime(bars["date"]) <= through]
     prices = prepare(bars, dividends)
     days = [d for d in prices.days if pd.Timestamp(start) <= d <= pd.Timestamp(end)]
     if not days:

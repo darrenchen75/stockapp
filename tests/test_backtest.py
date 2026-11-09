@@ -163,3 +163,22 @@ def test_viewer_does_not_import_the_backtest():
     for name in ("app/ui.py", "app/main.py"):
         text = Path(name).read_text()
         assert "app.backtest" not in text and "app.daily" not in text
+
+
+live = bars([("A", d, 10, 10, 1, 1, 1) for d in ("2026-11-03", "2026-11-04", "2026-11-05")])
+
+
+@pytest.mark.parametrize("hour, minute, last", [(17, 0, "2026-11-04"), (20, 30, "2026-11-05")])
+def test_run_drops_a_bar_that_is_not_final_yet(hour, minute, last):
+    seen = []
+    now = pd.Timestamp(2026, 11, 5, hour, minute, tz="America/New_York")
+    r = run(lambda h, as_of: seen.append(as_of) or {"A": 1.0}, live, "2026-11-01", "2026-11-30", now=now)
+    assert seen[-1] == pd.Timestamp(last) and r.portfolio["date"].iloc[-1] == pd.Timestamp(last)
+    assert (r.positions["date"].dropna() <= pd.Timestamp(last)).all()
+
+
+def test_run_with_only_unfinished_days_has_no_trading_days():
+    now = pd.Timestamp(2026, 11, 5, 17, 0, tz="America/New_York")
+    with pytest.raises(ValueError, match="no trading days"):
+        run(all_in("A"), live, "2026-11-05", "2026-11-30", now=now)
+
