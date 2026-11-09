@@ -75,7 +75,7 @@ change once the reviewer answers (see "Waiting on the reviewer").
 | Unaffordable purchases | Scale all purchases by one common factor; never borrow |
 | Costs | One cost setting in basis points of traded value, default 0 |
 | Dividends | Included in returns; one setting switches to splits only |
-| Adjustment method | Raw prices plus per-day factors derived from Alpaca (see "Data") |
+| Adjustment method | Raw prices plus per-day factors built from Alpaca corporate actions (see "Data") |
 | Results | CSV files |
 
 ## Data
@@ -93,9 +93,19 @@ change once the reviewer answers (see "Waiting on the reviewer").
 splits and dividends, so a strategy on day T would see the effect of events after T.
 To prevent that:
 
-- Store raw daily bars (`Adjustment.RAW`), which never restate, plus a per-symbol,
-  per-day cumulative adjustment factor: adjusted close (`Adjustment.ALL`) divided by
-  raw close.
+- Store raw daily bars (`Adjustment.RAW`), which never restate, plus two per-symbol,
+  per-day cumulative factors built from Alpaca corporate actions (forward splits,
+  reverse splits and cash dividends):
+  - Split factor: the product of `old_rate / new_rate` over splits with an ex-date
+    after the day.
+  - Full factor: the split factor times the product of `1 - d / C` over cash dividends
+    with an ex-date after the day. `d` is the amount as paid and `C` is the raw close
+    on the last trading day before the ex-date. Records sharing an ex-date multiply.
+    Every cash dividend counts, because Alpaca's `special` flag is unreliable.
+  - Both factors are 1 on and after a symbol's last event.
+  - Alpaca's adjusted bars are not used. They are rounded to 2 decimals, including
+    split-adjusted closes before a split, which makes derived factors noisy.
+  - Other action types, such as spin-offs and stock dividends, are ignored for now.
 - For a decision on day T, the runner gives the strategy each earlier day t's price as
   `raw(t) * factor(t) / factor(T)`, so day T's own price equals what traded that day.
 - Adjust volume for splits only, on the same as-of-T basis. Dividends must not change it.
@@ -116,6 +126,23 @@ SIP daily bars, raw and adjusted:
 - Factor quality. Alpaca's rounding of adjusted prices could add noise to derived
   factors. If that noise would matter at the reconciliation tolerance, build the
   factors from Alpaca's corporate actions data (already used in `app/feed.py`) instead.
+
+Findings, 2026-11-08 (AAPL, F, SPY):
+
+- Free-plan SIP works. RAW, SPLIT and ALL each returned 2728 bars from 2016-01-04,
+  with matching dates. Daily timestamps are midnight New York time, so convert to New
+  York time before taking the date.
+- Factor quality failed. ALL/RAW moved by up to 4.0e-5 (AAPL) and 7.2e-4 (F) between
+  dividends, and SPLIT/RAW by about 2e-5 before a split (AAPL 2020-08-28: 124.81
+  against 499.23 / 4). The owner chose factors built from corporate actions. Built
+  that way, the factors are exactly constant between events. They reproduce Alpaca's
+  ALL closes to within $0.005 for AAPL and F.
+
+**Known data gaps.** Alpaca's SPY dividends for 2016-03-18 and 2018-06-15 are missing
+from both corporate actions and the ALL bars. For 2026-03-20, corporate actions says
+1.797 while the ALL bars imply about 1.829. No trusted second source exists, so nothing
+is corrected by hand. Results name the gaps, and a live check fails if they change.
+Reconciliation shows whether they matter.
 
 ## Strategy interface
 
@@ -183,7 +210,7 @@ Entry points:
 
 Results are one CSV of daily portfolio value and return, and one CSV of daily target
 weights, fill prices and positions per symbol. Both must carry a visible note of the
-data's survivorship bias, its feed and its dividend setting.
+data's survivorship bias, its feed, its dividend setting and its known dividend gaps.
 
 ## Reconciliation
 

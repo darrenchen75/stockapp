@@ -16,6 +16,7 @@
 - Viewer unchanged: startup, minute data (IEX) and update flow. `app/ui.py` and `app/main.py` must not import `app.daily` or `app.backtest`.
 - No real strategy in the repo. Only the dummy in `tests/fixtures/`.
 - Daily data: SIP feed, from 2016-01-01; never request bars newer than 15 minutes.
+- Factors come only from corporate actions, never from Alpaca's adjusted bars, which are rounded to 2 decimals (spec, "Prices as of each day").
 - Decision time: 20:30 New York time on day T. Fill at T+1's open.
 - A strategy never sees a day's bar before that day's cutoff, or adjustment from events after the decision day.
 - Cash never goes negative.
@@ -35,6 +36,8 @@
 ---
 
 ### Task 1: Verify the data source with a real key (gate)
+
+**Done 2026-11-08.** SIP passed; the factor gate failed. The owner chose factors built from corporate actions, and Tasks 3, 6 and 7 below reflect that. The findings are in the spec under "Verify first".
 
 Uses the owner's stored Alpaca key, read-only. The script is throwaway, so keep it in the session scratchpad and do not commit it. Never print the key.
 
@@ -164,7 +167,7 @@ git commit -m "feat: store daily bars with adjustment factors"
 - Test: `tests/test_daily.py`
 
 **Interfaces:**
-- Consumes: `DailyBar` and the `Store` daily methods from Task 2; `feed.MAX_SYMBOLS`, `feed.load_symbols`.
+- Consumes: `DailyBar` and the `Store` daily methods from Task 2; `feed.MAX_SYMBOLS`, `feed.load_symbols`. A bars client (`StockHistoricalDataClient`) and a corporate-actions client (`CorporateActionsClient`, called the way `feed.repair_splits` calls it).
 - Produces, in `app/feed.py`: `with_retries(call: Callable[[], T], sleep=time.sleep) -> T`, the existing 429 loop. `fetch` uses it, and `tests/test_feed.py` stays unchanged.
 - Produces, in `app/daily.py`:
   - `HISTORY_START = date(2016, 1, 1)`
@@ -172,14 +175,14 @@ git commit -m "feat: store daily bars with adjustment factors"
   - `last_final_date(now: datetime) -> date`: latest date whose decision time is at or before `now`
   - `universe() -> list[str]`: `load_symbols() + ["SPY"]`
   - `default_db_path() -> str`: `bars.db` in `user_data_dir("stockapp", appauthor=False)`, creating the directory
-  - `IncompleteDownload(Exception)`: its message names the affected symbols
-  - `fetch_daily(client, symbols, through: date, sleep=time.sleep) -> tuple[dict[str, list[DailyBar]], list[str]]`: complete symbols, then symbols whose RAW, SPLIT and ALL date sets differ
-  - `refresh_daily(client, store, symbols, now=None, sleep=time.sleep, progress=lambda done, total: None) -> bool`: True if it downloaded, False if already current. Raises `IncompleteDownload` after finishing the other symbols if any symbol's dates differ.
+  - `build_factors(closes: list[tuple[str, float]], splits: list[tuple[str, float]], dividends: list[tuple[str, float]]) -> list[tuple[float, float]]`: `closes` are `(date, raw close)` in date order; `splits` are `(ex_date, old_rate / new_rate)`; `dividends` are `(ex_date, amount as paid)`. Returns `(factor_all, factor_split)` for each close, per the spec's formulas.
+  - `fetch_daily(client, actions, symbols, through: date, sleep=time.sleep) -> dict[str, list[DailyBar]]`: RAW bars with factors from `build_factors`
+  - `refresh_daily(client, actions, store, symbols, now=None, sleep=time.sleep, progress=lambda done, total: None) -> bool`: True if it downloaded, False if already current
   - `load_bars(store, now=None) -> pandas.DataFrame`: columns `symbol, date, o, h, l, c, v, factor_all, factor_split`, with `date` as `datetime64` and only dates up to `last_final_date(now)`
 
 - [ ] **Step 1: Write the failing tests**
 
-Build a `FakeClient` as in `tests/test_feed.py` whose `get_stock_bars` looks up bars by `req.adjustment`, and records requests. Compare datetimes with the `utc` helper from `tests/test_feed.py`, since alpaca-py may normalize them.
+Build a `FakeClient` as in `tests/test_feed.py` whose `get_stock_bars` serves RAW bars and records requests. Build a fake actions client whose `get_corporate_actions` returns splits and cash dividends shaped like alpaca-py's models, and records requests. Compare datetimes with the `utc` helper from `tests/test_feed.py`, since alpaca-py may normalize them.
 
 ```python
 NOV5 = date(2026, 11, 5)  # a Thursday
@@ -188,65 +191,81 @@ def test_last_final_date_turns_at_2030_new_york():
     assert last_final_date(datetime(2026, 11, 5, 20, 29, tzinfo=ET)) == date(2026, 11, 4)
     assert last_final_date(datetime(2026, 11, 5, 20, 30, tzinfo=ET)) == NOV5
 
-def test_fetch_daily_requests_sip_day_bars_three_ways():
+def test_fetch_daily_requests_raw_sip_day_bars():
     client = make_client(...)
-    fetch_daily(client, ["A"], NOV5)
-    assert {r.adjustment for r in client.requests} == {Adjustment.RAW, Adjustment.SPLIT, Adjustment.ALL}
+    fetch_daily(client, actions, ["A"], NOV5)
+    assert all(r.adjustment == Adjustment.RAW for r in client.requests)
     assert all(r.feed == DataFeed.SIP and r.timeframe.value == TimeFrame.Day.value for r in client.requests)
     assert all(utc(r.start) == datetime(2016, 1, 1, tzinfo=ET).astimezone(timezone.utc) for r in client.requests)
     # 20:15 on `through`: at the 20:30 cutoff this is already 15 minutes old
     assert all(utc(r.end) == datetime(2026, 11, 5, 20, 15, tzinfo=ET).astimezone(timezone.utc) for r in client.requests)
 
+def test_fetch_daily_requests_splits_and_cash_dividends():
+    fetch_daily(make_client(...), actions, ["A"], NOV5)
+    assert {t for r in actions.requests for t in r.types} == {
+        CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT, CorporateActionsType.CASH_DIVIDEND}
+    assert all(r.start == HISTORY_START and r.end == NOV5 for r in actions.requests)
+
 def test_fetch_daily_batches_at_most_100_symbols():
     client = make_client(...)
-    fetch_daily(client, [f"S{i}" for i in range(101)], NOV5)
-    assert sorted(len(r.symbol_or_symbols) for r in client.requests) == [1, 1, 1, 100, 100, 100]
+    fetch_daily(client, actions, [f"S{i}" for i in range(101)], NOV5)
+    assert sorted(len(r.symbol_or_symbols) for r in client.requests) == [1, 100]
 
-def test_fetch_daily_derives_factors_from_closes():
-    # raw close 100, split-adjusted 25, fully adjusted 24
-    bars = fetch_daily(make_client(...), ["A"], NOV5)[0]["A"]
-    assert bars[0].c == 100 and bars[0].factor_split == 0.25 and bars[0].factor_all == 0.24
+def test_split_factor_before_a_4_for_1_split():
+    closes = [("2020-08-28", 499.23), ("2020-08-31", 129.04)]
+    assert build_factors(closes, [("2020-08-31", 0.25)], []) == [(0.25, 0.25), (1.0, 1.0)]
+
+def test_dividend_uses_the_close_before_the_ex_date():
+    # ex-date 2024-01-15 is not a trading day; the close before it is 2024-01-12's
+    closes = [("2024-01-11", 99.0), ("2024-01-12", 100.0), ("2024-01-16", 100.0)]
+    f = build_factors(closes, [], [("2024-01-15", 1.0)])
+    assert f == pytest.approx([(0.99, 1.0), (0.99, 1.0), (1.0, 1.0)])
+
+def test_same_day_dividends_multiply():
+    closes = [("2023-02-09", 10.0), ("2023-02-10", 10.0)]
+    f = build_factors(closes, [], [("2023-02-10", 0.15), ("2023-02-10", 0.65)])
+    assert f[0][0] == pytest.approx((1 - 0.015) * (1 - 0.065))
+
+def test_dividend_as_paid_before_a_split_uses_the_raw_close():
+    closes = [("2020-08-06", 400.0), ("2020-08-07", 400.0), ("2020-08-31", 100.0)]
+    f = build_factors(closes, [("2020-08-31", 0.25)], [("2020-08-07", 0.82)])
+    assert f[0] == pytest.approx((0.25 * (1 - 0.82 / 400), 0.25))
+    assert f[1] == pytest.approx((0.25, 0.25))
+
+def test_dividend_on_the_first_bar_needs_no_earlier_close():
+    assert build_factors([("2016-01-04", 10.0)], [], [("2016-01-04", 0.1)]) == [(1.0, 1.0)]
 
 def test_fetch_daily_uses_new_york_date():
     # timestamp 2020-01-02 05:00 UTC is midnight New York on 2020-01-02
-    assert fetch_daily(make_client(...), ["A"], NOV5)[0]["A"][0].date == "2020-01-02"
-
-def test_mismatched_dates_keep_old_history_and_other_symbols_finish(tmp_path):
-    # For A, ALL lacks one of RAW's two dates; B is complete
-    store.replace_daily("A", [old_row])
-    with pytest.raises(IncompleteDownload, match="A"):
-        refresh_daily(partial_client, store, ["A", "B"], now=...)
-    assert [r for r in store.daily_rows("2099-01-01") if r[0] == "A"] == [old_row_tuple]
-    assert "B" in {r[0] for r in store.daily_rows("2099-01-01")}
-    assert store.daily_through() is None
-
-def test_healthy_retry_replaces_the_whole_snapshot_after_a_mismatch(tmp_path):
-    with pytest.raises(IncompleteDownload):
-        refresh_daily(partial_client, store, ["A"], now=...)
-    assert refresh_daily(healthy_client, store, ["A"], now=...) is True
-    assert {r[1] for r in store.daily_rows("2099-01-01")} == {"2020-01-02", "2020-01-03"}
-    assert store.daily_through() == "2026-11-05"
+    assert fetch_daily(make_client(...), actions, ["A"], NOV5)["A"][0].date == "2020-01-02"
 
 def test_refresh_is_skipped_when_current(tmp_path):
     store.set_daily_through("2026-11-05")
-    assert refresh_daily(client, store, ["A"], now=datetime(2026, 11, 5, 21, 0, tzinfo=ET)) is False
-    assert client.requests == []
+    assert refresh_daily(client, actions, store, ["A"], now=datetime(2026, 11, 5, 21, 0, tzinfo=ET)) is False
+    assert client.requests == [] and actions.requests == []
 
 def test_refresh_sets_marker_only_when_finished(tmp_path):
-    assert refresh_daily(client, store, ["A"], now=datetime(2026, 11, 5, 21, 0, tzinfo=ET)) is True
+    assert refresh_daily(client, actions, store, ["A"], now=datetime(2026, 11, 5, 21, 0, tzinfo=ET)) is True
     assert store.daily_through() == "2026-11-05"
 
 def test_interrupted_refresh_leaves_marker_unset_and_symbols_consistent(tmp_path):
     # 2 batches; the client raises a non-429 error on the second batch's first request
     with pytest.raises(HTTPError):
-        refresh_daily(client, store, symbols_in_two_batches, now=...)
+        refresh_daily(client, actions, store, symbols_in_two_batches, now=...)
     assert store.daily_through() is None
     # first batch's symbols have rows; second batch's old rows are untouched
-    assert refresh_daily(healthy_client, store, symbols_in_two_batches, now=...) is True
+    assert refresh_daily(healthy_client, actions, store, symbols_in_two_batches, now=...) is True
+
+def test_failed_actions_request_keeps_old_rows_and_marker_unset(tmp_path):
+    store.replace_daily("A", [old_row])
+    with pytest.raises(HTTPError):
+        refresh_daily(client, failing_actions, store, ["A"], now=...)
+    assert list(store.daily_rows("2099-01-01")) == [old_row_tuple]
+    assert store.daily_through() is None
 
 def test_symbol_without_bars_keeps_old_rows_and_finishes(tmp_path):
     store.replace_daily("GONE", [old_row])
-    assert refresh_daily(client_without_gone, store, ["A", "GONE"], now=...) is True
+    assert refresh_daily(client_without_gone, actions, store, ["A", "GONE"], now=...) is True
     assert "GONE" in {r[0] for r in store.daily_rows("2099-01-01")}
 
 def test_load_bars_hides_a_day_before_its_cutoff(tmp_path):
@@ -274,9 +293,9 @@ Expected: `pyproject.toml` lists pandas, and the locked major version stays 3.x.
 
 - [ ] **Step 4: Extract `with_retries` in `app/feed.py`, and implement `app/daily.py`**
 
-The request `end` is `decision_time(through) - timedelta(minutes=15)`. `refresh_daily` computes `through = last_final_date(now)`, and each symbol gets one `replace_daily` call, so symbols stay internally consistent. Symbols with no bars in all three responses skip `replace_daily` and are logged.
+The bars request `end` is `decision_time(through) - timedelta(minutes=15)`. For each batch of at most `feed.MAX_SYMBOLS`, fetch RAW bars and the batch's corporate actions (forward splits, reverse splits, cash dividends, `HISTORY_START` through `through`), both through `with_retries`, before writing anything for that batch. `refresh_daily` computes `through = last_final_date(now)`, and each symbol gets one `replace_daily` call, so symbols stay internally consistent. Symbols with no bars skip `replace_daily` and are logged. A symbol with no actions has factors of 1. `set_daily_through` runs last, so any failure leaves the marker unset and the next run downloads again.
 
-A symbol whose date sets differ across RAW, SPLIT and ALL keeps its old rows untouched. `refresh_daily` finishes the other symbols, then raises `IncompleteDownload` without calling `set_daily_through`, so the next run downloads again and a backtest cannot run on a partial refresh. `set_daily_through` runs last, and only when no symbol was incomplete. If the mismatch persists for a symbol, the command keeps failing with its name; return to the owner rather than dropping dates.
+In `build_factors`, a split's value is `old_rate / new_rate` from alpaca-py's split models, and a dividend's amount is the cash dividend's `rate`. Do not filter on `special`. A dividend whose ex-date has no earlier close in `closes` affects no day, so it is skipped.
 
 `app/daily.py` must not import `app.settings` or anything from Qt.
 
@@ -289,7 +308,7 @@ Expected: all pass, including `tests/test_feed.py` unchanged.
 
 ```bash
 git add app/daily.py app/feed.py pyproject.toml uv.lock tests/test_daily.py
-git commit -m "feat: download daily bars with as-of adjustment factors"
+git commit -m "feat: download daily bars with factors from corporate actions"
 ```
 
 ---
@@ -569,7 +588,7 @@ def test_results_carry_the_required_note(tmp_path):
     assert len(pd.read_csv(tmp_path / "portfolio.csv", comment="#")) == 4
 
 def test_main_runs_end_to_end(tmp_path, monkeypatch):
-    # Patch the key loader, client and db path; the fake client serves SPY bars
+    # Patch the key loader, both clients and db path; the fake bars client serves SPY bars
     assert main(["tests/fixtures/buy_spy.py", "--start", D[0], "--end", D[3], "--out", str(tmp_path)]) == 0
     assert (tmp_path / "portfolio.csv").exists()
 
@@ -602,7 +621,7 @@ A `target_weights(history, as_of)` that returns `{"SPY": 1.0}`.
 
 Note line: `# Today's S&P 500 members only, so results have survivorship bias. Data: {source}. Dividends: {on|off}.`
 
-`main` imports `app.settings` inside the function, because it pulls in Qt. It refreshes daily data, prints progress to stderr, loads bars, runs, and writes with source `"Alpaca SIP daily"`. A missing key, `StrategyError`, `ValueError` or a download failure prints one line to stderr and returns 1. The no-key message: `No Alpaca key found. Open Stock Bars once and enter your Alpaca key.` Add `if __name__ == "__main__": sys.exit(main())`.
+`main` imports `app.settings` inside the function, because it pulls in Qt. It builds `StockHistoricalDataClient(*keys)` and `CorporateActionsClient(*keys)`, refreshes daily data, prints progress to stderr, loads bars, runs, and writes with source `"Alpaca SIP daily; Alpaca dividends miss some payouts (e.g. SPY 2016-03-18, 2018-06-15)"`. A missing key, `StrategyError`, `ValueError` or a download failure prints one line to stderr and returns 1. The no-key message: `No Alpaca key found. Open Stock Bars once and enter your Alpaca key.` Add `if __name__ == "__main__": sys.exit(main())`.
 
 - [ ] **Step 5: Run the whole suite**
 
@@ -642,14 +661,20 @@ def test_tsla_3_for_1_split():
 def test_aapl_25_cent_dividend():
     prev_close = raw_close("AAPL", "2024-08-09")
     assert ratio("AAPL", "factor_all", "2024-08-09", "2024-08-12") == pytest.approx(prev_close / (prev_close - 0.25), rel=1e-4)
+
+def test_known_spy_dividend_gaps_unchanged():
+    # Alpaca's known gaps (spec, "Known data gaps"); a failure means the data changed, so update the spec
+    dates = spy_dividends()
+    assert "2016-03-18" not in dates and "2018-06-15" not in dates
+    assert dates["2026-03-20"] == pytest.approx(1.797)
 ```
 
-`ratio(symbol, field, before, after)` is `factor(after) / factor(before)`, and fetches through `fetch_daily` with `settings.load_keys()`, using the complete symbols it returns.
+`ratio(symbol, field, before, after)` is `factor(after) / factor(before)`, and fetches through `fetch_daily` with both clients built from `settings.load_keys()`. `spy_dividends()` returns `{ex_date: rate}` for SPY's cash dividends from 2016-01-01, from `CorporateActionsClient`.
 
 - [ ] **Step 2: Run the live tests**
 
 Run: `STOCKBARS_LIVE=1 uv run pytest tests/test_daily_live.py -v`
-Expected: 3 passed. On a failure, check the event's date against Alpaca's corporate actions data before suspecting the code, and report the result.
+Expected: 4 passed. On a failure, check the event's date against Alpaca's corporate actions data before suspecting the code, and report the result.
 
 - [ ] **Step 3: Run a real end-to-end backtest**
 
@@ -659,7 +684,7 @@ Expected: exit 0, and `portfolio.csv` shows a total return close to SPY's publis
 - [ ] **Step 4: Confirm the default run skips the live tests**
 
 Run: `uv run pytest -q`
-Expected: all pass, 3 skipped.
+Expected: all pass, 4 skipped.
 
 - [ ] **Step 5: Commit**
 
