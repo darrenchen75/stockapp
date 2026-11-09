@@ -8,11 +8,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 from app import backtest, settings
 from app.backtest import main
-from app.compare_ui import MAX_TICKED, CompareWindow, RunWorker
+from app.compare_ui import MAX_TICKED, CompareWindow, RunDetail, RunWorker
 from app.runs import RunRecord, Settings, list_runs, save_run
 from app.store import DailyBar, Store
 from tests.backtest_cases import D, all_in, plain
@@ -463,3 +463,124 @@ def test_spy_without_rows_says_no_data(make_window):
     wait(lambda: not w.workers)
     QApplication.processEvents()
     assert w.spy_note.text() == "SPY: no data" and len(lines(w)) == 1
+
+
+# --- new run, detail, export ---
+CUSTOM = Settings(start=D[0], end=D[3], capital=50_000.0, cost_bps=7.5, dividends=False)
+
+
+@pytest.fixture
+def window_with_runs(qapp, tmp_path, fakes):
+    """A window over one saved run whose strategy file still exists, with the fake clients wired in."""
+    result = backtest.run(all_in("A"), plain, CUSTOM.start, CUSTOM.end, CUSTOM.capital, CUSTOM.cost_bps, False)
+    result.positions.loc[0, "warning"] = "no bar today: target not filled"
+    save_run(fakes.root, result, CUSTOM, str(fakes.strategy), fakes.strategy.read_bytes(), D[3], "0.1.4", now=NOW)
+    w = CompareWindow(fakes.db_path, fakes.root, fakes.make_clients, "0.1.4")
+    w.fakes = fakes
+    yield w
+    wait(lambda: not w.busy)
+    w.close()
+
+
+def cells(table):
+    return [[table.item(r, c).text() for c in range(table.columnCount())] for r in range(table.rowCount())]
+
+
+def test_rerun_prefills_settings(window_with_runs):
+    w = window_with_runs
+    dialog = w.rerun(w.records[0].id)
+    assert dialog.values() == (str(w.fakes.strategy), CUSTOM) and dialog.note() == ""
+
+
+def test_new_run_defaults(window_with_runs):
+    path, s = window_with_runs.new_run().values()
+    assert path == "" and (s.start, s.capital, s.cost_bps, s.dividends) == ("2016-01-04", 100_000.0, 0.0, True)
+    assert s.end >= "2026-01-01"  # the last final date, which is never in the future
+
+
+def test_rerun_uses_saved_copy_when_original_is_gone(window_with_runs):
+    w = window_with_runs
+    os.remove(w.fakes.strategy)
+    dialog = w.rerun(w.records[0].id)
+    assert dialog.values()[0] == str(w.records[0].folder / "strategy.py")
+    assert "Original file not found; using the copy saved with this run" in dialog.note()
+
+
+def test_new_and_rerun_disabled_while_busy(window_with_runs):
+    w = window_with_runs
+    gate = threading.Event()
+    w.fakes.stock.hook = lambda: gate.wait(10)  # holds the worker in its download
+    w.list.setCurrentRow(0)
+    assert w.new_button.isEnabled() and w.rerun_button.isEnabled()
+    dialog = w.rerun(w.records[0].id)
+    dialog.run_button.click()
+    assert w.busy and not w.new_button.isEnabled() and not w.rerun_button.isEnabled()
+    assert w.new_run() is None and w.rerun(w.records[0].id) is None
+    gate.set()
+    wait(lambda: not w.busy)
+    assert w.new_button.isEnabled() and w.rerun_button.isEnabled()
+    assert len(w.records) == 2 and not dialog.isVisible()  # the new run appears in the list
+
+
+def test_cancel_run_stops_and_saves_nothing(window_with_runs):
+    w = window_with_runs
+    gate = threading.Event()
+    w.fakes.stock.hook = lambda: gate.wait(10)
+    dialog = w.rerun(w.records[0].id)
+    dialog.run_button.click()
+    dialog.cancel_button.click()
+    assert w.busy  # still busy until the worker has stopped
+    gate.set()
+    wait(lambda: not w.busy)
+    assert len(w.records) == 1 and dialog.isVisible() and "Cancelled" in dialog.error.text()
+
+
+def test_failed_run_shows_one_message_in_the_dialog(window_with_runs):
+    w = window_with_runs
+    dialog = w.rerun(w.records[0].id)
+    dialog.path.setText(str(w.fakes.strategy.parent / "missing.py"))
+    dialog.run_button.click()
+    wait(lambda: not w.busy)
+    assert "missing.py" in dialog.error.text() and dialog.isVisible() and len(w.records) == 1
+
+
+def test_detail_shows_positions_and_warnings(window_with_runs):
+    record = window_with_runs.records[0]
+    d = RunDetail(window_with_runs, record)
+    assert [d.tabs.tabText(i) for i in range(d.tabs.count())] == ["Positions", "Warnings"]
+    assert d.picker.count() == 4  # one rebalance decision per day
+    first = cells(d.positions)
+    assert first and first[0][0] == "A" and first[0][-1] == "no bar today: target not filled"
+    d.picker.setCurrentIndex(1)
+    assert cells(d.positions) != first
+    assert any("no bar today: target not filled" in row for row in cells(d.warnings))
+    with open(record.folder / "portfolio.csv") as f:
+        assert d.note.text() == f.readline().removeprefix("# ").strip()
+
+
+def test_double_click_opens_detail(window_with_runs):
+    w = window_with_runs
+    w.list.itemDoubleClicked.emit(w.list.item(0))
+    assert isinstance(w.detail, RunDetail) and w.detail.isVisible()
+
+
+def test_export_copies_both_csvs(window_with_runs, tmp_path, monkeypatch):
+    w = window_with_runs
+    record = w.records[0]
+    out = tmp_path / "out"
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(out)))
+    w.list.setCurrentRow(0)
+    w.export_button.click()
+    for name in ("portfolio.csv", "positions.csv"):
+        assert (out / name).read_bytes() == (record.folder / name).read_bytes()
+    out2 = tmp_path / "out2"
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(out2)))
+    RunDetail(w, record).export_button.click()
+    assert (out2 / "portfolio.csv").exists() and (out2 / "positions.csv").exists()
+
+
+def test_export_cancelled_writes_nothing(window_with_runs, monkeypatch):
+    from app import compare_ui
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: ""))
+    monkeypatch.setattr(compare_ui, "export_run", lambda *a: pytest.fail("exported after the user backed out"))
+    window_with_runs.export(window_with_runs.records[0].id)
