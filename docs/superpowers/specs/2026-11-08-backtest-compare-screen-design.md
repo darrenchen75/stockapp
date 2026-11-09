@@ -88,6 +88,11 @@ point (menu item, toolbar button) is left to the builder.
   - Closing the window during a run asks for confirmation, then cancels the run.
   - The update offer waits until no run is in progress, the same way it already
     waits for other busy states.
+  - Cancel works at every stage: between download batches, between run days, after
+    the last day, and just before the saved run is published. The screen stays busy
+    until the worker has actually stopped.
+  - The strategy file's bytes are read once, before anything runs. That exact code
+    is executed and saved, so editing or deleting the file mid-run changes nothing.
   - `run()` gains two optional callbacks, one for progress and one that is checked
     for cancel at each day. The defaults keep the command's behavior unchanged.
   - A worker thread is acceptable. The builder may use a subprocess instead if a
@@ -106,6 +111,9 @@ point (menu item, toolbar button) is left to the builder.
     no run ticked, the chart shows a hint to tick a run, and nothing is plotted.
   - Its data: recomputed from the current daily data whenever it is shown. The
     legend shows the data date it used. It is not saved.
+  - It is computed off the UI thread and cached by data date and date range. A
+    result for a selection that has since changed is discarded. Run lines show at
+    once, and the SPY line follows.
   - With no daily data on this computer yet, the SPY entry is disabled, with a hint
     to run a backtest first.
   - It doesn't count toward the 6-run limit.
@@ -152,7 +160,9 @@ The statistics are defined once, in the module, so the command can print the sam
 figures later:
 
 - **Total return:** final value / starting capital − 1.
-- **Yearly growth (CAGR):** (final / start) ^ (365.25 / calendar days) − 1.
+- **Yearly growth (CAGR):** (final / start) ^ (365.25 / calendar days) − 1. It is
+  unavailable, shown as "—" and never marked best, when a run spans zero calendar
+  days.
 - **Worst drop:** the minimum over days of value / running maximum − 1.
 - **Rebalances:** the number of decision days with at least one trade.
 - **Warnings:** the number of position rows with a warning.

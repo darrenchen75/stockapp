@@ -27,7 +27,7 @@
 
 1. A seventh tick is refused with a message, and the six ticked runs stay ticked. Test in Task 5.
 2. A run folder with an unknown or older `format` version, or a damaged `run.json`, is still listed (marked) and never crashes the list. Test in Task 3.
-3. Closing the window or pressing Cancel mid-run saves nothing and leaves no partial run folder. Test in Task 4.
+3. Closing the window or pressing Cancel mid-run, during the download, on the last day or while saving, saves nothing and leaves no partial run folder. Test in Task 4.
 4. Two runs with capitals of $50,000 and $200,000 plot from the same $100,000 start. Test in Task 1.
 5. Re-run after the original strategy file was moved or deleted pre-fills the saved copy instead, with a note. Test in Task 6.
 
@@ -58,8 +58,8 @@ If Task 8 changed `Result`'s columns, update `RESULTS_FORMAT` in Task 2 and the 
   - `BASE = 100_000.0`
   - `growth(portfolio: DataFrame) -> Series`: `value` scaled so the first row is `BASE`, indexed by `date`
   - `drawdown(portfolio: DataFrame) -> Series`: `value / value.cummax() - 1`, indexed by `date`
-  - `summary(portfolio: DataFrame, positions: DataFrame) -> dict[str, float]` with keys `total_return`, `cagr`, `worst_drop`, `rebalances`, `warnings`
-  - `best(column_values: dict[str, dict[str, float]]) -> dict[str, str]`: for `total_return` and `cagr` the run id with the highest value, for `worst_drop` the one closest to zero; no entry for `rebalances` or `warnings`
+  - `summary(portfolio: DataFrame, positions: DataFrame) -> dict[str, float | None]` with keys `total_return`, `cagr`, `worst_drop`, `rebalances`, `warnings`. `cagr` is `None` when the first and last dates are the same calendar day, and the UI shows it as "—".
+  - `best(column_values: dict[str, dict[str, float | None]]) -> dict[str, str]`: for `total_return` and `cagr` the run id with the highest value, for `worst_drop` the one closest to zero; `None` values never win; no entry for `rebalances` or `warnings`
 
 Formulas (spec, "Same numbers as the command"): total return = final / first − 1; CAGR = (final / first) ^ (365.25 / calendar days) − 1; worst drop = min of drawdown; rebalances = number of distinct `decided_on` among `positions` rows with a non-NaN `fill_price`; warnings = count of non-empty `positions.warning`.
 
@@ -84,6 +84,11 @@ def test_summary_formulas():
     assert s["total_return"] == pytest.approx(0.21)
     assert s["cagr"] == pytest.approx(1.21 ** (365.25 / 365) - 1)
     assert s["worst_drop"] == 0 and s["rebalances"] == 2 and s["warnings"] == 1
+
+def test_single_day_run_has_no_cagr():
+    s = summary(portfolio([100]), pd.DataFrame(columns=["decided_on", "fill_price", "warning"]))
+    assert s["cagr"] is None and s["total_return"] == 0
+    assert best({"a": {**s, "cagr": None}, "b": {**s, "cagr": .1}})["cagr"] == "b"
 
 def test_best_marks_return_growth_and_smallest_drop_only():
     b = best({"a": {"total_return": .5, "cagr": .1, "worst_drop": -.3, "rebalances": 9, "warnings": 0},
@@ -120,10 +125,11 @@ git commit -m "feat: compute backtest statistics and chart series"
 
 **Interfaces:**
 - Consumes: the current `run`, `main`, `refresh_daily`, `load_bars`, `universe`, `default_db_path`, `SOURCE`.
-- Produces, in `app/backtest.py`:
-  - `Cancelled(Exception)`
-  - `run(..., now=None, progress=None, cancelled=None) -> Result`: `progress(done: int, total: int)` after each trading day; `cancelled() -> bool` checked before each day, raising `Cancelled` when True. Defaults leave behavior unchanged.
-  - `backtest(strategy, start, end, capital, cost_bps, dividends, client, actions, store, download_progress=None, progress=None, cancelled=None) -> Result`: refresh daily data, load `universe()` bars, apply the SPY-coverage check now in `main` (raise `ValueError` with the same message), then `run`. `main` calls it, so its output and messages stay identical.
+- Produces:
+  - In `app/daily.py`: `Cancelled(Exception)`, and `refresh_daily(..., cancelled=None)`, which checks `cancelled()` before each batch and raises `Cancelled` without setting the marker. Rows already replaced stay, consistent per symbol, as an interrupted refresh leaves them today.
+  - In `app/backtest.py`: `Cancelled` re-exported from `app.daily`. `app.daily` cannot import `app.backtest`, because `app.backtest` imports `app.daily`.
+  - `run(..., now=None, progress=None, cancelled=None) -> Result`: `progress(done: int, total: int)` after each trading day; `cancelled() -> bool` checked before each day AND once after the last day, raising `Cancelled` when True. Defaults leave behavior unchanged.
+  - `backtest(strategy, start, end, capital, cost_bps, dividends, client, actions, store, download_progress=None, progress=None, cancelled=None) -> Result`: refresh daily data (passing `cancelled`), load `universe()` bars, apply the SPY-coverage check now in `main` (raise `ValueError` with the same message), then `run`. `main` calls it, so its output and messages stay identical.
   - `buy_spy(history, as_of) -> dict`: returns `{"SPY": 1.0}` (the app's benchmark strategy)
   - `RESULTS_FORMAT = 1`: the version of `Result`'s column layout, saved with each run
 
@@ -140,6 +146,18 @@ def test_run_stops_when_cancelled():
     with pytest.raises(Cancelled):
         run(lambda h, d: seen.append(d) or {"A": 1.0}, plain, D[0], D[3], cancelled=lambda: len(seen) == 2)
     assert len(seen) == 2
+
+def test_cancel_during_the_last_day_still_cancels():
+    seen = []
+    with pytest.raises(Cancelled):
+        run(lambda h, d: seen.append(d) or {"A": 1.0}, plain, D[0], D[3], cancelled=lambda: len(seen) == 4)
+
+def test_refresh_stops_between_batches_when_cancelled(tmp_path):
+    # two batches (101 symbols); cancelled() turns True after the first batch's progress call
+    with pytest.raises(Cancelled):
+        refresh_daily(client, actions, store, symbols_in_two_batches, now=..., cancelled=flag,
+                      progress=lambda d, t: flag.set())
+    assert store.daily_through() is None and len(client.requests) == 1
 
 def test_backtest_matches_main(tmp_path, command):
     # `command` is the existing main-test fixture with patched clients and db path
@@ -167,8 +185,10 @@ Expected: all pass. The existing `main` tests pass unchanged.
 
 - [ ] **Step 5: Commit**
 
+The refresh test goes in `tests/test_daily.py`, reusing its two-batch fakes.
+
 ```bash
-git add app/backtest.py tests/test_backtest.py
+git add app/backtest.py app/daily.py tests/test_backtest.py tests/test_daily.py
 git commit -m "feat: share one backtest path with progress and cancel hooks"
 ```
 
@@ -186,7 +206,7 @@ git commit -m "feat: share one backtest path with progress and cancel hooks"
   - `Settings`, a frozen dataclass: `start: str, end: str, capital: float, cost_bps: float, dividends: bool`
   - `RunRecord`, a frozen dataclass: `id: str, folder: Path, name: str, settings: Settings | None, strategy_path: str, ran_at: str, data_through: str | None, app_version: str, format: int | None, readable: bool`
   - `runs_dir() -> Path`: `<user_data_dir("stockapp", appauthor=False)>/runs`, created on demand
-  - `save_run(root: Path, result: Result, settings: Settings, strategy_path: str, data_through: str | None, app_version: str, now: datetime | None = None) -> RunRecord`
+  - `save_run(root: Path, result: Result, settings: Settings, strategy_path: str, strategy_bytes: bytes, data_through: str | None, app_version: str, now: datetime | None = None, cancelled: Callable[[], bool] | None = None) -> RunRecord`. `strategy_bytes` is the exact code that ran, captured before execution by the caller. `save_run` never reads `strategy_path`. `cancelled()` is checked once more just before the staging folder is renamed into place; if it returns True, `save_run` removes the staging folder and raises `Cancelled`.
   - `list_runs(root: Path) -> list[RunRecord]`: newest first
   - `load_result(record: RunRecord) -> Result`
   - `rename_run(record: RunRecord, name: str) -> RunRecord`
@@ -199,7 +219,7 @@ Layout of one run (my call in the spec, "Format"): `runs/<id>/run.json`, `strate
 
 ```python
 def test_save_and_list_round_trip(tmp_path):
-    rec = save_run(tmp_path, result_of(plain), SETTINGS, str(strategy_file(tmp_path, "x = 1\n")), "2026-11-05", "0.1.4")
+    rec = save_run(tmp_path, result_of(plain), SETTINGS, "/gone/s.py", b"x = 1\n", "2026-11-05", "0.1.4")
     [listed] = list_runs(tmp_path)
     assert listed.name == "s.py" and listed.settings == SETTINGS and listed.readable and listed.format == RESULTS_FORMAT
     assert (listed.folder / "strategy.py").read_bytes() == b"x = 1\n"
@@ -212,6 +232,17 @@ def test_failed_save_leaves_no_run(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         save_run(tmp_path, ...)
     assert list_runs(tmp_path) == [] and not any(tmp_path.iterdir())
+
+def test_cancel_at_the_save_boundary_leaves_no_run(tmp_path):
+    with pytest.raises(Cancelled):
+        save_run(tmp_path, ..., cancelled=lambda: True)
+    assert list_runs(tmp_path) == [] and not any(tmp_path.iterdir())
+
+def test_truncated_current_format_csv_is_unreadable(tmp_path):
+    rec = save_run(tmp_path, ...)
+    (rec.folder / "portfolio.csv").write_text("# note\ndate,val")  # header cut short, no rows
+    [listed] = list_runs(tmp_path)
+    assert listed.readable is False
 
 def test_older_or_damaged_runs_are_listed_not_fatal(tmp_path):
     good = save_run(tmp_path, ...)
@@ -226,7 +257,7 @@ def test_older_or_damaged_runs_are_listed_not_fatal(tmp_path):
 def test_rename_delete_export(tmp_path): ...  # rename persists; delete removes the folder; export copies both CSVs byte-for-byte
 ```
 
-A record is `readable` when `run.json` parses, `format == RESULTS_FORMAT` and both CSVs exist. Older formats stay listed with `readable` set by whether their CSVs still load with today's columns.
+A record is `readable` when, for any `format`: `run.json` parses; both CSVs parse with `comment="#"`; `portfolio.csv` has `date` and `value` columns, at least one row, parseable dates and finite values; and `positions.csv` has `decided_on`, `fill_price` and `warning` columns. Older formats that pass these checks stay readable and are marked "older format" in the list. `list_runs` catches any exception per folder, so one bad run never hides the others.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -260,10 +291,18 @@ git commit -m "feat: save backtest runs with settings and a strategy copy"
 - Consumes: `backtest`, `load_strategy`, `Cancelled`, `StrategyError` (Task 2); `save_run`, `Settings`, `runs_dir` (Task 3); `Store`, `default_db_path`.
 - Produces, in `app/compare_ui.py`:
   - `RunWorker(QObject)` with signals `progressed(str, int, int)` (stage `"download"` or `"run"`, done, total), `finished(object)` (a `RunRecord`), `failed(str)` (one line), `stopped()`
-  - `RunWorker.__init__(self, strategy_path: str, settings: Settings, make_clients: Callable[[], tuple], store: Store, root: Path, app_version: str)`
-  - `RunWorker.start()` runs on a `threading.Thread` (the pattern `ui.py` already uses) and emits signals; `RunWorker.cancel()` sets a flag that `backtest`'s `cancelled` reads; `RunWorker.busy -> bool`
+  - `RunWorker.__init__(self, strategy_path: str, settings: Settings, make_clients: Callable[[], tuple], db_path: str, root: Path, app_version: str)`
+  - `RunWorker.start()` runs on a `threading.Thread` (the pattern `ui.py` already uses) and emits signals; `RunWorker.cancel()` sets a flag that the `cancelled` hooks read; `RunWorker.busy -> bool` stays True until the thread has exited, whether it finished, failed or stopped
 
-Messages: a `StrategyError` or `ValueError` emits its own text; a download failure emits `Could not download daily data: <error>`; `Cancelled` emits `stopped()`. Only success calls `save_run`, passing `store.daily_through()` as `data_through`.
+Order inside the thread:
+1. Read the strategy file's bytes once.
+2. Write them to a temp file under `root` and `load_strategy` that file, so the code that runs is the code saved.
+3. Open its own `Store(db_path)`. `sqlite3` connections belong to the thread that made them, as the viewer's `Poller` already does.
+4. `backtest(..., cancelled=...)`.
+5. `save_run(..., strategy_bytes=those bytes, data_through=store.daily_through(), cancelled=...)`.
+6. Close the store and delete the temp file in a `finally`.
+
+Messages: a `StrategyError` or `ValueError` emits its own text; a download failure emits `Could not download daily data: <error>`; `Cancelled` from any step emits `stopped()`. Only success saves.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -273,7 +312,12 @@ Use the fake clients from the Task 2 `command` fixture via `make_clients`. Wait 
 def test_worker_saves_a_successful_run(qapp, tmp_path, fakes): ...  # finished emits a RunRecord; list_runs has one run
 def test_worker_result_matches_command(qapp, tmp_path, fakes):
     # same strategy, dates and settings via main(...) and via RunWorker: CSV bytes identical
-def test_cancel_saves_nothing(qapp, tmp_path, fakes): ...  # cancel after the first "run" progress -> stopped; list_runs == []; no folders under root
+def test_worker_uses_a_real_sqlite_db_from_its_own_thread(qapp, tmp_path, fakes): ...  # db_path is a real temp file; no ProgrammingError
+@pytest.mark.parametrize("when", ["download", "last day", "save"])
+def test_cancel_saves_nothing(qapp, tmp_path, fakes, when): ...  # cancel at that point -> stopped; list_runs == []; no folders under root; busy False only after stopped
+def test_saved_copy_is_the_code_that_ran(qapp, tmp_path, fakes):
+    # strategy file edited on disk after the run starts (from the first "run" progress signal) -> saved strategy.py equals the original bytes
+def test_original_deleted_mid_run_still_saves(qapp, tmp_path, fakes): ...
 def test_strategy_error_names_the_date_and_saves_nothing(qapp, tmp_path, fakes): ...  # failed text contains D[0]
 def test_download_failure_saves_nothing(qapp, tmp_path, fakes): ...  # failed text starts with "Could not download daily data"
 ```
@@ -310,7 +354,8 @@ git commit -m "feat: run backtests on a worker thread with cancel"
 **Interfaces:**
 - Consumes: `growth`, `drawdown`, `summary`, `best`, `BASE` (Task 1); `list_runs`, `load_result`, `rename_run`, `delete_run` (Task 3); `run`, `buy_spy`, `load_bars` (Task 2).
 - Produces, in `app/compare_ui.py`:
-  - `CompareWindow(QWidget)`: `__init__(self, store: Store, root: Path, make_clients, app_version: str)`
+  - `CompareWindow(QWidget)`: `__init__(self, db_path: str, root: Path, make_clients, app_version: str)`. It keeps its own UI-thread `Store(db_path)`, used only for cheap reads (`daily_through`).
+  - `CompareWindow.benchmark_ready` signal, emitted when the SPY line arrives
   - `CompareWindow.reload()`: re-reads `list_runs(root)`
   - `CompareWindow.ticked() -> list[str]`: ticked run ids, in list order
   - `CompareWindow.set_mode(mode: str)`: `"growth"` or `"drawdown"`
@@ -318,7 +363,13 @@ git commit -m "feat: run backtests on a worker thread with cancel"
 
 Layout follows mockup option 5 (left list, chart, table under it). The run list is a `QListWidget` with checkable items: name, date range, cost. The SPY entry is pinned at the bottom and disabled, with a tooltip hint, when `load_bars` returns no SPY rows. The chart is a `pg.PlotWidget` with a `pg.DateAxisItem`, one line per ticked run, and SPY dashed gray. The table is a `QTableWidget` with one column per ticked run plus SPY, and rows Total return, Yearly growth, Worst drop, Rebalances, Warnings. Best cells are bold, and the SPY column is never bold. The results note from `SOURCE` sits under the table. Line colors: 6 colors differing in lightness as well as hue (builder's choice).
 
-SPY benchmark: `run(buy_spy, load_bars(store, symbols=["SPY"]), earliest_start, latest_end, BASE, 0.0, True)`, recomputed on every tick change. The legend shows `SPY (data to <daily_through>)`. With no run ticked, the chart shows the hint "Tick a run to compare" and plots nothing.
+SPY benchmark: `run(buy_spy, load_bars(store, symbols=["SPY"]), earliest_start, latest_end, BASE, 0.0, True)`. It is never computed on the UI thread:
+- A tick change starts the computation on a `threading.Thread` with its own `Store(db_path)`.
+- Results are cached in memory, keyed by `(daily_through, start, end)`.
+- Each request carries a generation number, and a result whose generation is no longer current is dropped.
+- Run lines and the table appear immediately. The SPY line and column appear when `benchmark_ready` fires, showing "SPY: loading…" until then.
+
+The legend shows `SPY (data to <daily_through>)`. With no run ticked, the chart shows the hint "Tick a run to compare" and plots nothing.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -329,7 +380,11 @@ def test_seventh_tick_is_refused(qapp, window_with_runs):  # 7 saved runs
         w.tick(i)
     assert len(w.ticked()) == 6 and "6" in w.message()
 
-def test_chart_has_one_line_per_ticked_run_plus_spy(qapp, window_with_runs): ...
+def test_chart_has_one_line_per_ticked_run_plus_spy(qapp, window_with_runs): ...  # SPY line counted after benchmark_ready
+def test_tick_change_returns_before_the_benchmark_is_computed(qapp, window_with_runs, monkeypatch):
+    # patch app.compare_ui.run so the benchmark call blocks on an Event; tick() returns, run lines are drawn, SPY shows "loading"
+def test_stale_benchmark_result_is_dropped(qapp, window_with_runs): ...  # tick A, then A+B; the A-only result arriving last does not replace the A+B one
+def test_single_day_run_shows_dash_for_growth(qapp, window_with_one_day_run): ...
 def test_lines_start_at_100k_whatever_the_capital(qapp, window_capitals_50k_200k): ...  # first y of each line == 100_000
 def test_table_bolds_best_but_never_spy(qapp, window_with_runs): ...
 def test_spy_disabled_without_daily_data(qapp, empty_store_window): ...
@@ -369,7 +424,7 @@ git commit -m "feat: compare saved backtest runs on one chart and table"
 - Test: `tests/test_compare_ui.py`
 
 **Interfaces:**
-- Consumes: `RunWorker` (Task 4), `CompareWindow` (Task 5), `export_run`, `load_result`, `Settings` (Task 3).
+- Consumes: `RunWorker` (Task 4, built with `db_path`), `CompareWindow` (Task 5), `export_run`, `load_result`, `Settings` (Task 3).
 - Produces, in `app/compare_ui.py`:
   - `NewRunDialog(QDialog)`: `__init__(self, parent, settings: Settings | None = None, strategy_path: str = "", fallback_path: str = "")`, with fields from mockup option 1. `values() -> tuple[str, Settings]`. A progress bar, a Cancel button and an error label are driven by a `RunWorker`.
   - `CompareWindow.new_run()` and `CompareWindow.rerun(run_id: str)`: both open the dialog. Re-run pre-fills it from the record. If `strategy_path` no longer exists, it pre-fills the saved `strategy.py` copy instead, and shows "Original file not found; using the copy saved with this run".
@@ -421,7 +476,7 @@ git commit -m "feat: add new-run dialog, run detail and export"
 
 **Interfaces:**
 - Consumes: `CompareWindow`, `CompareWindow.busy`, `CompareWindow.cancel_run()` (Tasks 5 and 6).
-- Produces: a `Backtests…` action in a `Tools` menu on `MainWindow.menuBar()` that lazily imports `app.compare_ui` and opens a single `CompareWindow`. `MainWindow.compare` holds it, or `None`.
+- Produces: a `Backtests…` action in a `Tools` menu on `MainWindow.menuBar()` that lazily imports `app.compare_ui` and opens a single `CompareWindow(self.db_path, runs_dir(), make_clients, VERSION)`, where `make_clients` builds `StockHistoricalDataClient(*self.keys)` and `CorporateActionsClient(*self.keys)`. `MainWindow.compare` holds it, or `None`.
 
 Behavior:
 - `offer_update` returns early, and offers again on the next daily check, while `self.compare` is busy.
