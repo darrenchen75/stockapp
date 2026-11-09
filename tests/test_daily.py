@@ -1,3 +1,4 @@
+import threading
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -6,7 +7,7 @@ import pytest
 from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.timeframe import TimeFrame
 
-from app.daily import (HISTORY_START, IncompleteDownload, build_factors, fetch_daily, last_final_date, load_bars,
+from app.daily import (HISTORY_START, Cancelled, IncompleteDownload, build_factors, fetch_daily, last_final_date, load_bars,
                        refresh_daily, universe)
 from app.store import ET, DailyBar, Store
 from tests.test_feed import HTTPError, utc
@@ -215,6 +216,16 @@ def test_refresh_reports_progress(tmp_path):
     refresh_daily(good_client(symbols), FakeActions(), store, symbols, now=NOW,
                   progress=lambda done, total: seen.append((done, total)))
     assert seen == [(1, 2), (2, 2)]
+
+
+def test_refresh_stops_between_batches_when_cancelled(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    symbols = [f"S{i:03}" for i in range(101)]  # 2 batches: 100, then 1
+    client, flag = good_client(symbols), threading.Event()
+    with pytest.raises(Cancelled):
+        refresh_daily(client, FakeActions(), store, symbols, now=NOW, cancelled=flag.is_set,
+                      progress=lambda done, total: flag.set())
+    assert store.daily_through() is None and len(client.requests) == 1
 
 
 def test_interrupted_refresh_leaves_marker_unset_and_symbols_consistent(tmp_path):

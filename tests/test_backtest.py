@@ -5,9 +5,10 @@ import pandas as pd
 import pytest
 
 from app import backtest
-from app.backtest import (StrategyError, history_as_of, load_strategy, main, prepare, rebalance, run,
-                          validate_weights, write_results)
-from app.store import DailyBar
+from app.backtest import backtest as run_backtest  # `backtest` stays the module, for monkeypatch
+from app.backtest import (SOURCE, Cancelled, StrategyError, history_as_of, load_strategy, main, prepare,
+                          rebalance, run, validate_weights, write_results)
+from app.store import DailyBar, Store
 from tests.backtest_cases import D, DIVIDEND, SPLIT, all_in, bars, plain
 from tests.test_daily import FakeActions, FakeClient, fake_day
 from tests.test_feed import HTTPError
@@ -148,6 +149,10 @@ def test_failed_export_leaves_existing_files_untouched_and_no_temp_files(tmp_pat
     assert sorted(p.name for p in tmp_path.iterdir()) == ["portfolio.csv", "positions.csv"]
 
 
+class Command(list):
+    """The main() arguments, plus the fake clients (stock, actions) and the store the fixture patched in."""
+
+
 @pytest.fixture
 def command(tmp_path, monkeypatch):
     """Patch the key loader, db path, universe and both clients; returns the args and the keys to set."""
@@ -155,10 +160,12 @@ def command(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "load_keys", lambda: ("k", "s"))
     monkeypatch.setattr(backtest, "default_db_path", lambda: str(tmp_path / "bars.db"))
     monkeypatch.setattr(backtest, "universe", lambda: ["SPY"])
-    monkeypatch.setattr(backtest, "CorporateActionsClient", lambda *keys: FakeActions())
-    monkeypatch.setattr(backtest, "StockHistoricalDataClient",
-                        lambda *keys: FakeClient({"SPY": [fake_day(d) for d in D]}))
-    return ["tests/fixtures/buy_spy.py", "--start", D[0], "--end", D[3], "--out", str(tmp_path / "out")]
+    clients = FakeClient({"SPY": [fake_day(d) for d in D]}), FakeActions()
+    monkeypatch.setattr(backtest, "CorporateActionsClient", lambda *keys: clients[1])
+    monkeypatch.setattr(backtest, "StockHistoricalDataClient", lambda *keys: clients[0])
+    args = Command(["tests/fixtures/buy_spy.py", "--start", D[0], "--end", D[3], "--out", str(tmp_path / "out")])
+    args.clients, args.store = clients, Store(str(tmp_path / "bars.db"))
+    return args
 
 
 def test_main_runs_end_to_end(command, tmp_path):
@@ -249,3 +256,35 @@ def test_main_ignores_cached_symbols_that_left_the_universe(command, tmp_path, c
     Store(str(tmp_path / "bars.db")).replace_daily("OLD", [DailyBar("OLD", "2020-01-09", 1, 1, 1, 1, 1, 1, 1)])
     assert main(command) == 0  # OLD's later date would otherwise make SPY look incomplete
     assert (tmp_path / "out" / "portfolio.csv").exists()
+
+
+def test_run_reports_progress_each_day():
+    calls = []
+    run(all_in("A"), plain, D[0], D[3], progress=lambda d, t: calls.append((d, t)))
+    assert calls == [(1, 4), (2, 4), (3, 4), (4, 4)]
+
+
+def test_run_stops_when_cancelled():
+    seen = []
+    with pytest.raises(Cancelled):
+        run(lambda h, d: seen.append(d) or {"A": 1.0}, plain, D[0], D[3], cancelled=lambda: len(seen) == 2)
+    assert len(seen) == 2
+
+
+def test_cancel_during_the_last_day_still_cancels():
+    seen = []
+    with pytest.raises(Cancelled):
+        run(lambda h, d: seen.append(d) or {"A": 1.0}, plain, D[0], D[3], cancelled=lambda: len(seen) == 4)
+
+
+def test_backtest_matches_main(command, tmp_path):
+    assert main(["tests/fixtures/buy_spy.py", "--start", D[0], "--end", D[3], "--out", str(tmp_path / "cli")]) == 0
+    result = run_backtest(load_strategy("tests/fixtures/buy_spy.py"), D[0], D[3], 100_000.0, 0.0, True,
+                      *command.clients, command.store)
+    write_results(result, str(tmp_path / "fn"), SOURCE)
+    for name in ("portfolio.csv", "positions.csv"):
+        assert (tmp_path / "cli" / name).read_bytes() == (tmp_path / "fn" / name).read_bytes()
+
+
+def test_buy_spy_and_results_format():
+    assert backtest.buy_spy({}, None) == {"SPY": 1.0} and backtest.RESULTS_FORMAT == 1
