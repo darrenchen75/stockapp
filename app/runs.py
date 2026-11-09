@@ -52,14 +52,14 @@ def save_run(root: Path, result: Result, settings: Settings, strategy_path: str,
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     run_id = now.strftime("%Y%m%d-%H%M%S")
-    if (root / run_id).exists():
+    if (root / run_id).exists() or (root / f".{run_id}.tmp").exists():  # a staging folder is another save's
         run_id += "-" + secrets.token_hex(2)
     staging, final = root / f".{run_id}.tmp", root / run_id
     meta = dict(name=re.split(r"[\\/]", strategy_path)[-1], settings=asdict(settings), strategy_path=strategy_path,
                 ran_at=now.isoformat(timespec="seconds"), data_through=data_through, app_version=app_version,
                 format=RESULTS_FORMAT)
+    staging.mkdir()  # outside the try: if it exists it is not ours to remove
     try:
-        staging.mkdir()
         (staging / "strategy.py").write_bytes(strategy_bytes)
         write_results(result, str(staging), SOURCE)
         (staging / "run.json").write_text(json.dumps(meta, indent=2))

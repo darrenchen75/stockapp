@@ -49,6 +49,14 @@ def test_same_second_gets_a_suffix(tmp_path):
     assert [r.id for r in list_runs(tmp_path)] == [b.id, a.id]
 
 
+def test_same_second_leaves_another_saves_staging_alone(tmp_path):
+    other = tmp_path / ".20261108-120000.tmp"  # another save of the same second, still writing
+    other.mkdir()
+    (other / "strategy.py").write_bytes(b"y = 2\n")
+    rec = save(tmp_path, now=NOW)
+    assert rec.id.startswith("20261108-120000-") and (other / "strategy.py").read_bytes() == b"y = 2\n"
+
+
 def test_failed_save_leaves_no_run(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise OSError("disk full")
