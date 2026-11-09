@@ -21,9 +21,10 @@ chose to merge them.
 
 ## Gate
 
-The owner's earlier rule stands: no screen code until the backtest matches the
-reviewer's real case (module plan, Task 8). The synthetic case does not unlock it.
-Planning can happen before then.
+**Lifted by the owner on 2026-11-08.** The screen is built before the backtest has been
+matched against the reviewer's real case (module plan, Task 8). If Task 8 changes the
+shape of results, saved runs are handled through the results format version (see
+"Saved runs"), and the screen is adjusted then.
 
 ## Goals
 

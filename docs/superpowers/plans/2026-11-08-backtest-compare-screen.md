@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Gate: no screen code until the module plan's Task 8 (reconciliation with the reviewer's real case) passes. Task 0 checks this.
+- Gate: lifted by the owner on 2026-11-08 (spec, "Gate"). Task 0 is done.
 - The screen must not reimplement `load_strategy`, `refresh_daily`, `load_bars`, `run` or `write_results`. The screen and `python -m app.backtest` produce identical `portfolio.csv` and `positions.csv` for the same inputs.
 - Statistics are computed from saved results each time they are shown, never stored.
 - At most 6 runs ticked at once. SPY is outside the limit.
