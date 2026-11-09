@@ -1,20 +1,21 @@
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, Qt
 from PySide6.QtWidgets import QApplication
 
 from app import backtest, settings
 from app.backtest import main
-from app.compare_ui import RunWorker
-from app.runs import RunRecord, Settings, list_runs
-from app.store import Store
-from tests.backtest_cases import D
+from app.compare_ui import MAX_TICKED, CompareWindow, RunWorker
+from app.runs import RunRecord, Settings, list_runs, save_run
+from app.store import DailyBar, Store
+from tests.backtest_cases import D, all_in, plain
 from tests.test_daily import FakeActions, FakeClient, fake_day
 from tests.test_feed import HTTPError
 
@@ -267,3 +268,168 @@ def test_slow_cleanup_finishes_before_the_terminal_signal(qapp, tmp_path, fakes,
     w.finished.connect(probe.look)
     run_to_end(w, sink)
     assert seen == [[]]
+
+
+# --- CompareWindow ---
+NOW = datetime(2026, 11, 8, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def save_one(root, i, capital=100_000.0, cost_bps=0.0, start=D[0], end=D[3]):
+    result = backtest.run(all_in("A"), plain, start, end, capital, cost_bps)
+    settings_ = Settings(start, end, capital, cost_bps, True)
+    return save_run(root, result, settings_, f"/x/s{i}.py", b"x = 1\n", D[3], "0.1.4", now=NOW + timedelta(seconds=i))
+
+
+@pytest.fixture
+def make_window(qapp, tmp_path):
+    made = []
+
+    def make(runs=3, spy=True, spy_growth=1.1, **save_kw):
+        root = tmp_path / "runs"
+        for i in range(runs):
+            save_one(root, i, cost_bps=i * 100.0, **save_kw)
+        store = Store(str(tmp_path / "bars.db"))
+        if spy:
+            store.replace_daily("SPY", [DailyBar("SPY", d, c, c, c, c, 1.0, 1.0, 1.0)
+                                        for d, c in zip(D, (100 * spy_growth ** i for i in range(4)))])
+            store.set_daily_through(D[3])
+        w = CompareWindow(str(tmp_path / "bars.db"), root, lambda: None, "0.1.4")
+        made.append(w)
+        return w
+
+    yield make
+    for w in made:
+        wait(lambda: not w.workers)
+        w.close()
+
+
+def lines(w):
+    return [(i.opts.get("name"), *i.getData()) for i in w.plot.plotItem.listDataItems()]
+
+
+def spy_ready(w):
+    seen = []
+    w.benchmark_ready.connect(lambda: seen.append(1))
+    wait(lambda: seen)
+
+
+def test_seventh_tick_is_refused(make_window):
+    w = make_window(runs=7)
+    for i in range(7):
+        w.tick(i)
+    assert len(w.ticked()) == MAX_TICKED == 6 and "6" in w.message()
+
+
+def test_chart_has_one_line_per_ticked_run_plus_spy(make_window):
+    w = make_window()
+    assert lines(w) == [] and w.plot.plotItem.titleLabel.text == "Tick a run to compare"
+    w.tick(0)
+    w.tick(1)
+    assert len(lines(w)) == 2 and w.spy_note.text() == "SPY: loading…"
+    spy_ready(w)
+    assert len(lines(w)) == 3 and lines(w)[-1][0] == f"SPY (data to {D[3]})" and w.spy_note.text() == ""
+
+
+def test_tick_change_returns_before_the_benchmark_is_computed(make_window, monkeypatch):
+    from app import compare_ui
+    real, gate = compare_ui.run, threading.Event()
+    monkeypatch.setattr(compare_ui, "run", lambda *a, **k: (gate.wait(10), real(*a, **k))[1])
+    w = make_window()
+    w.tick(0)  # returns while the benchmark blocks
+    assert len(lines(w)) == 1 and w.spy_note.text() == "SPY: loading…" and w.table.columnCount() == 1
+    gate.set()
+    spy_ready(w)
+    assert len(lines(w)) == 2 and w.table.columnCount() == 2
+
+
+def test_stale_benchmark_result_is_dropped(make_window, monkeypatch):
+    from app import compare_ui
+    real = compare_ui.run
+    gates = {}
+
+    def gated(strategy, bars, start, end, *args, **kwargs):
+        gates.setdefault((start, end), threading.Event()).wait(10)
+        return real(strategy, bars, start, end, *args, **kwargs)
+
+    monkeypatch.setattr(compare_ui, "run", gated)
+    w = make_window(runs=0)
+    save_one(w.root, 0, end=D[2])  # A: D0..D2
+    save_one(w.root, 1, start=D[1])  # B: D1..D3
+    w.reload()
+    seen = []
+    w.benchmark_ready.connect(lambda: seen.append(1))
+    w.tick(1)  # list is newest first: row 0 is B, row 1 is A
+    w.tick(0)
+    wait(lambda: len(gates) == 2)
+    gates[(D[0], D[3])].set()  # the A+B result arrives first
+    wait(lambda: seen)
+    gates[(D[0], D[2])].set()  # the A-only result arrives last
+    wait(lambda: len(w.workers) == 0)
+    QApplication.processEvents()
+    assert len(seen) == 1 and len(lines(w)[-1][1]) == 4  # still the 4-day A+B line
+
+
+def test_single_day_run_shows_dash_for_growth(make_window):
+    w = make_window(runs=1, start=D[0], end=D[0])
+    w.tick(0)
+    assert w.table.item(1, 0).text() == "—" and w.table.item(0, 0).text() == "+0.0%"
+
+
+def test_lines_start_at_100k_whatever_the_capital(make_window):
+    w = make_window(runs=0)
+    save_one(w.root, 0, capital=50_000.0)
+    save_one(w.root, 1, capital=200_000.0)
+    w.reload()
+    w.tick(0)
+    w.tick(1)
+    spy_ready(w)
+    assert len(lines(w)) == 3 and all(ys[0] == pytest.approx(100_000.0) for _, _, ys in lines(w))
+
+
+def test_table_bolds_best_but_never_spy(make_window):
+    w = make_window(spy_growth=2.0)  # SPY beats every run
+    for i in range(3):
+        w.tick(i)
+    spy_ready(w)
+    bold = lambda r, c: w.table.item(r, c).font().bold()
+    assert w.table.horizontalHeaderItem(3).text() == "SPY" and w.table.rowCount() == 5
+    # row 0 is the newest run (cost 200 bps), so the cheapest run is column 2
+    assert [bold(0, c) for c in range(4)] == [False, False, True, False]
+    assert not any(bold(r, 3) for r in range(5)) and not any(bold(r, c) for r in (3, 4) for c in range(4))
+
+
+def test_spy_disabled_without_daily_data(make_window):
+    w = make_window(spy=False)
+    w.tick(0)
+    assert not w.spy_item.flags() & Qt.ItemIsEnabled and w.spy_item.toolTip() and not w.workers
+    assert len(lines(w)) == 1 and w.table.columnCount() == 1
+
+
+def test_unreadable_run_is_listed_but_cannot_be_ticked(make_window):
+    w = make_window(runs=2)
+    (w.records[1].folder / "portfolio.csv").write_text("garbage")
+    w.reload()
+    assert len(w.records) == 2 and not w.records[1].readable and "damaged" in w.list.item(1).text()
+    assert not w.list.item(1).flags() & Qt.ItemIsUserCheckable
+    w.tick(1)
+    assert w.ticked() == []
+
+
+def test_drawdown_mode_plots_drawdown(make_window):
+    w = make_window()
+    w.tick(0)
+    spy_ready(w)
+    w.set_mode("drawdown")
+    assert len(lines(w)) == 2 and all(max(ys) <= 0 for _, _, ys in lines(w))
+
+
+def test_rename_rejects_a_blank_name_and_renames(make_window):
+    w = make_window(runs=1)
+    assert not w.rename_row(0, "   ") and "name" in w.message() and w.records[0].name == "s0.py"
+    assert w.rename_row(0, " mine ") and w.records[0].name == "mine" and "mine" in w.list.item(0).text()
+
+
+def test_delete_removes_the_run_and_its_tick(make_window):
+    w = make_window(runs=2)
+    w.tick(0)
+    assert w.delete_row(0) and len(w.records) == 1 and w.ticked() == []
