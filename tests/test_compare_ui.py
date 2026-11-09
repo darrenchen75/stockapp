@@ -372,6 +372,39 @@ def test_stale_benchmark_result_is_dropped(make_window, monkeypatch):
     assert len(seen) == 1 and len(lines(w)[-1][1]) == 4  # still the 4-day A+B line
 
 
+def count_benchmark_starts(monkeypatch):
+    from app import compare_ui
+    started, real = [], compare_ui.BenchmarkWorker.start_thread
+    monkeypatch.setattr(compare_ui.BenchmarkWorker, "start_thread", lambda self: (started.append(1), real(self)))
+    return started
+
+
+def test_same_dates_start_one_benchmark_worker(make_window, monkeypatch):
+    from app import compare_ui
+    real, gate = compare_ui.run, threading.Event()
+    monkeypatch.setattr(compare_ui, "run", lambda *a, **k: (gate.wait(10), real(*a, **k))[1])
+    started = count_benchmark_starts(monkeypatch)
+    w = make_window()  # every run spans D0..D3
+    w.tick(0)
+    w.tick(1)
+    assert len(started) == 1 and w.spy_note.text() == "SPY: loading…"
+    gate.set()
+    spy_ready(w)
+    assert len(started) == 1 and len(lines(w)) == 3
+
+
+def test_new_data_date_starts_a_worker_on_redraw(make_window, monkeypatch):
+    w = make_window()
+    w.tick(0)
+    spy_ready(w)
+    started = count_benchmark_starts(monkeypatch)
+    w.store.set_daily_through("2026-11-06")  # a download finished meanwhile
+    w.set_mode("drawdown")
+    assert len(started) == 1
+    spy_ready(w)
+    assert lines(w)[-1][0] == "SPY (data to 2026-11-06)" and w.spy_note.text() == ""
+
+
 def test_single_day_run_shows_dash_for_growth(make_window):
     w = make_window(runs=1, start=D[0], end=D[0])
     w.tick(0)

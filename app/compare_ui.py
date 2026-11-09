@@ -113,13 +113,13 @@ def percent(value: float | None, sign: bool = False) -> str:
 
 
 class BenchmarkWorker(QObject):
-    """Computes SPY buy-and-hold on a thread. Emits (generation, key, Result, error): a Result; or no Result and
-    an empty error when SPY has no rows; or no Result and a one-line error."""
-    done = Signal(int, object, object, str)
+    """Computes SPY buy-and-hold on a thread for key (daily_through, start, end). Emits (key, Result, error): a
+    Result; or no Result and an empty error when SPY has no rows; or no Result and a one-line error."""
+    done = Signal(object, object, str)
 
-    def __init__(self, db_path: str, generation: int, key: tuple, start: str, end: str):
+    def __init__(self, db_path: str, key: tuple):
         super().__init__()
-        self.db_path, self.generation, self.key, self.start, self.end = db_path, generation, key, start, end
+        self.db_path, self.key = db_path, key
 
     def start_thread(self) -> None:
         threading.Thread(target=self._work, daemon=True).start()
@@ -130,13 +130,13 @@ class BenchmarkWorker(QObject):
             store = Store(self.db_path)
             bars = load_bars(store, symbols=["SPY"])
             if not bars.empty:
-                result = run(buy_spy, bars, self.start, self.end, BASE, 0.0, True)
+                result = run(buy_spy, bars, self.key[1], self.key[2], BASE, 0.0, True)
         except Exception as e:
             error = one_line(f"{type(e).__name__}: {e}")
         finally:
             if store:
                 store.db.close()
-        self.done.emit(self.generation, self.key, result, error)  # last statement, after the store is closed
+        self.done.emit(self.key, result, error)  # last statement, after the store is closed
 
 
 DATE_FORMAT = "yyyy-MM-dd"
@@ -342,7 +342,8 @@ class CompareWindow(QWidget):
         self.mode = "growth"
         self.benchmarks: dict[tuple, object] = {}  # (daily_through, start, end) -> Result, or None for no SPY rows
         self.spy_error: tuple | None = None  # (key, message) of the last failed computation; never cached
-        self.generation, self.workers, self._updating = 0, {}, False  # workers: generation -> worker
+        self.workers: dict[tuple, BenchmarkWorker] = {}  # key -> running worker, referenced until it reports
+        self._updating = False
         self.run_worker: RunWorker | None = None  # held until its terminal signal arrives, or it could be collected
         self.run_dialog: NewRunDialog | None = None
         self.detail: RunDetail | None = None
@@ -626,24 +627,26 @@ class CompareWindow(QWidget):
                     item.setCheckState(Qt.Unchecked)
                     self.status.setText(one_line(f"Could not read {rec.name}: {e}"))
         self._updating = False
-        key = self._benchmark_key()
-        self.generation += 1  # any result still on its way is for an older selection
-        if key is not None and key not in self.benchmarks:
-            worker = BenchmarkWorker(self.db_path, self.generation, key, key[1], key[2])
-            self.spy_error = None  # a failure is retried, not remembered
-            self.workers[self.generation] = worker  # referenced until it reports
-            worker.done.connect(self.on_benchmark)
-            worker.start_thread()
+        self.spy_error = None  # a refresh retries a failure
         self.redraw()
 
-    def on_benchmark(self, generation: int, key: tuple, result, error: str) -> None:
-        self.workers.pop(generation, None)
-        if generation != self.generation:
+    def _start_benchmark(self, key) -> None:
+        # not for a failed key: redraw would restart a failing worker in a loop
+        if key is None or key in self.benchmarks or key in self.workers or (self.spy_error and self.spy_error[0] == key):
             return
+        worker = BenchmarkWorker(self.db_path, key)
+        self.workers[key] = worker
+        worker.done.connect(self.on_benchmark)
+        worker.start_thread()
+
+    def on_benchmark(self, key: tuple, result, error: str) -> None:
+        self.workers.pop(key, None)
+        if not error:
+            self.benchmarks[key] = result  # the key holds the data date, so a result stays valid under it
+        if key != self._benchmark_key():
+            return  # for a selection that has since changed: never shown
         if error:
             self.spy_error = key, error
-        else:
-            self.benchmarks[key] = result
         self.redraw()
         if result is not None:
             self.benchmark_ready.emit()
@@ -676,6 +679,7 @@ class CompareWindow(QWidget):
             columns[i] = summary(portfolio, positions)
         spy_stats = None
         key = self._benchmark_key()
+        self._start_benchmark(key)
         if key is None:
             self.spy_note.setText("")
         elif key not in self.benchmarks:
