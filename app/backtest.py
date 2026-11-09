@@ -96,7 +96,10 @@ def rebalance(shares, cash, targets, open_px, last_px, cost_bps=0.0) -> Fill:
     scale = cash / need if need > cash else 1.0
     for s, d in buys.items():
         new[s] = new.get(s, 0) + d * scale
-    return Fill({s: n for s, n in new.items() if n > 0}, max(0.0, cash - need * scale), need - cash > tol,
+    left = cash - need * scale
+    if left < -tol:  # only rounding error may be clamped away
+        raise ValueError(f"rebalance would leave negative cash: {left}")
+    return Fill({s: n for s, n in new.items() if n > 0}, max(0.0, left), need - cash > tol,
                 sorted(s for s, w in targets.items() if w > 0 and s not in open_px))
 
 
