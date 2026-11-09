@@ -149,6 +149,19 @@ def test_dividend_on_the_first_bar_needs_no_earlier_close():
     assert build_factors([("2016-01-04", 10.0)], [], [("2016-01-04", 0.1)]) == [(1.0, 1.0)]
 
 
+@pytest.mark.parametrize("amount", [10.0, 12.0, -1.0, 0.0])
+def test_implausible_dividend_is_skipped_with_a_warning(amount, caplog):
+    closes = [("2024-01-11", 10.0), ("2024-01-12", 10.0)]
+    with caplog.at_level("WARNING", logger="app.daily"):
+        assert build_factors(closes, [], [("2024-01-12", amount)]) == [(1.0, 1.0), (1.0, 1.0)]
+    assert "2024-01-12" in caplog.text and str(amount) in caplog.text
+
+
+def test_dividend_after_a_zero_close_is_skipped():
+    closes = [("2024-01-11", 0.0), ("2024-01-12", 10.0)]
+    assert build_factors(closes, [], [("2024-01-12", 0.1)]) == [(1.0, 1.0), (1.0, 1.0)]
+
+
 def test_fetch_daily_uses_new_york_date():
     # timestamp 2020-01-02 05:00 UTC is midnight New York on 2020-01-02
     assert fetch_daily(good_client(["A"]), FakeActions(), ["A"], NOV5)["A"][0].date == "2020-01-02"

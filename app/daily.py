@@ -51,8 +51,13 @@ def build_factors(closes: list[tuple[str, float]], splits: list[tuple[str, float
         split_at[ex] *= ratio
     for ex, amount in dividends:
         i = bisect_left(dates, ex)  # closes before the ex-date are closes[:i]
-        if i:
-            div_at[ex] *= 1 - amount / closes[i - 1][1]
+        if not i:
+            continue
+        close = closes[i - 1][1]
+        if 0 < amount < close:
+            div_at[ex] *= 1 - amount / close
+        else:  # a bad record would make the factor zero, negative or infinite
+            log.warning("skipped dividend of %s on %s: not between 0 and the prior close %s", amount, ex, close)
     events = sorted(set(split_at) | set(div_at), reverse=True)
     out, split_f, all_f, e = [], 1.0, 1.0, 0
     for d in reversed(dates):
