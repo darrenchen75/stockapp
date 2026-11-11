@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
         self.progress: QProgressDialog | None = None
         self.resume_requested = False
         self.updating = False
+        self.compare = None  # the backtest compare window, once opened
         self.store = Store(db_path)
         self.symbol: str | None = None
         self.range = "1D"
@@ -150,6 +151,7 @@ class MainWindow(QMainWindow):
         split.addWidget(right)
         split.setSizes([520, 680])
         self.setCentralWidget(split)
+        self.menuBar().addMenu("Tools").addAction("Backtests…", self.open_backtests)
 
         # Bound methods of QObjects on the UI thread: Qt queues these cross-thread calls.
         self.progressed.connect(self.on_progress)
@@ -206,7 +208,22 @@ class MainWindow(QMainWindow):
         if release is not None:
             self.update_found.emit(release)
 
+    def open_backtests(self):
+        if self.compare is None:  # imported here so the viewer never loads the backtest code
+            from app.compare_ui import CompareWindow
+            from app.runs import runs_dir
+
+            def make_clients():
+                return StockHistoricalDataClient(*self.keys), CorporateActionsClient(*self.keys)
+
+            self.compare = CompareWindow(self.db_path, runs_dir(), make_clients, VERSION)
+        self.compare.show()
+        self.compare.raise_()
+        self.compare.activateWindow()
+
     def offer_update(self, release: update.Release):
+        if self.compare is not None and self.compare.busy:
+            return  # offered again on the next daily check
         if release.version in self.declined or not self.lock.tryLock(0):
             return
         box = QMessageBox(QMessageBox.Question, "Stock Bars",
@@ -335,6 +352,14 @@ class MainWindow(QMainWindow):
         if self.updating:  # quitting mid-swap could leave no app installed
             event.ignore()
             return
+        if self.compare is not None:
+            if self.compare.busy:
+                answer = QMessageBox.question(self, "Stock Bars", "A backtest is running. Stop it and quit?")
+                if answer != QMessageBox.Yes:
+                    event.ignore()
+                    return
+                self.compare.cancel_run()
+            self.compare.hide()  # a visible compare window would keep the app running
         if self.poller:
             self.poller.stop.set()
         self.lock.unlock()  # still held only when paused for update; a no-op otherwise

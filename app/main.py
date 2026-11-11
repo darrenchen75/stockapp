@@ -14,6 +14,9 @@ APP = "stockapp"
 
 
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--selftest":  # CI runs this on each packaged app
+        from app import backtest  # imported here so the viewer never loads the backtest code
+        return backtest.selftest(sys.argv[2])
     log_dir = Path(user_log_dir(APP, appauthor=False))
     log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(

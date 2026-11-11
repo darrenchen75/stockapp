@@ -104,10 +104,14 @@ class Store:
                 [(b.symbol, b.date, b.o, b.h, b.l, b.c, b.v, b.factor_all, b.factor_split) for b in bars],
             )
 
-    def daily_rows(self, through: str) -> Iterable[tuple]:
-        return self.db.execute(
-            "SELECT * FROM daily_bars WHERE date <= ? ORDER BY date, symbol", (through,)
-        )
+    def daily_rows(self, through: str, symbols: Iterable[str] | None = None) -> Iterable[tuple]:
+        """Rows through `through`, or only those of `symbols` if given."""
+        sql, args = "SELECT * FROM daily_bars WHERE date <= ?", [through]
+        if symbols is not None:
+            symbols = list(symbols)
+            sql += f" AND symbol IN ({','.join('?' * len(symbols))})"
+            args += symbols
+        return self.db.execute(sql + " ORDER BY date, symbol", args)
 
     def daily_through(self) -> str | None:
         row = self.db.execute("SELECT through FROM daily_meta").fetchone()

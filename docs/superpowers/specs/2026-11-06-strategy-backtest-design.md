@@ -238,6 +238,10 @@ This stage's module work is finished only when the reviewer's case passes.
 
 ## App screen
 
+**Replaced 2026-11-08** by `docs/superpowers/specs/2026-11-08-backtest-compare-screen-design.md`.
+The owner chose a compare-runs screen that also absorbs the performance page. The text
+below is kept for history.
+
 The owner chose to build this once reconciliation passes, so it waits for the reviewer's
 real case. The synthetic case does not unlock it. Plan it separately, as a second plan
 started when that case passes. It stays minimal:

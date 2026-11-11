@@ -1,3 +1,4 @@
+import threading
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -6,7 +7,7 @@ import pytest
 from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.timeframe import TimeFrame
 
-from app.daily import (HISTORY_START, IncompleteDownload, build_factors, fetch_daily, last_final_date, load_bars,
+from app.daily import (HISTORY_START, Cancelled, IncompleteDownload, build_factors, fetch_daily, last_final_date, load_bars,
                        refresh_daily, universe)
 from app.store import ET, DailyBar, Store
 from tests.test_feed import HTTPError, utc
@@ -217,6 +218,16 @@ def test_refresh_reports_progress(tmp_path):
     assert seen == [(1, 2), (2, 2)]
 
 
+def test_refresh_stops_between_batches_when_cancelled(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    symbols = [f"S{i:03}" for i in range(101)]  # 2 batches: 100, then 1
+    client, flag = good_client(symbols), threading.Event()
+    with pytest.raises(Cancelled):
+        refresh_daily(client, FakeActions(), store, symbols, now=NOW, cancelled=flag.is_set,
+                      progress=lambda done, total: flag.set())
+    assert store.daily_through() is None and len(client.requests) == 1
+
+
 def test_interrupted_refresh_leaves_marker_unset_and_symbols_consistent(tmp_path):
     store = Store(str(tmp_path / "bars.db"))
     symbols = [f"S{i:03}" for i in range(101)]  # 2 batches: 100, then 1
@@ -328,6 +339,22 @@ def test_load_bars_can_limit_the_symbols(tmp_path):
     only = load_bars(store, now=NOW, symbols=["A", "SPY"])
     assert set(only["symbol"]) == {"A"} and list(only.index) == [0]
     assert load_bars(store, now=NOW, symbols=[]).empty
+
+
+def test_load_bars_reads_only_those_symbols_from_the_store(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    store.replace_daily("A", [row("2026-11-04", "A")])
+    store.replace_daily("OLD", [row("2026-11-05", "OLD")])
+    real, fetched = store.daily_rows, []
+
+    def spy(*args):
+        rows = list(real(*args))
+        fetched.extend(rows)
+        return rows
+
+    store.daily_rows = spy
+    assert set(load_bars(store, now=NOW, symbols=["A"])["symbol"]) == {"A"}
+    assert {r[0] for r in fetched} == {"A"}  # filtered in SQL, not after reading every row
 
 
 def test_load_bars_empty_store(tmp_path):
