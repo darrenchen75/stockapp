@@ -19,7 +19,7 @@ from app.backtest import (SOURCE, Cancelled, DownloadError, StrategyError, backt
                           RESULTS_FORMAT)
 from app.daily import last_final_date, load_bars
 from app.runs import RunRecord, Settings, delete_run, export_run, list_runs, load_result, rename_run, save_run
-from app.stats import BASE, best, drawdown, growth, summary
+from app.stats import BASE, best, drawdown, growth, risk, summary
 from app.store import Store
 
 
@@ -100,6 +100,7 @@ MAX_TICKED = 6
 COLORS = ["#3a6bff", "#ffd24a", "#ef5350", "#4dd0c8", "#7b3fb0", "#ff8c3a"]
 SPY_COLOR = "#9e9e9e"
 ROWS = [("total_return", "Total return"), ("cagr", "Yearly growth"), ("worst_drop", "Worst drop"),
+        ("volatility", "Volatility"), ("beta", "Beta"), ("alpha", "Alpha (yearly)"),
         ("rebalances", "Rebalances"), ("warnings", "Warnings")]
 
 
@@ -682,7 +683,7 @@ class CompareWindow(QWidget):
             rec = self._record(i)
             line(portfolio, self.colors[i], rec.name)
             columns[i] = summary(portfolio, positions)
-        spy_stats = None
+        spy_stats = bench = None
         key = self._benchmark_key()
         self._start_benchmark(key)
         if key is None:
@@ -696,7 +697,10 @@ class CompareWindow(QWidget):
             spy = self.benchmarks[key]
             self.spy_note.setText("")
             line(spy.portfolio, SPY_COLOR, f"SPY (data to {key[0]})", style=Qt.DashLine)
-            spy_stats = summary(spy.portfolio, spy.positions)
+            bench = spy.portfolio
+            spy_stats = {**summary(bench, spy.positions), **risk(bench, bench)}
+        for i in ids:
+            columns[i].update(risk(self._load(i)[0], bench))
         self.fill_table(ids, columns, spy_stats)
         dividends = {self._record(i).settings.dividends for i in ids}
         self.results_note.setText(
@@ -719,9 +723,20 @@ class CompareWindow(QWidget):
             self.table.setHorizontalHeaderItem(col, header)
             for row, (key, _) in enumerate(ROWS):
                 value = stats[key]
-                text = percent(value, key == "total_return") if key in ("total_return", "cagr", "worst_drop") \
-                    else str(value)
+                if key == "volatility":
+                    text = "—" if value is None else f"{percent(value)} ({stats['vol_days']} d)"
+                elif key == "beta":
+                    text = "—" if value is None else f"{value:.2f} ± {stats['beta_se']:.2f} ({stats['days']} d)"
+                elif key == "alpha":
+                    text = "—" if value is None else \
+                        f"{percent(value, True)} ± {percent(stats['alpha_se'])} ({stats['days']} d)"
+                elif key in ("total_return", "cagr", "worst_drop"):
+                    text = percent(value, key == "total_return")
+                else:
+                    text = str(value)
                 cell = QTableWidgetItem(text)
+                if key in ("beta", "alpha") and self.spy_item.checkState() != Qt.Checked:
+                    cell.setToolTip("Tick SPY to compare")
                 cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if run_id is not None and marked.get(key) == run_id:
                     font = QFont(cell.font())

@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -428,10 +429,34 @@ def test_table_bolds_best_but_never_spy(make_window):
         w.tick(i)
     spy_ready(w)
     bold = lambda r, c: w.table.item(r, c).font().bold()
-    assert w.table.horizontalHeaderItem(3).text() == "SPY" and w.table.rowCount() == 5
+    assert w.table.horizontalHeaderItem(3).text() == "SPY" and w.table.rowCount() == 8
     # row 0 is the newest run (cost 200 bps), so the cheapest run is column 2
     assert [bold(0, c) for c in range(4)] == [False, False, True, False]
-    assert not any(bold(r, 3) for r in range(5)) and not any(bold(r, c) for r in (3, 4) for c in range(4))
+    assert not any(bold(r, 3) for r in range(8)) and not any(bold(r, c) for r in range(3, 8) for c in range(4))
+
+
+def row(w, label):
+    return next(r for r in range(w.table.rowCount()) if w.table.verticalHeaderItem(r).text() == label)
+
+
+def test_risk_rows_show_error_and_days(make_window):
+    w = make_window(runs=1)
+    w.tick(0)
+    spy_ready(w)
+    vol, beta, alpha = row(w, "Volatility"), row(w, "Beta"), row(w, "Alpha (yearly)")
+    assert re.fullmatch(r"\d+\.\d% \(\d+ d\)", w.table.item(vol, 1).text())
+    assert re.fullmatch(r"1\.00 ± 0\.00 \(\d+ d\)", w.table.item(beta, 1).text())  # SPY against itself
+    assert re.fullmatch(r"\+0\.0% ± 0\.0% \(\d+ d\)", w.table.item(alpha, 1).text())
+
+
+def test_beta_and_alpha_need_spy_ticked(make_window):
+    w = make_window(runs=1)
+    w.tick(0)
+    w.spy_item.setCheckState(Qt.Unchecked)
+    for label in ("Beta", "Alpha (yearly)"):
+        cell = w.table.item(row(w, label), 0)
+        assert cell.text() == "—" and cell.toolTip() == "Tick SPY to compare"
+    assert w.table.item(row(w, "Volatility"), 0).text() != "—"
 
 
 def test_spy_disabled_without_daily_data(make_window):
