@@ -2,8 +2,10 @@ import csv
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TypeVar
 
 from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
@@ -12,6 +14,8 @@ from alpaca.data.timeframe import TimeFrame
 from app.store import ET, Bar, Store
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 DAYS = 30
 MAX_SYMBOLS = 100            # symbols per request
@@ -59,15 +63,11 @@ def retry_wait(e, attempt):
     return 5 * 2**attempt
 
 
-def fetch(client, symbols, start, end, sleep=time.sleep):
-    req = StockBarsRequest(
-        symbol_or_symbols=symbols, timeframe=TimeFrame.Minute,
-        start=start, end=end, feed=DataFeed.IEX, adjustment=Adjustment.SPLIT,
-    )
+def with_retries(call: Callable[[], T], sleep=time.sleep) -> T:
+    """Run `call`, waiting out 429s up to RETRIES times; any other error is raised."""
     for attempt in range(RETRIES):
         try:
-            data = client.get_stock_bars(req).data
-            break
+            return call()
         except Exception as e:
             if getattr(e, "status_code", None) != 429 or attempt == RETRIES - 1:
                 raise
@@ -75,6 +75,14 @@ def fetch(client, symbols, start, end, sleep=time.sleep):
             log.warning("rate limited, retrying in %ss", wait)
             if sleep(wait):  # Event.wait is True once stopped: give up rather than retry at once
                 raise
+
+
+def fetch(client, symbols, start, end, sleep=time.sleep):
+    req = StockBarsRequest(
+        symbol_or_symbols=symbols, timeframe=TimeFrame.Minute,
+        start=start, end=end, feed=DataFeed.IEX, adjustment=Adjustment.SPLIT,
+    )
+    data = with_retries(lambda: client.get_stock_bars(req).data, sleep)
     return [
         Bar(s, int(b.timestamp.timestamp()), b.open, b.high, b.low, b.close, int(b.volume))
         for s, bars in data.items() for b in bars

@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "alpaca-py>=0.44.0",
     "keyring>=25.7.0",
+    "pandas>=3.1.0",
     "platformdirs>=4.14.0",
     "pyqtgraph>=0.14.0",
     "pyside6>=6.12.0",
