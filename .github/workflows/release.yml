@@ -22,6 +22,7 @@ jobs:
   build:
     needs: test
     strategy:
+      fail-fast: false  # one OS failing still shows how the others did
       matrix:
         include:
           - os: macos-latest   # Apple Silicon; add macos-13 for Intel Macs
@@ -49,7 +50,9 @@ jobs:
         run: dist/StockBars.app/Contents/MacOS/StockBars --selftest packaging/smoke_strategy.py
       - name: Smoke test (Linux)
         if: runner.os == 'Linux'
-        run: dist/StockBars/StockBars --selftest packaging/smoke_strategy.py
+        run: |  # libEGL comes with every desktop; installed after the build so it is not bundled
+          sudo apt-get install -y libegl1
+          dist/StockBars/StockBars --selftest packaging/smoke_strategy.py
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
