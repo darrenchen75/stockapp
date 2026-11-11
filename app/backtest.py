@@ -225,6 +225,18 @@ def load_strategy(path: str):
     return module.target_weights
 
 
+def selftest(path: str) -> int:
+    """Run a strategy file over two synthetic days, without Qt or network. CI runs this on each packaged app."""
+    bars = pd.DataFrame(dict(symbol="A", date=["2020-01-02", "2020-01-03"], o=10.0, h=10.0, l=10.0, c=10.0, v=1.0))
+    try:
+        run(load_strategy(path), bars, "2020-01-02", "2020-01-03")
+    except Exception as e:
+        print(f"selftest failed: {type(e).__name__}: {e}", file=sys.stderr)  # no-op in a windowed Windows exe
+        return 1
+    print("selftest ok")
+    return 0
+
+
 def write_results(result: Result, out_dir: str, source: str) -> None:
     note = (f"# Today's S&P 500 members only, so results have survivorship bias. "
             f"Data: {source}. Dividends: {'on' if result.dividends else 'off'}.\n")

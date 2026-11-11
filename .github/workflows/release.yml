@@ -3,6 +3,8 @@ name: release
 on:
   push:
     tags: ["v*"]
+  pull_request:      # builds and smoke-tests all three OSes; publishes nothing
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -37,12 +39,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxcb-cursor0  # PyInstaller bundles it
       - run: uv sync
       - name: Stamp version
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: echo "VERSION = \"${GITHUB_REF_NAME#v}\"" > app/version.py
-      - run: >
-          uv run pyinstaller --noconfirm --windowed ${{ matrix.mode }} --name StockBars --paths .
-          --add-data "app/sp500.csv:app" --collect-submodules keyring.backends
-          --additional-hooks-dir packaging/hooks app/main.py
+      - run: bash packaging/build.sh ${{ matrix.mode }}
+      # Run a strategy that imports the stdlib, pandas and numpy inside the built app; exits 1 if any is missing
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: dist/StockBars.app/Contents/MacOS/StockBars --selftest packaging/smoke_strategy.py
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: dist/StockBars/StockBars --selftest packaging/smoke_strategy.py
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |  # a windowed exe returns at once unless waited on
+          $p = Start-Process dist/StockBars.exe -ArgumentList '--selftest', "$PWD/packaging/smoke_strategy.py" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Error "selftest exit code $($p.ExitCode)"; exit 1 }
       - name: Package macOS
         if: runner.os == 'macOS'
         run: |
@@ -55,5 +68,6 @@ jobs:
         if: runner.os == 'Linux'
         run: ./packaging/appimage.sh
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: StockBars-*

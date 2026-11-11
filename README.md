@@ -163,3 +163,10 @@ Send the app's log file to whoever gave you the app. It's in this folder:
 - **Windows**: press Windows key + R, paste `%LOCALAPPDATA%\stockapp\Logs\`, and press Enter
 - **Linux**: `~/.local/state/stockapp/log/` in your Home folder (show hidden
   files with Ctrl+H)
+
+## Building the app yourself
+
+Run `packaging/build.sh`. It is the same command the release uses, and the app lands in
+`dist/`. To check that strategies can import the standard library, pandas and numpy in
+that build, run `dist/StockBars/StockBars --selftest packaging/smoke_strategy.py`. It
+prints `selftest ok`.
