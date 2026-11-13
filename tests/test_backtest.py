@@ -6,7 +6,7 @@ import pytest
 
 from app import backtest
 from app.backtest import backtest as run_backtest  # `backtest` stays the module, for monkeypatch
-from app.backtest import (SOURCE, Cancelled, StrategyError, history_as_of, load_strategy, main, prepare,
+from app.backtest import (SOURCE, Cancelled, StrategyError, decide, history_as_of, input_hash, load_strategy, main, prepare,
                           rebalance, run, validate_weights, write_results)
 from app.store import DailyBar, Store
 from tests.backtest_cases import D, DIVIDEND, SPLIT, all_in, bars, plain
@@ -288,3 +288,36 @@ def test_backtest_matches_main(command, tmp_path):
 
 def test_buy_spy_and_results_format():
     assert backtest.buy_spy({}, None) == {"SPY": 1.0} and backtest.RESULTS_FORMAT == 1
+
+
+def test_run_uses_decide(monkeypatch):
+    calls = []
+    real = backtest.decide
+    monkeypatch.setattr(backtest, "decide", lambda *a: calls.append(a[2]) or real(*a))
+    run(all_in("A"), plain, D[0], D[3])
+    assert calls == [pd.Timestamp(d) for d in D]
+
+
+def hist():
+    return history_as_of(prepare(plain), D[1])
+
+
+def test_input_hash_is_exact():
+    h = hist()
+    base = input_hash(h)
+    assert input_hash({k: v.copy(deep=True) for k, v in h.items()}) == base
+    h["c"].iloc[0, 0] += 1e-12
+    assert input_hash(h) != base
+
+
+def test_input_hash_ignores_column_and_key_order():
+    h = hist()
+    flipped = {k: h[k][h[k].columns[::-1]] for k in reversed(list(h))}
+    assert input_hash(flipped) == input_hash(h)
+
+
+def test_input_hash_sees_nan_positions():
+    idx = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    a = pd.DataFrame({"X": [np.nan, 1.0], "Y": [1.0, 1.0]}, index=idx)
+    b = pd.DataFrame({"X": [1.0, 1.0], "Y": [np.nan, 1.0]}, index=idx)
+    assert input_hash({"c": a}) != input_hash({"c": b})

@@ -1,5 +1,6 @@
 """Backtest price view: on decision day T a strategy sees earlier prices restated only for events up to T."""
 import argparse
+import hashlib
 import importlib.util
 import math
 import os
@@ -122,6 +123,26 @@ class Result:
     dividends: bool
 
 
+def decide(strategy, history: dict[str, pd.DataFrame], day: pd.Timestamp, symbols: set[str]) -> dict[str, float]:
+    """The one decision step, shared by backtest and paper trading."""
+    try:
+        weights = strategy(history, day)
+    except Exception as e:
+        raise StrategyError(f"{day:%Y-%m-%d}: strategy raised {type(e).__name__}: {e}") from e
+    return validate_weights(weights, symbols, day)
+
+
+def input_hash(history: dict[str, pd.DataFrame]) -> str:
+    """Hex SHA-256 of the exact numbers a strategy saw, independent of key and column order."""
+    h = hashlib.sha256()
+    for key in sorted(history):
+        df = history[key].sort_index().sort_index(axis=1)
+        for part in (key, ",".join(df.columns), ",".join(df.index.strftime("%Y-%m-%d"))):
+            h.update(part.encode() + b"\0")
+        h.update(df.to_numpy(dtype="float64").tobytes())
+    return h.hexdigest()
+
+
 def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=True, now=None,
         progress=None, cancelled=None) -> Result:
     """Decide on each day's final bar, fill at the next open, value at that day's close.
@@ -169,11 +190,7 @@ def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=T
             note = "purchases scaled to the available cash" if fill.scaled else None
         port.append(dict(date=day, cash=cash, warning=note,
                          value=cash + sum(n * adj_close.at[day, s] for s, n in shares.items())))
-        try:
-            weights = strategy(history_as_of(prices, day), day)
-        except Exception as e:
-            raise StrategyError(f"{day:%Y-%m-%d}: strategy raised {type(e).__name__}: {e}") from e
-        pending = day, validate_weights(weights, symbols, day)
+        pending = day, decide(strategy, history_as_of(prices, day), day, symbols)
         if progress:
             progress(i + 1, len(days))
     if cancelled and cancelled():
