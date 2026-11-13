@@ -235,3 +235,25 @@ def test_plan_round_trips_through_json(env):
     assert math.isnan(xyz.ref_price)
     back = paper.plan_from_json(env.acct.journal(T, 1).plan())
     assert repr(back) == repr(plan)  # repr, because NaN != NaN
+
+
+def day_t_from_live_equity(env, equity, lock):
+    env.acct.save_state(loss_checked_through="2026-11-10")
+    env.broker.history = [(date(2026, 11, 10), 1e5), (date(2026, 11, 11), 1e5)]  # no point for T yet
+    env.broker.acct = paper.Account(NUMBER, "https://paper-api.alpaca.markets", equity, equity, 2 * equity)
+    plan = env.run()
+    state = env.acct.state()
+    assert (state["loss_lock"] or {}).get("session") == lock and bool(plan.orders) == (lock is None)
+    assert state["loss_checked_through"] == "2026-11-11"  # the next run re-checks T from real history
+    assert any("live equity" in n.text for n in plan.notes)
+    return plan
+
+
+def test_day_t_loss_from_live_equity_locks(env):
+    plan = day_t_from_live_equity(env, 95_000.0, "2026-11-12")
+    assert [d for d, _ in plan.loss.breaches] == [T]
+
+
+def test_day_t_small_move_from_live_equity_does_not_lock(env):
+    plan = day_t_from_live_equity(env, 99_000.0, None)
+    assert plan.loss.breaches == []

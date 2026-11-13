@@ -239,7 +239,14 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
         # step 4: the account and the loss cutoff over every session since the last one checked
         positions = broker.positions()
         limits = settings["limits"]
-        loss = check_losses(broker.equity_history(), _date(state["loss_checked_through"]), limits.loss_cutoff)
+        equity = broker.equity_history()
+        loss = check_losses(equity, _date(state["loss_checked_through"]), limits.loss_cutoff)
+        last = max(equity, default=None)  # (date, equity) of the latest history point
+        live = not loss.problem and last and last[0] < day and last[1] > 0
+        if live:  # Alpaca's history lacks T yet: after 20:30 the account's equity is T's close
+            change = account.equity / last[1] - 1
+            if change < -limits.loss_cutoff:
+                loss = replace(loss, breaches=[*loss.breaches, (day, change)])
         lock = state["loss_lock"]  # only a person clears it
         fresh = [(d, x) for d, x in loss.breaches if d.isoformat() not in state["cleared"]]
         problem_day = (loss.checked_through or day).isoformat()
@@ -250,9 +257,9 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
         through = loss.checked_through.isoformat() if loss.checked_through else state["loss_checked_through"]
         if (through, lock) != (state["loss_checked_through"], state["loss_lock"]):
             acct.save_state(loss_checked_through=through, loss_lock=lock)
-        if loss.checked_through and loss.checked_through < day:
-            notes.append(Note(None, "warning", f"Portfolio history reaches only {loss.checked_through}, "
-                                               f"so the loss on {day} is checked on a later run."))
+        if live:
+            notes.append(Note(None, "warning", f"Portfolio history reaches only {last[0]}, so the loss on {day} "
+                                               "was checked from live equity; the next run checks it again."))
 
         # step 5: splits taking effect at T+1's open; no answer never counts as no split
         wanted = sorted(set(targets) | {s for s, q in positions.items() if q})
