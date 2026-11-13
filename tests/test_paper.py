@@ -856,15 +856,33 @@ def test_replay_matches_then_flags_changed_data(env):
 
 
 def test_impure_strategy_shows_as_mismatch(env):
+    import builtins
     code = ("import builtins\n"
             "def target_weights(history, as_of):\n"
             "    builtins._replay_n = getattr(builtins, '_replay_n', 0) + 1\n"
             "    return {'SPY': 0.1 * builtins._replay_n}\n")
     env.use(code)
-    env.run()
-    got = paper.replay(env.acct, env.acct.journal(T, 1), env.store)
+    try:
+        env.run()
+        got = paper.replay(env.acct, env.acct.journal(T, 1), env.store)
+    finally:
+        vars(builtins).pop("_replay_n", None)
     assert got["hash_matches"] is True and got["same_targets"] is False
-    del __import__("builtins")._replay_n
+
+
+def test_replay_of_a_sell_all_journal_does_not_raise(env):
+    env.broker.held = {"XYZ": 5.0}
+    plan = paper.plan_sell_all(env.broker, env.acct, NOW)
+    assert not isinstance(plan, Refusal)
+    got = paper.replay(env.acct, env.acct.journal(plan.day, plan.attempt), env.store)
+    assert got == {"hash_matches": None, "same_targets": None, "targets": None, "sell_all": True}
+
+
+def test_to_cash_backtest_is_zero_shares(env):
+    env.broker.held = {"AAPL": 400.0}
+    sent_plan(env, "def target_weights(history, as_of):\n    return {}\n")
+    add_next_bar(env, {"SPY": 100.0, "AAPL": 50.0})
+    assert row(paper.track_fills(env.broker, env.acct, env.store), "AAPL").backtest_shares == 0
 
 
 def test_export_fills_round_trips(env, tmp_path):
@@ -887,12 +905,21 @@ def test_missed_sessions_lists_days_without_a_sent_attempt(env):
     assert paper.missed_sessions(env.acct, SESSIONS, now=datetime(2026, 11, 13, 8, 0, tzinfo=ET)) == []
 
 
-def test_negative_cash_days_from_plans_and_live_account(env):
-    plan = sent_plan(env)
+def test_negative_cash_days_from_plans_and_live_account(env, monkeypatch):
+    other = date(2026, 12, 1)
+    monkeypatch.setattr(paper, "_today", lambda: other)
+    sent_plan(env)
     assert paper.negative_cash_days(env.acct, env.broker) == []
     j = env.acct.journal(T, 1)
     (j.folder / "plan.json").write_text(json.dumps({**j.plan(), "account": {**j.plan()["account"], "cash": -5.0}}))
     assert paper.negative_cash_days(env.acct, env.broker) == [(T, -5.0)]
     env.broker.acct = replace(env.broker.acct, cash=-9.0)
-    today = datetime.now(ET).date()
-    assert paper.negative_cash_days(env.acct, env.broker) == sorted({(T, -5.0), (today, -9.0)})
+    assert paper.negative_cash_days(env.acct, env.broker) == [(T, -5.0), (other, -9.0)]
+
+
+def test_negative_snapshot_survives_positive_live_cash_on_the_same_day(env, monkeypatch):
+    monkeypatch.setattr(paper, "_today", lambda: T)
+    sent_plan(env)
+    j = env.acct.journal(T, 1)
+    (j.folder / "plan.json").write_text(json.dumps({**j.plan(), "account": {**j.plan()["account"], "cash": -5.0}}))
+    assert paper.negative_cash_days(env.acct, env.broker) == [(T, -5.0)]

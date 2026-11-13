@@ -565,6 +565,10 @@ _TEXT = {"day", "symbol", "side", "reasons"}
 _NAN = math.nan
 
 
+def _today() -> date:
+    return datetime.now(ET).date()
+
+
 def _bps(side: str, avg: float, ref: float) -> float:
     """Signed so a positive number is a cost: paid more on a buy, got less on a sale."""
     return (avg - ref) / ref * 10_000 * (1 if side == "buy" else -1)
@@ -586,9 +590,9 @@ def _fill_rows(broker: Broker, j: Journal, plan: Plan, store: Store) -> tuple[li
     opens = {r.symbol: float(r.o) for r in nxt.itertuples()}
     closes = {s: b["c"] for s, b in plan.last_bars.items()}
     try:  # what the backtest's rules would hold after T+1's open, with no costs
-        want = rebalance(plan.positions, plan.account.cash, plan.targets, opens, closes, 0.0).shares if final else {}
+        want = rebalance(plan.positions, plan.account.cash, plan.targets, opens, closes, 0.0).shares if final else None
     except (KeyError, ValueError):
-        want = {}
+        want = None
     by_symbol = {o.symbol: o for o in plan.orders}
     blocked = {n.symbol: n for n in plan.notes if n.kind in ("blocked_loss", "blocked_split") and n.symbol}
     rows = []
@@ -615,7 +619,7 @@ def _fill_rows(broker: Broker, j: Journal, plan: Plan, store: Store) -> tuple[li
             filled=filled, avg_price=avg, open_next=open_next, close_t=close_t,
             bps_vs_open=_bps(o.side, avg, open_next) if o and open_next > 0 and avg == avg else _NAN,
             bps_vs_close=_bps(o.side, avg, close_t) if o and close_t > 0 and avg == avg else _NAN,
-            backtest_shares=want.get(s, 0.0) if final and want else _NAN,
+            backtest_shares=want.get(s, 0.0) if want is not None else _NAN,
             planned_shares=held + (sign * o.qty if o else 0.0),
             sent_shares=held + (sign * o.qty if o and o.client_order_id in reached else 0.0),
             filled_shares=held + sign * filled, reasons=";".join(reasons)))
@@ -630,8 +634,8 @@ def _frame(rows: list[dict]) -> pd.DataFrame:
 
 
 def track_fills(broker: Broker, acct: AccountStore, store: Store) -> pd.DataFrame:
-    """One row per order sent (and per buy a limit blocked), oldest day first. A row is saved in its attempt's
-    fills.json and kept as is once T+1's daily bar exists; before that it is recomputed on each call."""
+    """One row per planned order of every attempt that sent anything (sent_shares shows what went out), plus one
+    per symbol a loss lock or split blocked, oldest day first. A row is saved in its attempt's fills.json and kept as is once T+1's daily bar exists; before that it is recomputed on each call."""
     rows = []
     for j in reversed(acct.entries()):
         path = j.folder / "fills.json"
@@ -668,7 +672,8 @@ def negative_cash_days(acct: AccountStore, broker: Broker) -> list[tuple[date, f
         with suppress(FileNotFoundError):
             plan = j.plan()
             found[date.fromisoformat(plan["day"])] = plan["account"]["cash"]
-    found[datetime.now(ET).date()] = broker.account().cash
+    today, live = _today(), broker.account().cash
+    found[today] = min(found.get(today, live), live)  # a day that ended negative stays flagged
     return sorted((d, c) for d, c in found.items() if c < 0)
 
 
@@ -687,6 +692,8 @@ def replay(acct: AccountStore, journal: Journal, store: Store) -> dict:
     """Rebuild the history as prepare_plan did, from the strategy copy saved with the journal. If the input hash
     matches, decide again; targets that differ mean the strategy depends on more than history and as_of."""
     plan = plan_from_json(journal.plan())
+    if plan.sell_all:  # no strategy ran: nothing to replay
+        return {"hash_matches": None, "same_targets": None, "targets": None, "sell_all": True}
     path = journal.folder / "strategy.py"
     strategy = _load_exactly(path.read_bytes(), str(path))
     prices = prepare(load_bars(store, decision_time(plan.day), universe()), plan.dividends)
