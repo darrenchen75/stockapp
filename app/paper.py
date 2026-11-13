@@ -3,6 +3,7 @@ switch and selling everything. No Qt imports."""
 import hashlib
 import json
 import math
+import os
 import re
 import tempfile
 from contextlib import suppress
@@ -21,11 +22,11 @@ from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (GetCalendarRequest, GetOrdersRequest, GetPortfolioHistoryRequest,
                                      MarketOrderRequest)
 
-from app.backtest import StrategyError, decide, history_as_of, input_hash, load_strategy, prepare
-from app.daily import ET, load_bars, refresh_daily, universe
+from app.backtest import StrategyError, decide, history_as_of, input_hash, load_strategy, prepare, rebalance
+from app.daily import ET, decision_time, load_bars, refresh_daily, universe
 from app.paper_plan import (SEND_DEADLINE, Limits, LossCheck, Note, Order, check_losses, order_id, plan_orders,
                              run_window)
-from app.paper_state import AccountStore, Journal
+from app.paper_state import AccountStore, Journal, _write_json
 from app.store import Store
 
 
@@ -554,3 +555,153 @@ def plan_sell_all(broker: Broker, acct: AccountStore, now: datetime) -> Plan | R
                     settings["limits"], "", settings["dividends"],
                     LossCheck([], _date(state["loss_checked_through"]), None), state["loss_lock"], {}, sell_all=True)
         return _journal_plan(acct, plan)
+
+
+# --- fills, drift reasons, replay, export ---
+
+FILL_COLUMNS = ["day", "symbol", "side", "ordered", "filled", "avg_price", "open_next", "close_t", "bps_vs_open",
+                "bps_vs_close", "backtest_shares", "planned_shares", "sent_shares", "filled_shares", "reasons"]
+_TEXT = {"day", "symbol", "side", "reasons"}
+_NAN = math.nan
+
+
+def _bps(side: str, avg: float, ref: float) -> float:
+    """Signed so a positive number is a cost: paid more on a buy, got less on a sale."""
+    return (avg - ref) / ref * 10_000 * (1 if side == "buy" else -1)
+
+
+def _sent(j: Journal) -> dict[str, str]:
+    return {c: st for c, st in j.order_states().items() if st not in _NO_RESULT}
+
+
+def _fill_rows(broker: Broker, j: Journal, plan: Plan, store: Store) -> tuple[list[dict], bool]:
+    """(rows, final) for one attempt. final: T+1's daily bar is in the store, so the row never changes again."""
+    reached = {c: st for c, st in _sent(j).items() if st != "failed"}
+    if not reached:
+        return [], False
+    wanted = sorted({*plan.positions, *plan.targets, *(o.symbol for o in plan.orders), "SPY"})
+    nxt = load_bars(store, decision_time(plan.next_day), wanted)
+    nxt = nxt[nxt["date"] == pd.Timestamp(plan.next_day)]
+    final = "SPY" in set(nxt["symbol"])
+    opens = {r.symbol: float(r.o) for r in nxt.itertuples()}
+    closes = {s: b["c"] for s, b in plan.last_bars.items()}
+    try:  # what the backtest's rules would hold after T+1's open, with no costs
+        want = rebalance(plan.positions, plan.account.cash, plan.targets, opens, closes, 0.0).shares if final else {}
+    except (KeyError, ValueError):
+        want = {}
+    by_symbol = {o.symbol: o for o in plan.orders}
+    blocked = {n.symbol: n for n in plan.notes if n.kind in ("blocked_loss", "blocked_split") and n.symbol}
+    rows = []
+    for s in sorted(by_symbol.keys() | blocked.keys()):
+        o, held = by_symbol.get(s), plan.positions.get(s, 0.0)
+        sign = 1 if o and o.side == "buy" else -1
+        got = broker.order(o.client_order_id) if o and o.client_order_id in reached else None
+        filled = got.filled_qty if got else 0.0
+        avg = got.filled_avg_price if got and got.filled_avg_price else _NAN
+        open_next, close_t = opens.get(s, _NAN), closes.get(s, _NAN)
+        kinds = {n.kind for n in plan.notes if n.symbol == s}
+        reasons = [r for k, r in (("trim_cap", "size_cap"), ("blocked_loss", "loss_lock"),
+                                  ("blocked_split", "split_block")) if k in kinds]
+        if (w := plan.targets.get(s)) and close_t > 0:
+            exact = w * plan.account.equity / close_t
+            if math.floor(w * plan.account.equity * (1 - plan.limits.cash_buffer) / close_t) < math.floor(exact + 1e-9):
+                reasons.append("cash_buffer")
+            if abs(exact - round(exact)) > 1e-9:
+                reasons.append("rounding")
+        if o and filled < o.qty:
+            reasons.append("unfilled")
+        rows.append(dict(
+            day=plan.day.isoformat(), symbol=s, side=o.side if o else "", ordered=o.qty if o else 0.0,
+            filled=filled, avg_price=avg, open_next=open_next, close_t=close_t,
+            bps_vs_open=_bps(o.side, avg, open_next) if o and open_next > 0 and avg == avg else _NAN,
+            bps_vs_close=_bps(o.side, avg, close_t) if o and close_t > 0 and avg == avg else _NAN,
+            backtest_shares=want.get(s, 0.0) if final and want else _NAN,
+            planned_shares=held + (sign * o.qty if o else 0.0),
+            sent_shares=held + (sign * o.qty if o and o.client_order_id in reached else 0.0),
+            filled_shares=held + sign * filled, reasons=";".join(reasons)))
+    return rows, final
+
+
+def _frame(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows, columns=FILL_COLUMNS)
+    for c in FILL_COLUMNS:
+        df[c] = df[c].astype(object).where(df[c].notna(), None) if c in _TEXT else pd.to_numeric(df[c])
+    return df
+
+
+def track_fills(broker: Broker, acct: AccountStore, store: Store) -> pd.DataFrame:
+    """One row per order sent (and per buy a limit blocked), oldest day first. A row is saved in its attempt's
+    fills.json and kept as is once T+1's daily bar exists; before that it is recomputed on each call."""
+    rows = []
+    for j in reversed(acct.entries()):
+        path = j.folder / "fills.json"
+        saved = json.loads(path.read_text()) if path.exists() else None
+        if saved and saved["final"]:
+            rows += saved["rows"]
+            continue
+        try:
+            plan = plan_from_json(j.plan())
+        except FileNotFoundError:
+            continue
+        got, final = _fill_rows(broker, j, plan, store)
+        if got:
+            clean = [{k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in r.items()} for r in got]
+            _write_json(path, {"final": final, "rows": clean})
+            rows += clean
+    return _frame(rows)
+
+
+def cost_summary(fills: pd.DataFrame) -> dict[str, float]:
+    """Averages of bps_vs_open and bps_vs_close weighted by traded value (nan when nothing was traded)."""
+    value = fills["filled"] * fills["avg_price"]
+    out = {}
+    for col in ("bps_vs_open", "bps_vs_close"):
+        ok = fills[col].notna() & (value > 0)
+        out[col] = float((fills[col][ok] * value[ok]).sum() / value[ok].sum()) if ok.any() else _NAN
+    return out
+
+
+def negative_cash_days(acct: AccountStore, broker: Broker) -> list[tuple[date, float]]:
+    """Days a plan's account snapshot (taken after the close) showed cash below 0, plus today if it is negative now."""
+    found = {}
+    for j in reversed(acct.entries()):  # oldest first, so the latest attempt of a day wins
+        with suppress(FileNotFoundError):
+            plan = j.plan()
+            found[date.fromisoformat(plan["day"])] = plan["account"]["cash"]
+    found[datetime.now(ET).date()] = broker.account().cash
+    return sorted((d, c) for d, c in found.items() if c < 0)
+
+
+def missed_sessions(acct: AccountStore, calendar: list[date], now: datetime | None = None) -> list[date]:
+    """Sessions from the first sent attempt on, whose send deadline has passed, with no order that has a journal result."""
+    now = now or datetime.now(ET)
+    sent = {date.fromisoformat(j.plan()["day"]) for j in acct.entries() if _sent(j)}
+    if not sent:
+        return []
+    days = sorted(calendar)
+    return [d for d, nxt in zip(days, days[1:])
+            if d >= min(sent) and d not in sent and now >= datetime.combine(nxt, SEND_DEADLINE, ET)]
+
+
+def replay(acct: AccountStore, journal: Journal, store: Store) -> dict:
+    """Rebuild the history as prepare_plan did, from the strategy copy saved with the journal. If the input hash
+    matches, decide again; targets that differ mean the strategy depends on more than history and as_of."""
+    plan = plan_from_json(journal.plan())
+    path = journal.folder / "strategy.py"
+    strategy = _load_exactly(path.read_bytes(), str(path))
+    prices = prepare(load_bars(store, decision_time(plan.day), universe()), plan.dividends)
+    stamp = pd.Timestamp(plan.day)
+    history = history_as_of(prices, stamp)
+    if input_hash(history) != plan.input_hash:
+        return {"hash_matches": False, "same_targets": None, "targets": None}
+    try:
+        targets = decide(strategy, history, stamp, set(prices.raw["c"].columns))
+    except StrategyError:
+        return {"hash_matches": True, "same_targets": False, "targets": None}
+    return {"hash_matches": True, "same_targets": targets == plan.targets, "targets": targets}
+
+
+def export_fills(fills: pd.DataFrame, path: str) -> None:
+    tmp = f"{path}.tmp"
+    fills.to_csv(tmp, index=False)
+    os.replace(tmp, path)

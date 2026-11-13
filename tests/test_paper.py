@@ -733,3 +733,166 @@ def test_sell_all_send_refuses_a_buy(env):
     with pytest.raises(ValueError):
         paper.send_sell_all(env.broker, env.acct, bad, SEND)
     assert env.broker.calls == 0 and journaled(env) == []
+
+
+# --- fills, drift reasons, replay, export ---
+
+def sent_plan(env, code=FIFTHS):
+    env.use(code)
+    plan = env.run()
+    paper.send_plan(env.broker, env.acct, plan, SEND)
+    return plan
+
+
+def fill_order(env, symbol, qty, price, day=T):
+    cid = oid(1, symbol, day)
+    env.broker.orders = [replace(o, filled_qty=qty, filled_avg_price=price,
+                                 status="filled" if qty else o.status) if o.client_order_id == cid else o
+                         for o in env.broker.orders]
+
+
+def add_next_bar(env, opens):
+    for s, o in opens.items():
+        c = CLOSES[s]
+        env.store.replace_daily(s, [*bars(s), DailyBar(s, T1.isoformat(), o, o, o, c, 1000.0, 1.0, 1.0)])
+
+
+def row(fills, symbol):
+    return fills[fills["symbol"] == symbol].iloc[0]
+
+
+def test_signed_bps_cost_positive_both_sides(env):
+    env.broker.held = {"AAPL": 400.0}  # target 0.2 -> 392: AAPL is sold
+    sent_plan(env)
+    add_next_bar(env, {"SPY": 100.0, "AAPL": 100.0})
+    fill_order(env, "SPY", 196.0, 101.0)
+    fill_order(env, "AAPL", 8.0, 99.0)
+    fills = paper.track_fills(env.broker, env.acct, env.store)
+    assert row(fills, "SPY").bps_vs_open == pytest.approx(100.0)
+    assert row(fills, "AAPL").bps_vs_open == pytest.approx(100.0)
+    assert row(fills, "SPY").bps_vs_close == pytest.approx(100.0)  # SPY's close is 100 too
+    assert list(fills.columns) == ["day", "symbol", "side", "ordered", "filled", "avg_price", "open_next", "close_t",
+                                   "bps_vs_open", "bps_vs_close", "backtest_shares", "planned_shares",
+                                   "sent_shares", "filled_shares", "reasons"]
+
+
+def test_cost_summary_weights_by_value():
+    import pandas as pd
+    f = pd.DataFrame({"filled": [10.0, 30.0], "avg_price": [10.0, 10.0], "bps_vs_open": [100.0, 20.0],
+                      "bps_vs_close": [10.0, float("nan")]})
+    got = paper.cost_summary(f)
+    assert got["bps_vs_open"] == pytest.approx(40.0)
+    assert got["bps_vs_close"] == pytest.approx(10.0)
+
+
+def test_reasons_name_rounding_and_cap(env):
+    env.use("def target_weights(history, as_of):\n    return {'SPY': 0.3, 'AAPL': 0.2}\n")
+    plan = env.run()
+    paper.send_plan(env.broker, env.acct, plan, SEND)
+    fills = paper.track_fills(env.broker, env.acct, env.store)
+    spy, aapl = row(fills, "SPY"), row(fills, "AAPL")
+    assert "size_cap" in spy.reasons.split(";") and "cash_buffer" in spy.reasons.split(";")
+    assert "size_cap" not in aapl.reasons and "cash_buffer" in aapl.reasons
+    assert "rounding" not in aapl.reasons  # 0.2 * 1e5 / 50 = 400 exactly
+
+
+def test_rounding_reason_when_a_share_is_fractional(env):
+    sent_plan(env, "def target_weights(history, as_of):\n    return {'SPY': 0.2005}\n")
+    assert "rounding" in row(paper.track_fills(env.broker, env.acct, env.store), "SPY").reasons.split(";")
+
+
+def test_unfilled_opg_recorded(env):
+    sent_plan(env)
+    add_next_bar(env, {"SPY": 100.0, "AAPL": 50.0})
+    fill_order(env, "AAPL", 392.0, 50.0)
+    fills = paper.track_fills(env.broker, env.acct, env.store)
+    r = row(fills, "SPY")
+    assert r.filled == 0 and "unfilled" in r.reasons.split(";")
+    assert math.isnan(r.avg_price) and math.isnan(r.bps_vs_open)
+    assert r.sent_shares == 196 and r.filled_shares == 0
+
+
+def test_loss_lock_and_split_block_rows(env):
+    env.acct.save_state(loss_lock={"session": T.isoformat(), "loss": -0.05, "problem": None})
+    env.broker.held = {"XYZ": 5.0}  # the sale goes out; the buys are blocked
+    sent_plan(env)
+    fills = paper.track_fills(env.broker, env.acct, env.store)
+    assert sorted(fills.symbol) == ["AAPL", "SPY", "XYZ"]
+    assert row(fills, "SPY").reasons.split(";").count("loss_lock") == 1 and row(fills, "SPY").sent_shares == 0
+
+
+def test_rows_stay_fixed_once_next_bar_exists(env):
+    sent_plan(env)
+    first = paper.track_fills(env.broker, env.acct, env.store)
+    assert math.isnan(row(first, "SPY").open_next)
+    add_next_bar(env, {"SPY": 100.0, "AAPL": 50.0})
+    fill_order(env, "SPY", 196.0, 100.0)
+    final = paper.track_fills(env.broker, env.acct, env.store)
+    assert row(final, "SPY").filled == 196 and row(final, "SPY").open_next == 100.0
+    fill_order(env, "SPY", 1.0, 999.0)  # later changes at the broker are not picked up
+    again = paper.track_fills(env.broker, env.acct, env.store)
+    assert row(again, "SPY").filled == 196
+    text = (env.acct.journal(T, 1).folder / "fills.json").read_text()
+    assert "KEY" not in text and "Traceback" not in text
+
+
+def test_backtest_shares_sized_from_next_open(env):
+    sent_plan(env)
+    add_next_bar(env, {"SPY": 200.0, "AAPL": 50.0})  # cash 1e5 -> SPY 0.2*1e5/200 = 100
+    fills = paper.track_fills(env.broker, env.acct, env.store)
+    assert row(fills, "SPY").backtest_shares == pytest.approx(100.0)
+    assert row(fills, "SPY").planned_shares == 196
+
+
+def test_replay_matches_then_flags_changed_data(env):
+    env.use(FIFTHS)
+    env.run()
+    j = env.acct.journal(T, 1)
+    assert paper.replay(env.acct, j, env.store) == {"hash_matches": True, "same_targets": True,
+                                                    "targets": {"SPY": 0.2, "AAPL": 0.2}}
+    changed = [replace(b, c=b.c + 1) if b.date == T.isoformat() else b for b in bars("SPY")]
+    env.store.replace_daily("SPY", changed)
+    assert paper.replay(env.acct, j, env.store) == {"hash_matches": False, "same_targets": None, "targets": None}
+
+
+def test_impure_strategy_shows_as_mismatch(env):
+    code = ("import builtins\n"
+            "def target_weights(history, as_of):\n"
+            "    builtins._replay_n = getattr(builtins, '_replay_n', 0) + 1\n"
+            "    return {'SPY': 0.1 * builtins._replay_n}\n")
+    env.use(code)
+    env.run()
+    got = paper.replay(env.acct, env.acct.journal(T, 1), env.store)
+    assert got["hash_matches"] is True and got["same_targets"] is False
+    del __import__("builtins")._replay_n
+
+
+def test_export_fills_round_trips(env, tmp_path):
+    import pandas as pd
+    sent_plan(env)
+    fills = paper.track_fills(env.broker, env.acct, env.store)
+    out = tmp_path / "fills.csv"
+    paper.export_fills(fills, str(out))
+    back = pd.read_csv(out)
+    assert list(back.columns) == list(fills.columns)
+    assert back["symbol"].tolist() == fills["symbol"].tolist()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_missed_sessions_lists_days_without_a_sent_attempt(env):
+    sent_plan(env)  # T = Nov 12 sent
+    late = datetime(2026, 11, 19, 12, 0, tzinfo=ET)
+    got = paper.missed_sessions(env.acct, SESSIONS, now=late)
+    assert got == [date(2026, 11, d) for d in (13, 16, 17, 18)]  # the 19th's window is still open
+    assert paper.missed_sessions(env.acct, SESSIONS, now=datetime(2026, 11, 13, 8, 0, tzinfo=ET)) == []
+
+
+def test_negative_cash_days_from_plans_and_live_account(env):
+    plan = sent_plan(env)
+    assert paper.negative_cash_days(env.acct, env.broker) == []
+    j = env.acct.journal(T, 1)
+    (j.folder / "plan.json").write_text(json.dumps({**j.plan(), "account": {**j.plan()["account"], "cash": -5.0}}))
+    assert paper.negative_cash_days(env.acct, env.broker) == [(T, -5.0)]
+    env.broker.acct = replace(env.broker.acct, cash=-9.0)
+    today = datetime.now(ET).date()
+    assert paper.negative_cash_days(env.acct, env.broker) == sorted({(T, -5.0), (today, -9.0)})
