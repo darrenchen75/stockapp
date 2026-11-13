@@ -27,6 +27,8 @@ SIMULATOR_NOTE = ("Alpaca's paper fills are simulated against quotes, so the gap
                   "simulator's behaviour, not just real trading costs.")
 RED = "color: #c62828"
 PAPER_ENDPOINT = "paper-api.alpaca.markets"
+NOT_PAPER = ("These keys don't reach an Alpaca paper account. Nothing will be sent or cancelled from here. To stop "
+             "orders on the paper account, use Alpaca's dashboard.")
 WENT_OUT = "Orders already went out — use the kill switch to stop them."
 BUSY_JOBS = {"send", "kill", "sell", "sell_send"}  # closing or updating mid-way asks first
 fill = RunDetail.fill
@@ -308,6 +310,8 @@ class PaperWindow(QWidget):
     def _status(self, now: datetime) -> dict:
         broker = self.make_broker()
         account = broker.account()
+        if PAPER_ENDPOINT not in account.endpoint:  # no other call, no folder: these keys may reach real money
+            return dict(refused=True)
         acct = AccountStore(self.root, account_key(account))
         recovered = [] if acct.dir.name in self.recovered else recover(broker, acct)  # before anything is sent
         today = now.astimezone(ET).date()
@@ -318,23 +322,21 @@ class PaperWindow(QWidget):
                     fills=_with_store(self.db_path, lambda store: track_fills(broker, acct, store)))
 
     def on_status(self, s: dict) -> None:
+        if s.get("refused"):  # checked on every refresh: every control goes off, the kill switch too
+            self.broker = self.acct = self.status = self.plan = None  # the plan's journal is left as it is
+            self.show_plan()
+            self.say(NOT_PAPER, error=True)
+            self.show_status()
+            return
         self.broker, key = s["broker"], s["acct"].dir.name
         self.recovered.add(key)
         if s["recovered"]:
             self.say("Checked orders left unfinished last time: " + "; ".join(s["recovered"]))
-        why = None
-        if PAPER_ENDPOINT not in s["account"].endpoint:  # checked on every refresh, not only at setup
-            why = (f"{s['account'].endpoint} is not Alpaca's paper endpoint ({PAPER_ENDPOINT}), so paper trading is "
-                   "off for these keys.")
-            self.drop_plan()
-            self.status = None
-            self.acct = s["acct"] if (self.root / "current.json").exists() else None  # still able to halt
-        elif (self.acct is None or self.acct.dir.name != key) and (why := self.confirm(s)):
+        if (self.acct is None or self.acct.dir.name != key) and (why := self.confirm(s)):
             self.acct = self.status = None
+            self.say(why, error=True)
         else:
             self.status = s
-        if why:
-            self.say(why, error=True)
         self.show_status()
 
     def confirm(self, s: dict) -> str | None:

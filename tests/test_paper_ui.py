@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from app import paper, paper_ui
 from app.paper_state import AccountStore
-from app.paper_ui import LIVE_OFF, PaperWindow
+from app.paper_ui import LIVE_OFF, NOT_PAPER, PaperWindow
 from app.store import ET, DailyBar, Store
 from tests import paper_fakes
 from tests.paper_fakes import FakeBroker
@@ -30,6 +30,8 @@ SYMBOLS = ["AAPL", "SPY"]
 CLOSES = {"SPY": 100.0, "AAPL": 50.0}
 NUMBER = "PA0000001"
 BUY_SPY = str(Path(__file__).parent / "fixtures" / "buy_spy.py")
+NOT_PAPER_TEXT = ("These keys don't reach an Alpaca paper account. Nothing will be sent or cancelled from here. "
+                  "To stop orders on the paper account, use Alpaca's dashboard.")
 LOCK = {"session": "2026-11-12", "loss": -0.05, "problem": None}
 
 
@@ -455,10 +457,12 @@ def test_kill_during_send_stops_the_next_order(env, tmp_path):
 
 
 def test_a_live_endpoint_is_refused(env):
+    assert NOT_PAPER == NOT_PAPER_TEXT
     env.broker.acct = paper.Account(NUMBER, "https://api.alpaca.markets", 1e5, 1e5, 2e5)
     w = env.open()
     assert env.asked == [] and not (env.root / "current.json").exists()
-    assert "paper endpoint" in w.message.text() and not w.run_button.isEnabled() and not w.kill_button.isEnabled()
+    assert w.message.text() == NOT_PAPER and not w.run_button.isEnabled() and not w.kill_button.isEnabled()
+    assert not (env.root / f"paper-{NUMBER}").exists()
 
 
 def test_sell_everything_entry_records_the_app_version(env):
@@ -471,12 +475,22 @@ def test_sell_everything_entry_records_the_app_version(env):
 def test_endpoint_is_checked_on_every_refresh(env):
     w = env.open()
     click(w, w.run_button)
+    click(w, w.cancel_button)
+    click(w, w.run_button)
     assert w.send_button.isEnabled()
-    env.broker.acct = paper.Account(NUMBER, "https://api.alpaca.markets", 1e5, 1e5, 2e5)
+    before = {p: p.read_bytes() for p in env.acct().dir.rglob("*") if p.is_file()}
+    env.broker.acct = paper.Account("LA9", "https://api.alpaca.markets", 1e5, 1e5, 2e5)
+    calls = []
+    for name in ("account", "calendar", "positions", "orders_since", "open_orders", "order", "submit", "cancel_all",
+                 "equity_history", "splits", "market_open"):
+        real = getattr(env.broker, name)
+        setattr(env.broker, name, lambda *a, _n=name, _r=real, **k: calls.append(_n) or _r(*a, **k))
     w.refresh()
     settle(w)
-    assert not w.run_button.isEnabled() and not w.send_button.isEnabled() and w.plan is None
-    assert "paper endpoint" in w.message.text()
-    assert w.kill_button.isEnabled()  # confirmed before: a person can still halt
-    click(w, w.kill_button)
-    assert env.acct().state()["halted"]
+    assert set(calls) == {"account"}  # read to see the endpoint, and nothing else
+    assert w.plan is None and w.message.text() == NOT_PAPER
+    for b in (w.run_button, w.send_button, w.cancel_button, w.kill_button, w.release_button, w.sell_button,
+              w.clear_button, w.strategy_button, w.limits_button):
+        assert not b.isEnabled(), b.text()
+    assert {p: p.read_bytes() for p in env.acct().dir.rglob("*") if p.is_file()} == before
+    assert not (env.root / "paper-LA9").exists()
