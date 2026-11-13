@@ -31,6 +31,8 @@ class FakeBroker:
         self.submitted = []  # (client_order_id, tif)
         self.calls = 0  # submit() calls, including refused ones
         self.on_submit = None  # called with the call number as each submit starts; may raise or change state
+        self.on_cancel = None  # called as cancel_all starts
+        self.cancel_to = "canceled"  # the status cancel_all leaves an open order in
 
     def account(self):
         return self.acct
@@ -63,10 +65,12 @@ class FakeBroker:
         return out
 
     def cancel_all(self):
+        if self.on_cancel:
+            self.on_cancel()
         out = []
         for i, o in enumerate(self.orders):
             if o.status not in FINISHED:
-                self.orders[i] = replace(o, status="canceled")
+                self.orders[i] = replace(o, status=self.cancel_to)
                 out.append((o.id, True))
         return out
 

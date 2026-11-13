@@ -1,5 +1,7 @@
 import hashlib
+import json
 import math
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -559,3 +561,140 @@ def test_order_alpaca_reports_rejected_is_a_failure(env):
     assert result.sent == [] and result.failed == [(oid(1, "AAPL"), "rejected")]
     assert journaled(env) == [(oid(1, "AAPL"), "sending"), (oid(1, "AAPL"), "rejected")]
     assert env.broker.calls == 1  # a rejection stops the rest, like a failed request
+
+
+# --- kill switch, release and sell everything ---
+
+WINDOW_CLOSED = "the at-the-open window has closed; wait for the market to open"
+
+
+def no_wait(seconds):
+    pass
+
+
+def partly_sent(env):
+    """A daily attempt left open: the XYZ sale is at Alpaca, the AAPL buy was refused, the SPY buy never sent."""
+    env.use(FIFTHS)
+    env.broker.held = {"XYZ": 5.0}
+    plan = env.run()
+    env.broker.on_submit = lambda n: n == 2 and (_ for _ in ()).throw(rejection('{"message":"no"}', 422))
+    paper.send_plan(env.broker, env.acct, plan, SEND)
+    env.broker.on_submit = None
+    assert env.acct.journal(T, 1).order_states() == {oid(1, "XYZ"): "accepted", oid(1, "AAPL"): "failed"}
+    assert env.acct.journal(T, 1).closed() is None
+
+
+def test_kill_halts_before_cancelling(env):
+    partly_sent(env)
+    seen = []
+    env.broker.on_cancel = lambda: seen.append(env.acct.state()["halted"])
+    result = paper.kill(env.broker, env.acct, sleep=no_wait)
+    assert seen == [True]
+    assert sorted(result) == [(oid(1, "AAPL"), "failed"), (oid(1, "XYZ"), "canceled")]
+    j = env.acct.journal(T, 1)
+    assert j.order_states()[oid(1, "XYZ")] == "canceled" and j.closed() == "killed"
+
+
+def test_release_waits_for_cancels(env):
+    paper.send_plan(env.broker, env.acct, env.run(), SEND)  # attempt 1 is closed "sent", its order still open
+    env.broker.cancel_to = "pending_cancel"
+    naps = []
+    assert paper.kill(env.broker, env.acct, sleep=naps.append) == [(oid(1, "SPY"), "pending_cancel")]
+    assert len(naps) == 10  # polled until the timeout, then gave up
+    assert paper.unresolved_cancels(env.broker, env.acct) == [oid(1, "SPY")]
+    why = paper.release(env.broker, env.acct)
+    assert oid(1, "SPY") in why and env.acct.state()["halted"]
+    env.broker.orders = [replace(o, status="canceled") for o in env.broker.orders]
+    assert paper.unresolved_cancels(env.broker, env.acct) == []
+    assert paper.release(env.broker, env.acct) is None and env.acct.state()["halted"] is False
+    last = json.loads((env.acct.dir / "events.jsonl").read_text().splitlines()[-1])
+    assert last["kind"] == "state" and last["new"] == {"halted": False}  # logged
+
+
+def test_new_attempt_after_release(env):
+    partly_sent(env)
+    paper.kill(env.broker, env.acct, sleep=no_wait)
+    assert isinstance(env.run(), Refusal)  # halted
+    assert paper.release(env.broker, env.acct) is None
+    env.broker.held = {"SPY": 50.0}
+    plan = env.run()
+    assert plan.attempt == 2 and env.acct.journal(T, 1).closed() == "killed"
+    assert [(o.client_order_id, o.qty) for o in plan.orders] == [(oid(2, "AAPL"), 392), (oid(2, "SPY"), 146)]
+
+
+@pytest.mark.parametrize("sell_all", [False, True])
+def test_kill_during_a_send_lists_the_order_that_got_out(env, sell_all):
+    env.use(FIFTHS)
+    env.broker.held = {"AAPL": 3.0, "SPY": 2.0}
+    plan = paper.plan_sell_all(env.broker, env.acct, SEND) if sell_all else env.run()
+    send = paper.send_sell_all if sell_all else paper.send_plan
+    killed = []
+    # the kill lands between the sender's halt check and its submit; the send holds the account lock throughout
+    env.broker.on_submit = lambda n: n == 1 and killed.append(paper.kill(env.broker, env.acct, sleep=no_wait))
+    send(env.broker, env.acct, plan, SEND)
+    assert env.broker.submitted == [(oid(1, "AAPL"), "opg")]  # nothing more after the kill
+    assert killed == [[(oid(1, "AAPL"), "sending")]]
+    j = env.acct.journal(T, 1)
+    assert j.order_states() == {oid(1, "AAPL"): "accepted"} and j.closed() is None
+    assert paper.unresolved_cancels(env.broker, env.acct) == [oid(1, "AAPL")]
+    assert oid(1, "AAPL") in paper.release(env.broker, env.acct)
+    paper.kill(env.broker, env.acct, sleep=no_wait)  # a second kill cancels it
+    assert paper.release(env.broker, env.acct) is None and j.closed() == "killed"
+
+
+def test_sell_all_waits_for_open_buys(env):
+    paper.send_plan(env.broker, env.acct, env.run(), SEND)  # an open at-the-open buy
+    env.broker.held = {"AAPL": 3.0}
+    result = paper.plan_sell_all(env.broker, env.acct, SEND)
+    assert isinstance(result, Refusal) and "open order" in result.reason and env.acct.attempts(T) == [1]
+    env.broker.orders = [replace(o, status="filled") for o in env.broker.orders]
+    env.broker.held = {"AAPL": 3.0, "SPY": 980.4}
+    plan = paper.plan_sell_all(env.broker, env.acct, SEND)
+    assert env.acct.state()["halted"] and plan.sell_all and plan.attempt == 2
+    assert [(o.client_order_id, o.side, o.qty) for o in plan.orders] == [
+        (oid(2, "AAPL"), "sell", 3), (oid(2, "SPY"), "sell", 980)]
+    assert [(n.symbol, n.kind) for n in plan.notes] == [("SPY", "fractional")]
+    assert plan.loss_lock == env.acct.state()["loss_lock"]
+    assert repr(paper.plan_from_json(env.acct.journal(T, 2).plan())) == repr(plan)  # journaled; repr for NaN
+
+
+class Crash(BaseException):
+    pass
+
+
+def test_sell_all_survives_restart(env):
+    env.broker.held = {"AAPL": 3.0, "SPY": 2.0}
+    plan = paper.plan_sell_all(env.broker, env.acct, SEND)
+
+    def crash(n):
+        env.broker.orders.append(order(oid(1, "AAPL"), "accepted"))  # it reached Alpaca, then the app died
+        raise Crash
+
+    env.broker.on_submit = crash
+    with pytest.raises(Crash):
+        paper.send_sell_all(env.broker, env.acct, plan, SEND)
+    env.broker.on_submit = None
+    assert journaled(env) == [(oid(1, "AAPL"), "sending")]
+    assert paper.recover(env.broker, env.acct) == [f"{oid(1, 'AAPL')}: accepted"]
+    again = paper.plan_sell_all(env.broker, env.acct, SEND)
+    assert again.attempt == 1 and [o.client_order_id for o in again.orders] == [oid(1, "SPY")]
+    result = paper.send_sell_all(env.broker, env.acct, again, SEND)
+    assert result.discarded is None and [o.client_order_id for o in result.sent] == [oid(1, "SPY")]
+    assert env.acct.journal(T, 1).closed() == "sent"
+
+
+@pytest.mark.parametrize("is_open, now, tif", [
+    (True, datetime(2026, 11, 13, 10, 0, tzinfo=ET), "day"),
+    (False, SEND, "opg"),
+    (False, datetime(2026, 11, 13, 9, 28, tzinfo=ET), None),
+])
+def test_sell_all_order_type(env, is_open, now, tif):
+    env.broker.held = {"SPY": 2.0}
+    env.broker.is_open = is_open
+    plan = paper.plan_sell_all(env.broker, env.acct, now)
+    assert (plan.day, plan.next_day) == (T, T1)
+    result = paper.send_sell_all(env.broker, env.acct, plan, now)
+    if tif:
+        assert result.discarded is None and env.broker.submitted == [(oid(1, "SPY"), tif)]
+    else:
+        assert result.discarded == WINDOW_CLOSED and env.broker.submitted == []

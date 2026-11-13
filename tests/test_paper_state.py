@@ -20,7 +20,8 @@ def test_state_survives_reopen(tmp_path):
 
 def test_defaults(tmp_path):
     s = AccountStore(tmp_path, "paper-A")
-    assert s.state() == {"halted": False, "loss_lock": None, "loss_checked_through": None, "cleared": []}
+    assert s.state() == {"halted": False, "loss_lock": None, "loss_checked_through": None, "cleared": [],
+                         "killed_at": None}
     assert s.settings() == {"limits": Limits(), "strategy_path": None, "dividends": False}
 
 

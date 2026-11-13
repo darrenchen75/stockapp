@@ -1,11 +1,15 @@
-"""The paper-trading daily step: the Alpaca broker wrapper, preparing, sending and recovering a plan. No Qt imports."""
+"""The paper-trading daily step: the Alpaca broker wrapper, preparing, sending and recovering a plan, the kill
+switch and selling everything. No Qt imports."""
 import hashlib
 import json
+import math
 import re
 import tempfile
+from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from time import sleep as _sleep
 
 import pandas as pd
 from alpaca.common.exceptions import APIError
@@ -19,7 +23,7 @@ from alpaca.trading.requests import (GetCalendarRequest, GetOrdersRequest, GetPo
 
 from app.backtest import StrategyError, decide, history_as_of, input_hash, load_strategy, prepare
 from app.daily import ET, load_bars, refresh_daily, universe
-from app.paper_plan import (SEND_DEADLINE, Limits, LossCheck, Note, Order, check_losses, plan_orders,
+from app.paper_plan import (SEND_DEADLINE, Limits, LossCheck, Note, Order, check_losses, order_id, plan_orders,
                              run_window)
 from app.paper_state import AccountStore, Journal
 from app.store import Store
@@ -141,6 +145,7 @@ class Plan:
     loss: LossCheck
     loss_lock: dict | None  # the account's lock when the plan was made; sending rechecks it
     last_bars: dict[str, dict]  # day-T bar per held or targeted symbol
+    sell_all: bool = False  # a sell-everything plan, sent under the halt by send_sell_all
 
 
 def _date(iso: str | None) -> date | None:
@@ -164,9 +169,9 @@ _UNSENT = {None, "not_found"}  # journal states of an order that never reached A
 _NO_RESULT = _UNSENT | {"sending"}
 
 
-def _remainder(acct: AccountStore, day: date, attempts: list[int]) -> Plan | None:
-    """The latest attempt's saved plan, cut to its unsent orders, if that attempt is still open and a send
-    started (step 11 journals "sending" first). An attempt never sent is recomputed instead."""
+def _remainder(acct: AccountStore, day: date, attempts: list[int], sell_all: bool) -> Plan | None:
+    """The latest attempt's saved plan, cut to its unsent orders, if that attempt is still open, is of the kind
+    asked for and a send started (step 11 journals "sending" first). An attempt never sent is recomputed instead."""
     if not attempts:
         return None
     j = acct.journal(day, attempts[-1])
@@ -176,7 +181,7 @@ def _remainder(acct: AccountStore, day: date, attempts: list[int]) -> Plan | Non
         return None
     sent = j.order_states()
     unsent = [o for o in saved.orders if sent.get(o.client_order_id) in _UNSENT]
-    return replace(saved, orders=unsent) if sent and unsent and not j.closed() else None
+    return replace(saved, orders=unsent) if sent and unsent and not j.closed() and saved.sell_all == sell_all else None
 
 
 def _load_exactly(code: bytes, path: str):
@@ -188,6 +193,40 @@ def _load_exactly(code: bytes, path: str):
             return load_strategy(str(copy))
         except StrategyError as e:
             raise StrategyError(str(e).replace(str(copy), path)) from e
+
+
+def _attempt(broker: Broker, acct: AccountStore, number: str, day: date,
+             sell_all: bool) -> Refusal | tuple[Plan | None, int, list[Note]]:
+    """(the open attempt's unsent remainder or None, the next attempt number, notes), or why there is none:
+    an order from another day or attempt is still open. The number is 1 + the highest here or at Alpaca."""
+    prefix = f"sb-{number}-{day:%Y%m%d}-a"
+    ours = re.compile(rf"{re.escape(prefix)}(\d+)-")
+    remote = {int(m[1]) for o in broker.orders_since(datetime.combine(day, time(), ET))
+              if (m := ours.match(o.client_order_id or ""))}
+    local = acct.attempts(day)
+    left = _remainder(acct, day, local, sell_all)
+    mine = f"{prefix}{left.attempt}-" if left else None
+    blocking = [o.client_order_id for o in broker.open_orders()
+                if not (mine and (o.client_order_id or "").startswith(mine))]
+    if blocking:
+        return Refusal(f"{len(blocking)} open order(s) from another day or attempt, such as {blocking[0]}. "
+                       "Wait for them to finish or cancel them.")
+    notes = []
+    if remote - set(local):
+        notes.append(Note(None, "warning", f"Alpaca has orders for {day} that this computer has no journal "
+                                           "for: another computer may be running this account."))
+    return left, max([*local, *remote], default=0) + 1, notes
+
+
+def _journal_plan(acct: AccountStore, plan: Plan) -> Plan:
+    """Step 8: save the plan before anyone can confirm it."""
+    journal = acct.journal(plan.day, plan.attempt)
+    journal.write_plan(plan_to_json(plan))
+    for n in acct.attempts(plan.day):  # earlier attempts nobody started sending are replaced by this one
+        old = acct.journal(plan.day, n)
+        if n < plan.attempt and not old.closed() and not old.order_states():
+            old.close("superseded")
+    return plan
 
 
 def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, actions_client,
@@ -205,25 +244,12 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
         if why:
             return Refusal(why)
 
-        prefix = f"sb-{account.number}-{day:%Y%m%d}-a"
-        ours = re.compile(rf"{re.escape(prefix)}(\d+)-")
-        remote = {int(m[1]) for o in broker.orders_since(datetime.combine(day, time(), ET))
-                  if (m := ours.match(o.client_order_id or ""))}
-        local = acct.attempts(day)
-        left = _remainder(acct, day, local)
-        mine = f"{prefix}{left.attempt}-" if left else None
-        blocking = [o.client_order_id for o in broker.open_orders()
-                    if not (mine and (o.client_order_id or "").startswith(mine))]
-        if blocking:
-            return Refusal(f"{len(blocking)} open order(s) from another day or attempt, such as {blocking[0]}. "
-                           "Wait for them to finish or cancel them.")
+        got = _attempt(broker, acct, account.number, day, sell_all=False)
+        if isinstance(got, Refusal):
+            return got
+        left, attempt, notes = got
         if left:
             return left  # never recomputed: same IDs and quantities as confirmed
-        attempt = max([*local, *remote], default=0) + 1
-        notes = []
-        if remote - set(local):
-            notes.append(Note(None, "warning", f"Alpaca has orders for {day} that this computer has no journal "
-                                               "for: another computer may be running this account."))
 
         path = settings["strategy_path"]
         if not path:
@@ -297,15 +323,8 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
                     account, positions, limits, hashlib.sha256(code).hexdigest(), settings["dividends"], loss,
                     lock, last_bars)
 
-        # step 8: journal it before anyone can confirm it
-        journal = acct.journal(day, attempt)
-        (journal.folder / "strategy.py").write_bytes(code)
-        journal.write_plan(plan_to_json(plan))
-        for n in local:  # earlier attempts nobody started sending are replaced by this one
-            old = acct.journal(day, n)
-            if not old.closed() and not old.order_states():
-                old.close("superseded")
-        return plan
+        (acct.journal(day, attempt).folder / "strategy.py").write_bytes(code)
+        return _journal_plan(acct, plan)
 
 
 @dataclass(frozen=True)
@@ -321,12 +340,15 @@ def _close_if_sent(j: Journal) -> None:
         j.close("sent")
 
 
-def _recheck(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> str | None:
+_WINDOW_CLOSED = "the at-the-open window has closed; wait for the market to open"
+
+
+def _recheck(broker: Broker, acct: AccountStore, plan: Plan, now: datetime, tif: str) -> str | None:
     """Step 10: why the plan no longer holds, or None."""
-    if now >= datetime.combine(plan.next_day, SEND_DEADLINE, ET):
-        return f"The 09:28 New York send deadline for {plan.next_day} has passed."
+    if tif == "opg" and now >= datetime.combine(plan.next_day, SEND_DEADLINE, ET):
+        return _WINDOW_CLOSED if plan.sell_all else f"The 09:28 New York send deadline for {plan.next_day} has passed."
     state = acct.state()
-    if state["halted"]:
+    if state["halted"] and not plan.sell_all:  # selling everything requires the halt
         return "The account is halted."
     if state["loss_lock"] != plan.loss_lock:
         return "The loss lock changed since the plan was made."
@@ -357,7 +379,20 @@ def _look_up(broker: Broker, cid: str) -> BrokerOrder | None:
 
 def send_plan(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> SendResult:
     """Steps 10-11: recheck, then send the confirmed orders, journaling each before and after its request."""
+    return _send(broker, acct, plan, now, sell_all=False)
+
+
+def send_sell_all(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> SendResult:
+    """Send a sell-everything plan like send_plan, under the halt: as day orders while the market is open, else
+    at the open."""
+    return _send(broker, acct, plan, now, sell_all=True)
+
+
+def _send(broker: Broker, acct: AccountStore, plan: Plan, now: datetime, sell_all: bool) -> SendResult:
+    if plan.sell_all != sell_all:
+        raise ValueError("send a sell-everything plan with send_sell_all and a daily plan with send_plan")
     with acct.lock():
+        killed = acct.state()["killed_at"]  # a sell-all runs halted, so a kill shows as a new kill time
         j = acct.journal(plan.day, plan.attempt)
         if why := j.closed():
             return SendResult([], [], f"This attempt is already closed ({why}). Run again for a new plan.")
@@ -365,7 +400,8 @@ def send_plan(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> 
             if not (got := _look_up(broker, cid)):
                 return SendResult([], [(cid, _NO_ANSWER)], None)
             j.mark(cid, got.status, asdict(got))
-        if why := _recheck(broker, acct, plan, now):
+        tif = "day" if plan.sell_all and broker.market_open() else "opg"
+        if why := _recheck(broker, acct, plan, now, tif):
             if all(st in _UNSENT for st in j.order_states().values()):  # nothing of it is at Alpaca
                 j.close("discarded")
             return SendResult([], [], why)
@@ -374,11 +410,12 @@ def send_plan(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> 
             cid = o.client_order_id
             if states.get(cid) not in _UNSENT:  # already answered by Alpaca
                 continue
-            if acct.state()["halted"]:
+            state = acct.state()
+            if (state["killed_at"] != killed) if plan.sell_all else state["halted"]:
                 break
             j.mark(cid, "sending")
             try:
-                got = broker.submit(o)
+                got = broker.submit(o, tif)
             except Exception as e:
                 status = e.status_code if isinstance(e, APIError) else None
                 if "client_order_id must be unique" in str(e):
@@ -416,3 +453,93 @@ def recover(broker: Broker, acct: AccountStore) -> list[str]:
                 lines.append(f"{cid}: not found at Alpaca, so it is offered again")
             _close_if_sent(j)
         return lines
+
+
+_FINAL = {"canceled", "filled", "expired", "rejected", "failed", "not_found"}  # Alpaca has nothing open for these
+_POLL = 0.5  # seconds between status checks after a cancel
+
+
+def _settle(broker: Broker, acct: AccountStore, polls: int = 0, sleep=_sleep, close: bool = False) -> dict[str, str]:
+    """The latest status of every order of every open attempt and of every order Alpaca still has open. Orders
+    not finished are looked up again, up to `polls` more times, and new statuses are journaled. With `close`,
+    attempts whose orders are all finished are closed "killed"."""
+    for n in range(polls + 1):
+        if n:
+            sleep(_POLL)
+        status = {o.client_order_id or o.id: o.status for o in broker.open_orders()}
+        journals = [j for j in acct.entries() if not j.closed()]
+        for j in journals:
+            for cid, st in j.order_states().items():
+                if st not in _FINAL:
+                    with suppress(Exception):  # no answer leaves it unconfirmed
+                        got = broker.order(cid)
+                        # a "sending" order Alpaca doesn't know may still arrive; recover() settles it later
+                        new = got.status if got else st if st == "sending" else "not_found"
+                        if new != st:
+                            j.mark(cid, new, got and asdict(got))
+                        st = new
+                status[cid] = st
+        if all(st in _FINAL for st in status.values()):
+            break
+    if close:
+        for j in journals:
+            if all(st in _FINAL for st in j.order_states().values()):
+                j.close("killed")
+    return status
+
+
+def kill(broker: Broker, acct: AccountStore, timeout: float = 5.0, sleep=_sleep) -> list[tuple[str, str]]:
+    """Halt, cancel every open order, then confirm each one finished for up to `timeout` seconds, closing the
+    attempts that are. Takes no account lock: it must work while a send holds it."""
+    acct.save_state(halted=True, killed_at=datetime.now(timezone.utc).isoformat())  # on disk first
+    broker.cancel_all()
+    return list(_settle(broker, acct, round(timeout / _POLL), sleep, close=True).items())
+
+
+def unresolved_cancels(broker: Broker, acct: AccountStore) -> list[str]:
+    """IDs of orders Alpaca hasn't yet reported cancelled, filled or rejected."""
+    return [cid for cid, st in _settle(broker, acct).items() if st not in _FINAL]
+
+
+def release(broker: Broker, acct: AccountStore) -> str | None:
+    """Lift the halt, closing the killed attempts, once every order is finished; else why not."""
+    if not acct.state()["halted"]:
+        return None
+    if left := [cid for cid, st in _settle(broker, acct, close=True).items() if st not in _FINAL]:
+        return (f"{len(left)} order(s) not yet confirmed cancelled, filled or rejected, such as {left[0]}. "
+                "Kill again or wait for them to finish.")
+    acct.save_state(halted=False)
+    return None
+
+
+def plan_sell_all(broker: Broker, acct: AccountStore, now: datetime) -> Plan | Refusal:
+    """A journaled plan selling every whole share held, under the halt, once no other order is open."""
+    with acct.lock():
+        account = broker.account()
+        if account_key(account) != acct.dir.name:
+            return Refusal(f"The keys point to account {account.number}, not {acct.dir.name}.")
+        today = now.astimezone(ET).date()
+        day, next_day, why = run_window(broker.calendar(today - timedelta(days=10), today + timedelta(days=10)), now)
+        if day == next_day:  # no session to sell in; a passed 09:28 deadline still leaves market hours
+            return Refusal(why)
+        got = _attempt(broker, acct, account.number, day, sell_all=True)
+        if isinstance(got, Refusal):
+            return got
+        left, attempt, notes = got
+        state = acct.state()
+        if not state["halted"]:
+            acct.save_state(halted=True)
+        if left:
+            return left  # never recomputed: same IDs and quantities as confirmed
+        positions, settings, orders = broker.positions(), acct.settings(), []
+        for s, q in sorted(positions.items()):
+            whole = math.floor(q)
+            if q != whole:
+                notes.append(Note(s, "fractional", f"{s}: {q - whole:.4f} of a share is left alone"))
+            if whole > 0:
+                orders.append(Order(s, "sell", whole, order_id(account.number, day, attempt, s), math.nan))
+        plan = Plan(account.number, day, next_day, attempt, orders, notes, {}, "", "",
+                    now.astimezone(timezone.utc).isoformat(timespec="seconds"), account, positions,
+                    settings["limits"], "", settings["dividends"],
+                    LossCheck([], _date(state["loss_checked_through"]), None), state["loss_lock"], {}, sell_all=True)
+        return _journal_plan(acct, plan)

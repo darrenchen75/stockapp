@@ -16,7 +16,7 @@ from app.paper_plan import Limits
 log = logging.getLogger(__name__)
 
 _SETTINGS = {"limits": Limits(), "strategy_path": None, "dividends": False}
-_STATE = {"halted": False, "loss_lock": None, "loss_checked_through": None, "cleared": []}
+_STATE = {"halted": False, "loss_lock": None, "loss_checked_through": None, "cleared": [], "killed_at": None}
 
 
 class Busy(Exception):
