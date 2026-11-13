@@ -183,9 +183,9 @@ and make any borrowing visible:
 
 Orders are whole shares sized from day T's close, because the next open is unknown when
 the order is sent. The backtest uses fractional shares sized from T+1's open. Fill
-tracking shows the effect (see "Fill tracking"). The builder must check whether Alpaca
-accepts fractional at-the-open orders; if it does, the owner decides whether to use
-them.
+tracking shows the effect (see "Fill tracking"). Alpaca refuses fractional at-the-open
+orders (checked 2026-11-13: HTTP 422, `fractional orders must be DAY orders`), so whole
+shares are the only option.
 
 ## Strategy contract
 
@@ -212,7 +212,12 @@ and switching keys to another account never applies one account's state to anoth
   session's, from Alpaca's portfolio history (designer's call: Alpaca's `last_equity`
   moves overnight). The last session checked is stored. If any session's loss is larger
   than the cutoff, the run sends no buys and a red banner appears. If the history needed
-  is missing or zero, buys are blocked too. **The banner is a lock (owner's decision):**
+  is missing or zero, buys are blocked too. Checking starts at the account's first run
+  (designer's call after the Alpaca check: a new account's history shows equity 0 for
+  every day before it was funded). On the first run only day T's session is checked, and
+  a previous session at 0 counts as the funding day, not a loss. After that, a 0 in any
+  session that needs checking blocks buys. Each history point is dated by its New York
+  date; Alpaca stamps them 20:00 New York time. **The banner is a lock (owner's decision):**
   no run on any later day sends buys until a person clears it. Clearing records which
   session's loss was cleared, so a later breach locks again. Sales toward the targets
   still go out. Nothing is sold just because the cutoff was hit.
@@ -362,6 +367,21 @@ the market calendar, a corporate-actions query that reaches T+1, buying power fo
 alongside same-auction sales, that paper accounts get no dividends, and what portfolio
 history returns for a new account. Anything that turns out different comes back to the
 owner before the build relies on it.
+
+**Results (live paper account, 2026-11-13 00:33 ET; owner approved the changes):**
+- At-the-open order, lookup by `client_order_id`, cancel, listing a day's orders: as
+  assumed. Paper account numbers look like `PA` plus 7 characters.
+- A `client_order_id` can never be reused, even after a cancel. A duplicate and a reuse
+  both fail with HTTP 422, code 42210000, `client_order_id must be unique`. This matches
+  the new-attempt-new-IDs rule. The text can't tell "my own earlier send" apart from
+  "another computer", so the order is always looked up by ID.
+- Fractional at-the-open orders are refused (see "Whole shares").
+- Portfolio history: one point per session at 20:00 New York time, equity 0 before
+  funding (see "Daily loss cutoff").
+- The market calendar lists sessions only. A corporate-actions query reaching T+1 works
+  and returns announced future splits.
+- Not checked: weekend submission, buying power alongside a pending sale (the account
+  held nothing), a holiday in the calendar, paper dividends (taken from Alpaca's docs).
 
 ## Left to the builder
 

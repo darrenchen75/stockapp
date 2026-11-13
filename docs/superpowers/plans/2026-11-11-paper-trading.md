@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-11-paper-trading-design.md`. Read it before any task. Section names below refer to it.
 
-**Building waits for the owner's go.** Task 1 then reports to the owner, and Tasks 2+ start only after the owner has read that report.
+**Building waits for the owner's go.** Task 1 then reports to the owner, and Tasks 2+ start only after the owner has read that report. (Done 2026-11-13: results are in the spec's "First build step", and the owner approved the changes.)
 
 ## Global Constraints
 
@@ -134,6 +134,8 @@ Rules `plan_orders` must follow, from the spec's "The daily step", "Safety limit
   - `test_fractional_holding_trades_whole_shares` (Review Focus 3): holding A 10.5 untargeted → sell 10, with a `fractional` note.
   - `test_losses_checks_every_session_after_last`: history Mon 100, Tue 92, Wed 93, after=Mon, cutoff .03 → breaches [(Tue, -0.08)], checked_through Wed.
   - `test_losses_missing_or_zero_history_is_a_problem`: an empty history, or a zero equity in a needed session, gives `problem` not None.
+  - `test_losses_first_run_checks_only_latest_session` (spec "Daily loss cutoff", Alpaca results): history `[(Mon, 0.0), (Tue, 0.0), (Wed, 100_000.0), (Thu, 99_000.0)]`, after=None, cutoff .03 → no breaches, problem None, checked_through Thu. The same history with Thu at 90_000.0 → breaches [(Thu, -0.10)].
+  - `test_losses_first_run_after_funding_day_is_not_a_loss`: history `[(Mon, 0.0), (Tue, 100_000.0)]`, after=None → no breaches, problem None, checked_through Tue. A latest session at 0.0 → problem not None.
 - [ ] **Step 2: Run.** `uv run pytest tests/test_paper_plan.py -v` should FAIL (ImportError).
 - [ ] **Step 3: Implement `app/paper_plan.py`.** Window: T = the latest calendar day with `decision_time(T) <= now`. T+1 = the next calendar day after T. Open iff `now < datetime.combine(T+1, time(9, 28), ET)`.
 - [ ] **Step 4: Run.** `uv run pytest tests/test_paper_plan.py -v && uv run pytest -q` should pass.
@@ -170,7 +172,8 @@ class Journal:
     def mark(self, client_order_id: str, status: str, detail: dict | None = None) -> None  # appends to events.jsonl, fsync
     def events(self) -> list[dict]              # skips a truncated last line, logging a warning
     def order_states(self) -> dict[str, str]    # latest status per client_order_id
-    def close(self, why: str) -> None           # marks the attempt finished (sent, cancelled, killed, failed)
+    def close(self, why: str) -> None           # marks the attempt finished (sent, cancelled, killed, failed, discarded)
+    def closed(self) -> str | None              # the `why` given to close(), or None while the attempt is open
 ```
 - Layout: `<root>/<account_key>/settings.json`, `state.json`, `events.jsonl` (account-level), `days/<YYYY-MM-DD>/a<n>/plan.json`, `events.jsonl`, `strategy.py` (copy). The plan dict includes the strategy SHA-256.
 
@@ -178,6 +181,7 @@ class Journal:
   - `test_state_survives_reopen`: halt, reopen `AccountStore`, still halted.
   - `test_accounts_do_not_share_state` (spec "Safety limits": per account): halting "paper-A" leaves "paper-B" unhalted.
   - `test_plan_is_written_once`.
+  - `test_closed_survives_reopen`: `closed()` is None before `close("sent")`, and "sent" after reopening the `AccountStore`.
   - `test_unresolved_lists_sending_without_result`: mark x "sending" and y "sending", then y "accepted" → unresolved is [x].
   - `test_truncated_last_line_is_skipped` (Review Focus 4): append `{"id": "x", "sta` to events.jsonl → `events()` returns the earlier events and logs a warning.
   - `test_second_lock_raises_busy`: hold `lock()` and open a second `AccountStore` in a subprocess → it raises `Busy`.
@@ -211,9 +215,9 @@ class Broker:  # wraps TradingClient and CorporateActionsClient; FakeBroker in t
     def positions(self) -> dict[str, float]
     def orders_since(self, after: datetime) -> list[BrokerOrder]          # status=all, limit 500
     def order(self, client_order_id: str) -> BrokerOrder | None
-    def submit(self, order: Order) -> BrokerOrder
+    def submit(self, order: Order, tif: str = "opg") -> BrokerOrder      # tif "opg"|"day"; errors propagate unchanged
     def cancel_all(self) -> list[tuple[str, bool]]
-    def equity_history(self) -> list[tuple[date, float]]                 # 1D portfolio history
+    def equity_history(self) -> list[tuple[date, float]]                 # 1D portfolio history, each point dated by its New York date (Alpaca stamps 20:00 ET)
     def splits(self, symbols: list[str], start: date, end: date) -> dict[str, date]  # effective dates
     def market_open(self) -> bool                                        # get_clock().is_open
 def make_broker(keys: tuple[str, str]) -> Broker   # the only TradingClient(..., paper=True)
@@ -230,7 +234,7 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
 ```
 - `refresh_daily(..., expect: date | None = None)` and `Store.daily_last(symbol) -> str | None`. With `expect`, a current marker doesn't skip the download if SPY's last bar is before `expect`. After a download, SPY's last bar before `expect` raises `IncompleteDownload` and sets no marker. With `expect=None`, nothing changes.
 
-`prepare_plan` follows the spec's daily step 1-9, in order. It refuses (no orders, no journal) when: the account is halted; the window is closed; SPY has no day-T bar; the corporate-actions query fails; open orders exist from another day or attempt; or the strategy file is missing or raises. It loads the strategy fresh. The attempt is 1 + the highest attempt found locally *or* in `orders_since(T 00:00 ET)` by ID prefix. If the latest attempt for day T is not closed and has unsent orders, it returns that attempt's saved plan, limited to the unsent orders (spec "The journal and recovery"). If Alpaca has day-T `sb-` orders with no local journal, it adds a warning note ("another computer may be running this account"). Loss check: `check_losses(broker.equity_history(), state["loss_checked_through"], limits.loss_cutoff)`, minus sessions in `state["cleared"]`. A breach or a problem sets the lock and blocks buys. It saves the plan with `journal.write_plan` and copies the strategy file before returning.
+`prepare_plan` follows the spec's daily step 1-9, in order. It refuses (no orders, no journal) when: the account is halted; the window is closed; SPY has no day-T bar; the corporate-actions query fails; open orders exist from another day or attempt; or the strategy file is missing or raises. It loads the strategy fresh. The attempt is 1 + the highest attempt found locally *or* in `orders_since(T 00:00 ET)` by ID prefix. If the latest attempt for day T is not closed and has unsent orders, it returns that attempt's saved plan, limited to the unsent orders (spec "The journal and recovery"). If Alpaca has day-T `sb-` orders with no local journal, it adds a warning note ("another computer may be running this account"). Loss check: `check_losses(broker.equity_history(), state["loss_checked_through"], limits.loss_cutoff)` (the stored ISO date converted to `date`), minus sessions in `state["cleared"]`. A breach or a problem sets the lock and blocks buys. It saves the plan with `journal.write_plan` and copies the strategy file before returning.
 
 - [ ] **Step 1: Write the failing tests** (FakeBroker in memory, store seeded like `tests/test_compare_ui.py`'s `make_window`)
   - `test_daily_expect_forces_download_when_spy_stale` and `test_daily_expect_raises_without_marker` in `tests/test_daily.py`.
@@ -264,14 +268,14 @@ class SendResult: sent: list[BrokerOrder]; failed: list[tuple[str, str]]; discar
 def send_plan(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> SendResult
 def recover(broker: Broker, acct: AccountStore) -> list[str]   # one line per resolved order, for the window
 ```
-`send_plan` runs while holding `acct.lock()`. First, the recheck (spec daily step 10): before 09:28 on `plan.next_day`; same account number; not halted; loss lock unchanged; limits unchanged; no open orders except this attempt's; positions equal `plan.positions`. Any difference closes the journal as "discarded" and returns `discarded`. Otherwise, for each order in plan order, it checks `state()["halted"]`, marks "sending", submits, then marks the result. A duplicate `client_order_id` error is treated as already sent: `broker.order(id)` is looked up and its status recorded. It closes the journal as "sent" when every order has a result.
+`send_plan` runs while holding `acct.lock()`. First, the recheck (spec daily step 10): before 09:28 on `plan.next_day`; same account number; not halted; loss lock unchanged; limits unchanged; no open orders except this attempt's; positions equal `plan.positions`. Any difference closes the journal as "discarded" and returns `discarded`. Otherwise, for each order in plan order, it checks `state()["halted"]`, marks "sending", submits, then marks the result. A duplicate `client_order_id` error is treated as already sent: `broker.order(id)` is looked up and its status recorded. It is recognised by the substring `client_order_id must be unique` in `str(error)`. Alpaca's real response (Task 1) is HTTP 422 `{"code":42210000,"message":"client_order_id must be unique"}`, raised by alpaca-py as `APIError`. It closes the journal as "sent" when every order has a result.
 
 - [ ] **Step 1: Write the failing tests**
   - `test_send_submits_in_order_with_journal`: events go sending → accepted per order, sales before buys.
   - `test_send_rechecks_positions`: change FakeBroker's positions after prepare → `discarded` not None, and nothing submitted.
   - `test_send_after_deadline_discarded`: now = T+1 09:28 → discarded.
   - `test_send_stops_when_halted_midway`: FakeBroker sets the halt after the first submit → the second order is not sent.
-  - `test_duplicate_id_counts_as_sent` (Review Focus 5): FakeBroker raises an error with the exact text recorded in Task 1's report → no failure, status from `order()`.
+  - `test_duplicate_id_counts_as_sent` (Review Focus 5): FakeBroker raises `Exception('{"code":42210000,"message":"client_order_id must be unique"}')` → no failure, status from `order()`.
   - `test_recover_resolves_sending`: journal x "sending" with no result, FakeBroker knows x as accepted → `recover` marks "accepted"; for an ID Alpaca doesn't know, it marks "not_found".
   - `test_send_twice_never_doubles`: calling `send_plan` twice with the same plan leaves FakeBroker holding one order per ID.
 - [ ] **Step 2: Run.** These should FAIL.
@@ -296,7 +300,7 @@ def release(broker: Broker, acct: AccountStore) -> str | None                # N
 def plan_sell_all(broker: Broker, acct: AccountStore, now: datetime) -> Plan | Refusal
 def send_sell_all(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> SendResult
 ```
-`kill` saves `halted=True` first, then calls `cancel_all`, then polls each open order's status up to a short timeout and closes the open attempts as "killed". `release` refuses while `unresolved_cancels` isn't empty. `plan_sell_all` is a journaled plan (attempt numbering as in Task 5, IDs `…-a{n}-{symbol}`). It requires the halt to be set (it sets it if not), refuses until there are no open orders, and sells every whole share. `send_sell_all` is like `send_plan` but skips the halt check and uses market `time_in_force=day` when `broker` reports the market open, otherwise `opg`.
+`kill` saves `halted=True` first, then calls `cancel_all`, then polls each open order's status up to a short timeout and closes the open attempts as "killed". `release` refuses while `unresolved_cancels` isn't empty. `plan_sell_all` is a journaled plan (attempt numbering as in Task 5, IDs `…-a{n}-{symbol}`). It requires the halt to be set (it sets it if not), refuses until there are no open orders, and sells every whole share. `send_sell_all` is like `send_plan` but skips the halt check and calls `broker.submit(order, tif="day")` when `broker.market_open()`, otherwise `tif="opg"`.
 
 - [ ] **Step 1: Write the failing tests**
   - `test_kill_halts_before_cancelling`: FakeBroker records the halt state at the moment of `cancel_all` → already True.
