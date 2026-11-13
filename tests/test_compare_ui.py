@@ -794,3 +794,21 @@ def test_paper_source_error_is_a_note_not_a_crash(paper_window):
     w = paper_window(boom)
     assert w.paper_note.text() == "Paper: could not load (RuntimeError: no keys at all)"
     assert w.list.count() == len(w.records) + 1
+
+
+def test_paper_line_alone_is_compared_with_spy(paper_window):
+    w = paper_window(lambda: [("Paper: s (abc1234)", paper_frame())])
+    w.list.item(len(w.records) + 1).setCheckState(Qt.Checked)  # no run ticked
+    wait(lambda: not w.workers and w.table.columnCount() == 2)
+    assert [w.table.horizontalHeaderItem(c).text() for c in range(2)] == ["SPY", "Paper: s (abc1234)"]
+    assert w.table.item(4, 1).text() != "—"
+
+
+def test_paper_column_has_no_rebalance_or_warning_counts(paper_window):
+    w = paper_window(lambda: [("Paper: s (abc1234)", paper_frame())])
+    w.tick(0)
+    w.list.item(len(w.records) + 1).setCheckState(Qt.Checked)
+    wait(lambda: not w.workers)
+    col = w.table.columnCount() - 1
+    assert [w.table.item(r, col).text() for r in (6, 7)] == ["—", "—"]
+    assert w.table.item(6, 0).text() != "—"

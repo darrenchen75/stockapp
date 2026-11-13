@@ -727,11 +727,13 @@ def paper_lines(acct: AccountStore, history: list[tuple[date, float]]) -> list[t
         if segments:
             segments[-1][3] = plan.day
         segments.append([plan.strategy_sha256, plan.strategy_name, plan.day, None])
-    out = []
+    out, done = [], []
     for sha, name, start, end in segments:
         points = [(pd.Timestamp(d), v) for d, v in history if v > 0 and d >= start and (end is None or d <= end)]
         if len(points) > 1:  # one point has no return
-            out.append((f"Paper: {name} ({sha[:7]})", pd.DataFrame(points, columns=["date", "value"])))
+            seen = sum(1 for o in done if o == sha)  # the same code again gets " #2", " #3": names key the ticks
+            done.append(sha)
+            out.append((f"Paper: {name} ({sha[:7]})" + (f" #{seen + 1}" if seen else ""), pd.DataFrame(points, columns=["date", "value"])))
     return out
 
 

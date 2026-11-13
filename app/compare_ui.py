@@ -663,8 +663,12 @@ class CompareWindow(QWidget):
     def _benchmark_key(self):
         ids = self.ticked()
         through = self.store.daily_through()
-        if not ids or through is None or self.spy_item.checkState() != Qt.Checked:
+        paper = [p for n, p in self.paper_lines or [] if n in self.paper_ticked()]
+        if not (ids or paper) or through is None or self.spy_item.checkState() != Qt.Checked:
             return None
+        if not ids:  # paper lines alone: SPY over their dates
+            return through, min(p["date"].min() for p in paper).date().isoformat(), \
+                max(p["date"].max() for p in paper).date().isoformat()
         settings = [self._record(i).settings for i in ids]
         return through, min(s.start for s in settings), max(s.end for s in settings)
 
@@ -799,6 +803,8 @@ class CompareWindow(QWidget):
                         f"{percent(value, True)} ± {percent(stats['alpha_se'])} ({stats['days']} d)"
                 elif key in ("total_return", "cagr", "worst_drop"):
                     text = percent(value, key == "total_return")
+                elif run_id is None and name in {n for n, *_ in extra} and key in ("rebalances", "warnings"):
+                    text = "—"  # a paper line has no backtest rows to count
                 else:
                     text = str(value)
                 cell = QTableWidgetItem(text)

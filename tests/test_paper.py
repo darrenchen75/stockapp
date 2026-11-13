@@ -978,3 +978,11 @@ def test_unfilled_and_sell_all_attempts_make_no_segment(env_plan):
     filled_journal(env, date(2026, 11, 9), date(2026, 11, 10), "a" * 64, filled=0.0)
     filled_journal(env, date(2026, 11, 10), date(2026, 11, 11), "b" * 64, sell_all=True)
     assert paper.paper_lines(env.acct, curve(9, 10, 11)) == []
+
+
+def test_repeated_strategy_gets_a_distinct_name(env_plan):
+    env = env_plan
+    for day, nxt, sha in ((9, 10, "a"), (10, 11, "b"), (11, 12, "a")):
+        filled_journal(env, date(2026, 11, day), date(2026, 11, nxt), sha * 64)
+    got = paper.paper_lines(env.acct, curve(9, 10, 11, 12, 13))
+    assert [n for n, _ in got] == ["Paper: mine (aaaaaaa)", "Paper: mine (bbbbbbb)", "Paper: mine (aaaaaaa) #2"]
