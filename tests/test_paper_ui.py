@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -309,7 +310,7 @@ def test_backtests_get_paper_lines_once_an_account_is_confirmed(main_window, tmp
     seen = []
     monkeypatch.setattr(compare_ui, "CompareWindow", lambda *a, paper_source=None: seen.append(paper_source) or Mock())
     main_window.open_backtests()
-    assert seen == [None]  # no account confirmed yet
+    assert seen[0]() == []  # no account confirmed yet
 
     (tmp_path / "paper").mkdir()
     (tmp_path / "paper" / "current.json").write_text(json.dumps({"account_key": f"paper-{NUMBER}"}))
@@ -319,14 +320,15 @@ def test_backtests_get_paper_lines_once_an_account_is_confirmed(main_window, tmp
     monkeypatch.setattr(paper, "track_fills", lambda b, a, s: tracked.append((b, a.dir.name)))
     main_window.compare = None
     main_window.open_backtests()
-    assert seen[1]() == [] and tracked == [(broker, f"paper-{NUMBER}")]
+    assert seen[0]() == [] and tracked == [(broker, f"paper-{NUMBER}")]  # set up after the window opened
+    assert seen[1]() == [] and len(tracked) == 2
     broker.acct = paper.Account("PA0000002", broker.acct.endpoint, 1e5, 1e5, 2e5)
     with pytest.raises(ValueError, match="PA0000002"):
         seen[1]()
 
 
 def test_viewer_still_does_not_import_paper_modules():
-    text = Path("app/ui.py").read_text()
+    text = (Path(__file__).parents[1] / "app" / "ui.py").read_text()
     head = text.split("def open_backtests")[0]
     assert "app.paper" not in head and "paper_ui" not in head
     lazy = ('app.paper', 'app.compare_ui', 'app.backtest', 'app.runs')
@@ -396,3 +398,71 @@ def test_change_strategy(env, monkeypatch, tmp_path):
     monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (other, "")))
     click(w, w.strategy_button)
     assert env.acct().settings()["strategy_path"] == other and w.strategy_label.text() == other
+
+
+def two_orders(env, tmp_path):
+    two = tmp_path / "two.py"
+    two.write_text("def target_weights(history, as_of):\n    return {'SPY': 0.2, 'AAPL': 0.2}\n")
+    env.acct().save_settings(strategy_path=str(two))
+
+
+def test_run_today_opens_at_2030_without_a_refresh(env, monkeypatch):
+    monkeypatch.setattr(paper_ui, "_now", lambda: datetime(2026, 11, 12, 20, 20, tzinfo=ET))
+    w = env.open()
+    assert not w.run_button.isEnabled()
+    monkeypatch.setattr(paper_ui, "_now", lambda: NOW)
+    assert w.clock.isActive() and w.clock.interval() <= 60_000
+    w.clock.timeout.emit()
+    assert w.run_button.isEnabled()
+
+
+@pytest.mark.parametrize("halted", [True, False])  # False: the halt was already released
+def test_plan_made_across_a_kill_is_dropped(env, monkeypatch, halted):
+    w = env.open()
+    real = paper_ui.prepare_plan
+
+    def kill_meanwhile(broker, acct, *a):
+        plan = real(broker, acct, *a)
+        acct.save_state(halted=halted, killed_at="2026-11-13T02:00:00+00:00")
+        return plan
+    monkeypatch.setattr(paper_ui, "prepare_plan", kill_meanwhile)
+    click(w, w.run_button)
+    assert w.plan is None and not w.send_button.isEnabled() and "kill" in w.message.text()
+    assert env.acct().journal(T, 1).closed() is not None
+
+
+def test_kill_during_send_stops_the_next_order(env, tmp_path):
+    w = env.open()
+    two_orders(env, tmp_path)
+    click(w, w.run_button)
+    assert len(w.plan.orders) == 2
+    inside, go = threading.Event(), threading.Event()
+
+    def hold(call):
+        if call == 1:
+            inside.set()
+            assert go.wait(5)
+    env.broker.on_submit = hold
+    w.send_button.click()
+    wait(inside.is_set)
+    assert w.kill_button.isEnabled()
+    w.kill_button.click()
+    wait(lambda: "kill" not in w.jobs)
+    assert env.acct().state()["halted"]
+    go.set()
+    settle(w)
+    assert env.broker.calls == 1
+
+
+def test_a_live_endpoint_is_refused(env):
+    env.broker.acct = paper.Account(NUMBER, "https://api.alpaca.markets", 1e5, 1e5, 2e5)
+    w = env.open()
+    assert env.asked == [] and not (env.root / "current.json").exists()
+    assert "paper endpoint" in w.message.text() and not w.run_button.isEnabled() and not w.kill_button.isEnabled()
+
+
+def test_sell_everything_entry_records_the_app_version(env):
+    env.broker.held = {"SPY": 10.0}
+    w = env.open()
+    click(w, w.sell_button)
+    assert (env.acct().journal(T, 1).folder / "app_version.txt").read_text() == "0.1.4"

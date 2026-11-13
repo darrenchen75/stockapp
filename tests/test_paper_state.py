@@ -150,3 +150,30 @@ def test_a_racing_state_write_cannot_undo_a_halt(tmp_path, monkeypatch):
     loss.join()
     halt.join()
     assert s.state()["halted"] is True and s.state()["loss_checked_through"] == "2026-11-12"
+
+
+def test_two_writers_of_one_file_do_not_collide(tmp_path, monkeypatch):
+    import os
+    real, inside, go, errors = os.fsync, threading.Event(), threading.Event(), []
+
+    def slow(fd):
+        if threading.current_thread() is first:
+            inside.set()
+            go.wait(5)
+        real(fd)
+
+    def write():
+        try:
+            paper_state._write_json(tmp_path / "fills.json", {"from": "first"})
+        except Exception as e:
+            errors.append(e)
+
+    monkeypatch.setattr(os, "fsync", slow)
+    first = threading.Thread(target=write)
+    first.start()
+    assert inside.wait(5)
+    paper_state._write_json(tmp_path / "fills.json", {"from": "second"})  # while the first is mid-write
+    go.set()
+    first.join(5)
+    assert errors == [] and json.loads((tmp_path / "fills.json").read_text()) == {"from": "first"}
+    assert [p.name for p in tmp_path.iterdir()] == ["fills.json"]

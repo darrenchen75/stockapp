@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -34,12 +35,12 @@ def _now() -> str:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w") as f:
+    # a temp name of its own, so two writers of one file (the paper window and the compare screen) never collide
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as f:
         json.dump(data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    os.replace(f.name, path)
 
 
 def _append(path: Path, event: dict) -> None:

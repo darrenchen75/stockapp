@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 import pandas as pd
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QHBoxLayout, QLabel, QListWidget, QMessageBox, QPushButton, QSplitter,
                                QTableWidget, QTabWidget, QVBoxLayout, QWidget)
@@ -26,6 +26,7 @@ LIVE_OFF = "Live trading is off: the app has no code signing, so a tampered upda
 SIMULATOR_NOTE = ("Alpaca's paper fills are simulated against quotes, so the gap to the official open includes the "
                   "simulator's behaviour, not just real trading costs.")
 RED = "color: #c62828"
+PAPER_ENDPOINT = "paper-api.alpaca.markets"
 WENT_OUT = "Orders already went out — use the kill switch to stop them."
 BUSY_JOBS = {"send", "kill", "sell", "sell_send"}  # closing or updating mid-way asks first
 fill = RunDetail.fill
@@ -146,6 +147,7 @@ class PaperWindow(QWidget):
         self.recovered: set[str] = set()  # account keys whose crashed sends recover() has settled
         self.plan: Plan | None = None  # run in this session, not yet sent or cancelled
         self.jobs: dict[str, Job] = {}  # name -> running job, referenced until it reports
+        self.run_killed_at: str | None = None  # the kill time when the running Run started
         self.stale = False  # a refresh was asked for while a status job ran; it runs again after
         self.entries: list[Journal] = []
         self.fills = pd.DataFrame(columns=FILL_COLUMNS)
@@ -253,6 +255,9 @@ class PaperWindow(QWidget):
         outer = QHBoxLayout(self)
         outer.addWidget(split)
         self.resize(1150, 720)
+        self.clock = QTimer(self, interval=30_000)  # the run window opens and closes by the clock
+        self.clock.timeout.connect(self.update_buttons)
+        self.clock.start()
         if make_broker is None:
             self.say("No Alpaca keys are stored, so paper trading is off. Add keys in the main window.", error=True)
         self.update_buttons()
@@ -307,7 +312,7 @@ class PaperWindow(QWidget):
         recovered = [] if acct.dir.name in self.recovered else recover(broker, acct)  # before anything is sent
         today = now.astimezone(ET).date()
         calendar = broker.calendar(today - timedelta(days=366), today + timedelta(days=10))
-        return dict(broker=broker, account=account, acct=acct, recovered=recovered, window=run_window(calendar, now),
+        return dict(broker=broker, account=account, acct=acct, recovered=recovered, calendar=calendar,
                     unresolved=unresolved_cancels(broker, acct) if acct.state()["halted"] else [],
                     missed=missed_sessions(acct, calendar, now), negative=negative_cash_days(acct, broker),
                     fills=_with_store(self.db_path, lambda store: track_fills(broker, acct, store)))
@@ -317,15 +322,16 @@ class PaperWindow(QWidget):
         self.recovered.add(key)
         if s["recovered"]:
             self.say("Checked orders left unfinished last time: " + "; ".join(s["recovered"]))
-        if (self.acct is None or self.acct.dir.name != key) and not self.confirm(s):
+        if (self.acct is None or self.acct.dir.name != key) and (why := self.confirm(s)):
             self.acct = self.status = None
-            self.say("The account is not confirmed. Close and reopen this window to confirm it.", error=True)
+            self.say(why, error=True)
         else:
             self.status = s
         self.show_status()
 
-    def confirm(self, s: dict) -> bool:
-        """The account check: a new or different account is confirmed by the user before anything runs."""
+    def confirm(self, s: dict) -> str | None:
+        """The account check: a new or different account is confirmed by the user before anything runs. Returns
+        why it isn't, or None."""
         if self.plan is not None:  # the keys now point elsewhere: an unsent plan is discarded
             j = self.acct.journal(self.plan.day, self.plan.attempt)
             if not j.closed() and not j.order_states():
@@ -333,6 +339,9 @@ class PaperWindow(QWidget):
             self.plan = None
             self.show_plan()
         account, acct = s["account"], s["acct"]
+        if PAPER_ENDPOINT not in account.endpoint:
+            return (f"{account.endpoint} is not Alpaca's paper endpoint ({PAPER_ENDPOINT}), so paper trading is off "
+                    "for these keys.")
         current = self.root / "current.json"
         last = json.loads(current.read_text())["account_key"] if current.exists() else None
         if last != acct.dir.name:
@@ -340,13 +349,13 @@ class PaperWindow(QWidget):
             if last:
                 text += f" The last confirmed account was {last.removeprefix('paper-')}."
             if QMessageBox.question(self, "Paper trading", text) != QMessageBox.Yes:
-                return False
+                return "The account is not confirmed. Close and reopen this window to confirm it."
             self.root.mkdir(parents=True, exist_ok=True)
             _write_json(current, {"account_key": acct.dir.name})
         self.acct = acct
         if not acct.settings()["strategy_path"]:
             self.pick_strategy()
-        return True
+        return None
 
     def show_status(self) -> None:
         s, acct = self.status, self.acct
@@ -393,7 +402,8 @@ class PaperWindow(QWidget):
         working = bool(self.jobs.keys() - {"replay"})
         halted = ready and self.acct.state()["halted"]
         why = ("No paper account is confirmed." if not ready else
-               "The account is halted. Release the halt before running." if halted else self.status["window"][2])
+               "The account is halted. Release the halt before running." if halted else
+               run_window(self.status["calendar"], _now())[2])
         self.run_button.setEnabled(not why and not working)
         self.run_button.setToolTip(why or "")
         self.send_button.setEnabled(ready and self.plan is not None and not halted and not working
@@ -409,23 +419,35 @@ class PaperWindow(QWidget):
     # --- run, send, cancel ---
     def run_today(self) -> None:
         broker, acct, now = self.broker, self.acct, _now()
+        self.run_killed_at = acct.state()["killed_at"]
 
         def work():
-            plan = _with_store(self.db_path, lambda store: prepare_plan(broker, acct, store, *self.make_data_clients(),
-                                                                        now))
-            if isinstance(plan, Plan) and not (path := acct.journal(plan.day, plan.attempt).folder
-                                               / "app_version.txt").exists():
-                path.write_text(self.app_version)
-            return plan
+            return self._stamp(acct, _with_store(
+                self.db_path, lambda store: prepare_plan(broker, acct, store, *self.make_data_clients(), now)))
         self.start("run", work)
 
     def on_run(self, result) -> None:
         if isinstance(result, Refusal):
             self.say(result.reason, error=True)
             return
+        state = self.acct.state()
+        if state["halted"] or state["killed_at"] != self.run_killed_at:  # a kill landed while the plan was made
+            j = self.acct.journal(result.day, result.attempt)
+            if not j.closed() and not j.order_states():
+                j.close("discarded")
+            self.say("The kill switch was used while this plan was being made, so it was dropped. Run again once "
+                     "the halt is released.", error=True)
+            return
         self.plan = result
         self.say("")
         self.show_plan()
+
+    def _stamp(self, acct: AccountStore, plan):
+        """The app version beside a new plan, for the log."""
+        if isinstance(plan, Plan) and not (path := acct.journal(plan.day, plan.attempt).folder
+                                           / "app_version.txt").exists():
+            path.write_text(self.app_version)
+        return plan
 
     def show_plan(self) -> None:
         p = self.plan
@@ -502,7 +524,7 @@ class PaperWindow(QWidget):
                                 "open order, then lists the sales for you to confirm.") != QMessageBox.Yes:
             return
         broker, acct, now = self.broker, self.acct, _now()
-        self.start("sell", lambda: (kill(broker, acct), plan_sell_all(broker, acct, now))[1])
+        self.start("sell", lambda: (kill(broker, acct), self._stamp(acct, plan_sell_all(broker, acct, now)))[1])
 
     def on_sell(self, plan) -> None:
         if isinstance(plan, Refusal):

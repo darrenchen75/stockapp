@@ -656,9 +656,10 @@ def test_export_cancelled_writes_nothing(window_with_runs, monkeypatch):
 # --- entry from the main window, and its guards ---
 @pytest.fixture
 def main_window(qapp, tmp_path, monkeypatch):
-    from app import ui
+    from app import paper_state, ui
     monkeypatch.setattr(ui.MainWindow, "start_poller", lambda self, keys: None)
     monkeypatch.setattr(ui.MainWindow, "check_for_update", lambda self: None)
+    monkeypatch.setattr(paper_state, "paper_dir", lambda: tmp_path / "paper")  # never the real paper account
     w = ui.MainWindow(str(tmp_path / "bars.db"), [], ("k", "s"), tmp_path)
     yield w
     w.compare = None

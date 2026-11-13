@@ -221,23 +221,23 @@ class MainWindow(QMainWindow):
             from app.paper_state import paper_dir
             from app.runs import runs_dir
 
-            current = paper_dir() / "current.json"  # the last paper account confirmed in the paper window
-            paper_source = None
-            if self.keys and current.exists():
-                def paper_source():  # runs on the compare window's worker thread
-                    from app.paper import account_key, make_broker, paper_lines, track_fills
-                    from app.paper_state import AccountStore
+            def paper_source():  # runs on the compare window's worker thread, each time it asks
+                from app.paper import account_key, make_broker, paper_lines, track_fills
+                from app.paper_state import AccountStore
 
-                    key = json.loads(current.read_text())["account_key"]
-                    broker = make_broker(self.keys)
-                    if (found := account_key(broker.account())) != key:
-                        raise ValueError(f"the keys point to {found}, not the confirmed {key}")
-                    acct, store = AccountStore(paper_dir(), key), Store(self.db_path)
-                    try:
-                        track_fills(broker, acct, store)
-                    finally:
-                        store.db.close()
-                    return paper_lines(acct, broker.equity_history())
+                current = paper_dir() / "current.json"  # the last paper account confirmed in the paper window
+                if not self.keys or not current.exists():
+                    return []
+                key = json.loads(current.read_text())["account_key"]
+                broker = make_broker(self.keys)
+                if (found := account_key(broker.account())) != key:
+                    raise ValueError(f"the keys point to {found}, not the confirmed {key}")
+                acct, store = AccountStore(paper_dir(), key), Store(self.db_path)
+                try:
+                    track_fills(broker, acct, store)
+                finally:
+                    store.db.close()
+                return paper_lines(acct, broker.equity_history())
 
             self.compare = CompareWindow(self.db_path, runs_dir(), self.make_clients, VERSION,
                                          paper_source=paper_source)
@@ -389,8 +389,9 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.paper is not None:
-            if self.paper.busy and QMessageBox.question(
-                    self, "Stock Bars", "Paper orders are being sent or cancelled. Quit anyway?") != QMessageBox.Yes:
+            text = ("Paper orders are being sent or cancelled. Quit anyway? Unfinished orders are checked the next "
+                    "time you open Paper trading.")
+            if self.paper.busy and QMessageBox.question(self, "Stock Bars", text) != QMessageBox.Yes:
                 event.ignore()
                 return
             self.paper.hide()  # a visible paper window would keep the app running
