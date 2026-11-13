@@ -320,6 +320,28 @@ def test_spy_with_an_empty_bar_list_also_raises(tmp_path):
     assert store.daily_through() is None
 
 
+def test_daily_expect_forces_download_when_spy_stale(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    store.replace_daily("SPY", [row("2026-11-04", "SPY")])
+    store.set_daily_symbols(["SPY"])
+    store.set_daily_through("2026-11-05")  # current marker, but SPY stops a day short
+    client = FakeClient({"SPY": [fake_day("2026-11-04"), fake_day("2026-11-05")]})
+    assert refresh_daily(client, FakeActions(), store, ["SPY"], now=NOW, expect=NOV5) is True
+    assert client.requests and store.daily_last("SPY") == "2026-11-05"
+    again = FakeClient({"SPY": [fake_day("2026-11-05")]})
+    assert refresh_daily(again, FakeActions(), store, ["SPY"], now=NOW, expect=NOV5) is False
+    assert again.requests == []
+
+
+def test_daily_expect_raises_without_marker(tmp_path):
+    store = Store(str(tmp_path / "bars.db"))
+    client = FakeClient({"A": [fake_day("2026-11-05")], "SPY": [fake_day("2026-11-04")]})
+    with pytest.raises(IncompleteDownload, match="2026-11-05"):
+        refresh_daily(client, FakeActions(), store, ["A", "SPY"], now=NOW, expect=NOV5)
+    assert store.daily_through() is None and store.daily_last("SPY") == "2026-11-04"
+    assert store.daily_last("NONE") is None
+
+
 def test_load_bars_hides_a_day_before_its_cutoff(tmp_path):
     store = Store(str(tmp_path / "bars.db"))
     store.replace_daily("A", [row("2026-11-04"), row("2026-11-05")])
