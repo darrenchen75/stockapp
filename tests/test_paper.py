@@ -923,3 +923,58 @@ def test_negative_snapshot_survives_positive_live_cash_on_the_same_day(env, monk
     j = env.acct.journal(T, 1)
     (j.folder / "plan.json").write_text(json.dumps({**j.plan(), "account": {**j.plan()["account"], "cash": -5.0}}))
     assert paper.negative_cash_days(env.acct, env.broker) == [(T, -5.0)]
+
+
+# --- paper lines for the compare screen ---
+
+def filled_journal(env, day, nxt, sha, name="mine", filled=1.0, attempt=1, sell_all=False):
+    base = paper.plan_to_json(env.plan)
+    plan = {**base, "day": day.isoformat(), "next_day": nxt.isoformat(), "strategy_sha256": sha,
+            "strategy_name": name, "attempt": attempt,
+            "sell_all": sell_all}
+    j = env.acct.journal(day, attempt)
+    j.write_plan(plan)
+    (j.folder / "fills.json").write_text(json.dumps({"final": True, "rows": [{"filled_shares": filled}]}))
+
+
+@pytest.fixture(autouse=False)
+def env_plan(env):
+    env.plan = env.run()  # its own journal (T, a1) has no fills, so it makes no segment
+    return env
+
+
+def curve(*days):
+    return [(date(2026, 11, d), 1000.0 + i) for i, d in enumerate(days)]
+
+
+def test_plan_strategy_name_is_the_file_stem_and_defaults_for_old_plans(env):
+    plan = env.run()
+    assert plan.strategy_name == "buy_spy"
+    old = paper.plan_to_json(plan)
+    del old["strategy_name"]
+    assert paper.plan_from_json(old).strategy_name == "strategy"
+
+
+def test_segment_starts_at_prior_close(env_plan):
+    env = env_plan
+    filled_journal(env, date(2026, 11, 9), date(2026, 11, 10), "a" * 64)  # Mon's plan, fills Tue
+    (name, df), = paper.paper_lines(env.acct, curve(5, 6, 9, 10, 11))
+    assert name == "Paper: mine (aaaaaaa)"
+    assert [d.day for d in df["date"]] == [9, 10, 11] and list(df.columns) == ["date", "value"]
+
+
+def test_code_edit_starts_new_segment(env_plan):
+    env = env_plan
+    filled_journal(env, date(2026, 11, 9), date(2026, 11, 10), "a" * 64)
+    filled_journal(env, date(2026, 11, 11), date(2026, 11, 12), "b" * 64, name="v2")
+    filled_journal(env, date(2026, 11, 12), date(2026, 11, 13), "b" * 64, name="v2", attempt=2)  # same code: same line
+    (a, da), (b, db) = paper.paper_lines(env.acct, curve(6, 9, 10, 11, 12, 13) + [(date(2026, 11, 14), 0.0)])
+    assert (a, b) == ("Paper: mine (aaaaaaa)", "Paper: v2 (bbbbbbb)")
+    assert [d.day for d in da["date"]] == [9, 10, 11] and [d.day for d in db["date"]] == [11, 12, 13]  # zero dropped
+
+
+def test_unfilled_and_sell_all_attempts_make_no_segment(env_plan):
+    env = env_plan
+    filled_journal(env, date(2026, 11, 9), date(2026, 11, 10), "a" * 64, filled=0.0)
+    filled_journal(env, date(2026, 11, 10), date(2026, 11, 11), "b" * 64, sell_all=True)
+    assert paper.paper_lines(env.acct, curve(9, 10, 11)) == []

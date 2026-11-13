@@ -147,6 +147,7 @@ class Plan:
     loss_lock: dict | None  # the account's lock when the plan was made; sending rechecks it
     last_bars: dict[str, dict]  # day-T bar per held or targeted symbol
     sell_all: bool = False  # a sell-everything plan, sent under the halt by send_sell_all
+    strategy_name: str = "strategy"  # the strategy file's stem; older plan.json files lack it
 
 
 def _date(iso: str | None) -> date | None:
@@ -322,7 +323,7 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
         plan = Plan(account.number, day, next_day, attempt, orders, more + notes, targets, input_hash(history),
                     store.daily_last("SPY"), now.astimezone(timezone.utc).isoformat(timespec="seconds"),
                     account, positions, limits, hashlib.sha256(code).hexdigest(), settings["dividends"], loss,
-                    lock, last_bars)
+                    lock, last_bars, strategy_name=Path(path).stem)
 
         (acct.journal(day, attempt).folder / "strategy.py").write_bytes(code)
         return _journal_plan(acct, plan)
@@ -706,6 +707,32 @@ def replay(acct: AccountStore, journal: Journal, store: Store) -> dict:
     except StrategyError:
         return {"hash_matches": True, "same_targets": False, "targets": None}
     return {"hash_matches": True, "same_targets": targets == plan.targets, "targets": targets}
+
+
+def paper_lines(acct: AccountStore, history: list[tuple[date, float]]) -> list[tuple[str, pd.DataFrame]]:
+    """One (name, portfolio) per strategy segment. A segment is a run of attempts with one strategy SHA-256; it starts
+    at the close of the plan's day T for its first attempt with a filled order (fills.json) and ends at the close
+    where the next segment starts. A strategy returning after another one gets its own line."""
+    segments = []  # [sha, name, start, end]; end None while open
+    for j in reversed(acct.entries()):  # oldest first
+        try:
+            plan = plan_from_json(j.plan())
+            rows = json.loads((j.folder / "fills.json").read_text())["rows"]
+        except FileNotFoundError:  # no plan yet, or no fill seen yet
+            continue
+        if plan.sell_all or not any((r["filled_shares"] or 0) > 0 for r in rows):
+            continue
+        if segments and segments[-1][0] == plan.strategy_sha256:
+            continue
+        if segments:
+            segments[-1][3] = plan.day
+        segments.append([plan.strategy_sha256, plan.strategy_name, plan.day, None])
+    out = []
+    for sha, name, start, end in segments:
+        points = [(pd.Timestamp(d), v) for d, v in history if v > 0 and d >= start and (end is None or d <= end)]
+        if len(points) > 1:  # one point has no return
+            out.append((f"Paper: {name} ({sha[:7]})", pd.DataFrame(points, columns=["date", "value"])))
+    return out
 
 
 def export_fills(fills: pd.DataFrame, path: str) -> None:

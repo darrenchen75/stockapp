@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pandas as pd
 import pytest
 from PySide6.QtCore import QObject, Qt
 from PySide6.QtGui import QCloseEvent
@@ -739,3 +740,57 @@ def test_compare_window_close_while_running_asks_and_cancels(window_with_runs, m
     assert event.isAccepted() is closes
     assert w.run_worker.cancel.called is closes
     w.run_worker = None
+
+
+# --- paper lines ---
+
+def paper_frame(growth=2.0):
+    days = pd.to_datetime(D)
+    return pd.DataFrame({"date": days, "value": [1000.0 * growth ** i for i in range(4)]})
+
+
+@pytest.fixture
+def paper_window(make_window, tmp_path, qapp):
+    def make(source):
+        w = make_window(runs=2, spy=True)  # same data as make_window
+        w.close()
+        w = CompareWindow(str(tmp_path / "bars.db"), tmp_path / "runs", lambda: None, "0.1.4", paper_source=source)
+        made.append(w)
+        wait(lambda: not w.workers)
+        return w
+    made = []
+    yield make
+    for w in made:
+        w.close()
+
+
+def test_paper_line_pinned_never_best(paper_window):
+    w = paper_window(lambda: [("Paper: s (abc1234)", paper_frame())])  # beats every run
+    n = len(w.records)
+    assert [w.list.item(i).text() for i in range(n, n + 2)] == ["SPY (buy and hold)", "Paper: s (abc1234)"]
+    assert w.list.item(n + 1).checkState() == Qt.Unchecked
+    w.tick(0)
+    w.list.item(n + 1).setCheckState(Qt.Checked)
+    wait(lambda: not w.workers)
+    cols = [w.table.horizontalHeaderItem(c).text() for c in range(w.table.columnCount())]
+    assert cols[-2:] == ["SPY", "Paper: s (abc1234)"]
+    paper_col = cols.index("Paper: s (abc1234)")
+    assert not any(w.table.item(r, paper_col).font().bold() for r in range(w.table.rowCount()))
+    assert w.table.item(4, paper_col).text() != "—"  # beta against SPY is computed
+    assert any(w.table.item(0, c).font().bold() for c in range(w.table.columnCount()))  # a run is marked instead
+
+
+def test_paper_note_mentions_no_dividends(paper_window):
+    w = paper_window(lambda: [("Paper: s (abc1234)", paper_frame())])
+    w.tick(0)
+    assert "no dividends (Alpaca paper)" not in w.results_note.text()
+    w.list.item(len(w.records) + 1).setCheckState(Qt.Checked)
+    assert "no dividends (Alpaca paper)" in w.results_note.text()
+
+
+def test_paper_source_error_is_a_note_not_a_crash(paper_window):
+    def boom():
+        raise RuntimeError("no keys\nat all")
+    w = paper_window(boom)
+    assert w.paper_note.text() == "Paper: could not load (RuntimeError: no keys at all)"
+    assert w.list.count() == len(w.records) + 1

@@ -141,6 +141,26 @@ class BenchmarkWorker(QObject):
         self.done.emit(self.key, result, error)  # last statement, after the store is closed
 
 
+class PaperWorker(QObject):
+    """Calls the paper source on a thread. Emits (lines, error): a list of (name, portfolio), or None and a one-line error."""
+    done = Signal(object, str)
+
+    def __init__(self, source: Callable[[], list]):
+        super().__init__()
+        self.source = source
+
+    def start_thread(self) -> None:
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def _work(self) -> None:
+        lines, error = None, ""
+        try:
+            lines = self.source()
+        except Exception as e:
+            error = one_line(f"{type(e).__name__}: {e}")
+        self.done.emit(lines, error)
+
+
 DATE_FORMAT = "yyyy-MM-dd"
 COPY_NOTE = "Original file not found; using the copy saved with this run"
 
@@ -335,7 +355,8 @@ class RunDetail(QDialog):
 class CompareWindow(QWidget):
     benchmark_ready = Signal()
 
-    def __init__(self, db_path: str, root: Path, make_clients: Callable[[], tuple], app_version: str):
+    def __init__(self, db_path: str, root: Path, make_clients: Callable[[], tuple], app_version: str,
+                 paper_source: Callable[[], list[tuple[str, pd.DataFrame]]] | None = None):
         super().__init__()
         self.setWindowTitle("Compare backtests")
         self.db_path, self.root, self.make_clients, self.app_version = db_path, Path(root), make_clients, app_version
@@ -347,6 +368,10 @@ class CompareWindow(QWidget):
         self.benchmarks: dict[tuple, object] = {}  # (daily_through, start, end) -> Result, or None for no SPY rows
         self.spy_error: tuple | None = None  # (key, message) of the last failed computation; never cached
         self.workers: dict[tuple, BenchmarkWorker] = {}  # key -> running worker, referenced until it reports
+        self.paper_lines: list | None = None  # (name, portfolio) once the paper source answers
+        self.paper_error = ""
+        self.paper_items: list[tuple[str, QListWidgetItem]] = []  # pinned after SPY, unticked by default
+        self.paper_colors: dict[str, str] = {}
         self._updating = False
         self.run_worker: RunWorker | None = None  # held until its terminal signal arrives, or it could be collected
         self.run_dialog: NewRunDialog | None = None
@@ -374,6 +399,7 @@ class CompareWindow(QWidget):
         self.plot.addLegend()
         self.plot.showGrid(x=True, y=True, alpha=0.2)
         self.spy_note = QLabel()
+        self.paper_note = QLabel()
         self.table = QTableWidget()
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.results_note = QLabel(wordWrap=True)
@@ -389,6 +415,7 @@ class CompareWindow(QWidget):
             modes.addWidget(button)
             self.mode_buttons[mode] = button
         modes.addStretch()
+        modes.addWidget(self.paper_note)
         modes.addWidget(self.spy_note)
         right = QWidget()
         column = QVBoxLayout(right)
@@ -405,11 +432,16 @@ class CompareWindow(QWidget):
         outer.addWidget(split)
         self.resize(1150, 750)
         self.reload()
+        if paper_source:
+            worker = PaperWorker(paper_source)
+            self.workers[("paper",)] = worker
+            worker.done.connect(self.on_paper)
+            worker.start_thread()
 
     # --- run list ---
     def reload(self) -> None:
         """Re-read the saved runs, keeping the ticks of runs that still exist."""
-        keep = set(self.ticked())
+        keep, keep_paper = set(self.ticked()), self.paper_ticked()
         current = self.selected()
         self.records = list_runs(self.root)
         self.loaded = {k: v for k, v in self.loaded.items() if k in {r.id for r in self.records}}
@@ -435,11 +467,32 @@ class CompareWindow(QWidget):
         self.spy_item.setCheckState(Qt.Checked)
         self.spy_item.setIcon(swatch(SPY_COLOR))
         self.list.addItem(self.spy_item)
+        self._add_paper_items(keep_paper)
         self._updating = False
         if current:  # keep the selection (clear() dropped it), so Re-run and Export stay usable
             self.list.setCurrentRow(next((i for i, r in enumerate(self.records) if r.id == current.id), -1))
         self.update_buttons()
         self.refresh()
+
+    def _add_paper_items(self, keep) -> None:
+        self.paper_items = []
+        for name, _ in self.paper_lines or []:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if name in keep else Qt.Unchecked)
+            self.list.addItem(item)
+            self.paper_items.append((name, item))
+
+    def paper_ticked(self) -> list[str]:
+        return [n for n, i in self.paper_items if i.checkState() == Qt.Checked]
+
+    def on_paper(self, lines, error: str) -> None:
+        self.workers.pop(("paper",), None)
+        self.paper_lines, self.paper_error = lines, error
+        self._updating = True
+        self._add_paper_items(())
+        self._updating = False
+        self.redraw()
 
     def ticked(self) -> list[str]:
         return [r.id for i, r in enumerate(self.records) if self.list.item(i).checkState() == Qt.Checked]
@@ -678,6 +731,13 @@ class CompareWindow(QWidget):
             self.plot.plot(x, s.to_numpy(), pen=pg.mkPen(color, width=2, **pen), name=name)
 
         columns = {}  # header -> (summary, colour)
+        pticked = [(n, p) for n, p in self.paper_lines or [] if n in self.paper_ticked()]
+        self.paper_colors = {n: c for n, c in self.paper_colors.items() if n in dict(pticked)}
+        for n, _ in pticked:
+            if n not in self.paper_colors:
+                used = [*self.colors.values(), *self.paper_colors.values()]
+                self.paper_colors[n] = next((c for c in COLORS if c not in used), COLORS[len(used) % len(COLORS)])
+        self.paper_note.setText(f"Paper: could not load ({self.paper_error})" if self.paper_error else "")
         for i in ids:
             portfolio, positions = self._load(i)
             rec = self._record(i)
@@ -701,18 +761,25 @@ class CompareWindow(QWidget):
             spy_stats = {**summary(bench, spy.positions), **risk(bench, bench)}
         for i in ids:
             columns[i].update(risk(self._load(i)[0], bench))
-        self.fill_table(ids, columns, spy_stats)
+        nothing = pd.DataFrame({"decided_on": [], "fill_price": [], "warning": []})  # paper has no backtest rows
+        extra = []
+        for n, p in pticked:
+            line(p, self.paper_colors[n], n, style=Qt.DotLine)
+            extra.append((n, {**summary(p, nothing), **risk(p, bench)}, self.paper_colors[n]))
+        self.fill_table(ids, columns, spy_stats, extra)
         dividends = {self._record(i).settings.dividends for i in ids}
         self.results_note.setText(
             "Today's S&P 500 members only, so results have survivorship bias. "
             f"Data: {SOURCE}. Dividends: " + ("mixed" if len(dividends) > 1 else "on" if dividends == {True}
-                                              else "off" if dividends else "set per run") + ".")
+                                              else "off" if dividends else "set per run") + "."
+            + (" Paper lines: no dividends (Alpaca paper)." if pticked else ""))
 
-    def fill_table(self, ids: list[str], columns: dict, spy_stats) -> None:
+    def fill_table(self, ids: list[str], columns: dict, spy_stats, extra=()) -> None:
         marked = best(columns)  # run columns only: SPY is never marked
         shown = [(self._record(i).name, columns[i], self.colors[i], i) for i in ids]
         if spy_stats is not None:
             shown.append(("SPY", spy_stats, SPY_COLOR, None))
+        shown += [(n, stats, color, None) for n, stats, color in extra]  # never marked best
         self.table.clear()
         self.table.setRowCount(len(ROWS))
         self.table.setColumnCount(len(shown))
