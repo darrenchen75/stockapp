@@ -19,7 +19,7 @@ from app.paper import (FILL_COLUMNS, Broker, Plan, Refusal, account_key, cost_su
                        missed_sessions, negative_cash_days, plan_sell_all, prepare_plan, recover, release, replay,
                        send_plan, send_sell_all, track_fills, unresolved_cancels)
 from app.paper_plan import Limits, run_window
-from app.paper_state import AccountStore, Busy, Journal, _write_json
+from app.paper_state import AccountStore, Busy, Journal, _write_atomic, _write_json
 from app.store import Store
 
 LIVE_OFF = "Live trading is off: the app has no code signing, so a tampered update could trade real money."
@@ -304,22 +304,39 @@ class PaperWindow(QWidget):
         if "status" in self.jobs:
             self.stale = True  # that job may have read the account before the change that asked for this
         elif self.make_broker is not None:
-            now = _now()
-            self.start("status", lambda: self._status(now))
+            now, recover_now = _now(), not self.busy  # a send, kill or sale settles its own orders
+            self.start("status", lambda: self._status(now, recover_now))
 
-    def _status(self, now: datetime) -> dict:
+    def _status(self, now: datetime, recover_now: bool) -> dict:
         broker = self.make_broker()
         account = broker.account()
         if PAPER_ENDPOINT not in account.endpoint:  # no other call, no folder: these keys may reach real money
             return dict(refused=True)
         acct = AccountStore(self.root, account_key(account))
-        recovered = [] if acct.dir.name in self.recovered else recover(broker, acct)  # before anything is sent
+        errors = []
+
+        def extra(name: str, fn: Callable, default):
+            """fn's answer, or default: a failed side check is shown, and never keeps the kill switch off."""
+            try:
+                return fn()
+            except Busy:  # another window holds the account; the next refresh tries again
+                return default
+            except Exception as e:
+                errors.append(one_line(f"{name}: {type(e).__name__}: {e}"))
+                return default
+        # on every refresh, so an order lost in transit is settled once Alpaca knows it; None when it didn't run
+        recovered = extra("Checking unfinished orders", lambda: recover(broker, acct), None) if recover_now else None
         today = now.astimezone(ET).date()
-        calendar = broker.calendar(today - timedelta(days=366), today + timedelta(days=10))
+        calendar = extra("Calendar", lambda: broker.calendar(today - timedelta(days=366), today + timedelta(days=10)),
+                         [])
         return dict(broker=broker, account=account, acct=acct, recovered=recovered, calendar=calendar,
-                    unresolved=unresolved_cancels(broker, acct) if acct.state()["halted"] else [],
-                    missed=missed_sessions(acct, calendar, now), negative=negative_cash_days(acct, broker),
-                    fills=_with_store(self.db_path, lambda store: track_fills(broker, acct, store)))
+                    unresolved=extra("Open orders", lambda: unresolved_cancels(broker, acct)
+                                     if acct.state()["halted"] else [], []),
+                    missed=extra("Missed days", lambda: missed_sessions(acct, calendar, now), []),
+                    negative=extra("Cash", lambda: negative_cash_days(acct, broker), []),
+                    fills=extra("Fills", lambda: _with_store(
+                        self.db_path, lambda store: track_fills(broker, acct, store)), self.fills),
+                    errors=errors)
 
     def on_status(self, s: dict) -> None:
         if s.get("refused"):  # checked on every refresh: every control goes off, the kill switch too
@@ -329,9 +346,12 @@ class PaperWindow(QWidget):
             self.show_status()
             return
         self.broker, key = s["broker"], s["acct"].dir.name
-        self.recovered.add(key)
+        if s["recovered"] is not None:
+            self.recovered.add(key)
         if s["recovered"]:
             self.say("Checked orders left unfinished last time: " + "; ".join(s["recovered"]))
+        if s["errors"]:
+            self.say("; ".join(s["errors"]), error=True)
         if (self.acct is None or self.acct.dir.name != key) and (why := self.confirm(s)):
             self.acct = self.status = None
             self.say(why, error=True)
@@ -456,7 +476,7 @@ class PaperWindow(QWidget):
         """The app version beside a new plan, for the log."""
         if isinstance(plan, Plan) and not (path := acct.journal(plan.day, plan.attempt).folder
                                            / "app_version.txt").exists():
-            path.write_text(self.app_version)
+            _write_atomic(path, self.app_version.encode())
         return plan
 
     def show_plan(self) -> None:
@@ -564,7 +584,8 @@ class PaperWindow(QWidget):
                 self.show_status()
 
     def edit_limits(self) -> None:
-        old = self.acct.settings()["limits"]
+        settings = self.acct.settings()
+        old = settings["limits"]
         dialog = QDialog(self)
         dialog.setWindowTitle("Safety settings")
         form = QFormLayout(dialog)
@@ -574,14 +595,18 @@ class PaperWindow(QWidget):
             boxes[name] = QDoubleSpinBox(minimum=0, maximum=100, decimals=1, suffix=" %",
                                          value=getattr(old, name) * 100)
             form.addRow(label, boxes[name])
+        dividends = QCheckBox("Include dividends in the strategy's input", checked=settings["dividends"])
+        form.addRow("", dividends)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
         if dialog.exec() == QDialog.Accepted:
             new = Limits(**{k: round(b.value() / 100, 4) for k, b in boxes.items()})
-            if new != old:
-                self.acct.save_settings(limits=new)  # logged by save_settings
+            changes = {k: v for k, v, was in (("limits", new, old),
+                                              ("dividends", dividends.isChecked(), settings["dividends"])) if v != was}
+            if changes:
+                self.acct.save_settings(**changes)  # logged by save_settings
             self.show_status()
 
     # --- log, fills, replay ---

@@ -24,7 +24,7 @@ def test_defaults(tmp_path):
     s = AccountStore(tmp_path, "paper-A")
     assert s.state() == {"halted": False, "loss_lock": None, "loss_checked_through": None, "cleared": [],
                          "killed_at": None}
-    assert s.settings() == {"limits": Limits(), "strategy_path": None, "dividends": False}
+    assert s.settings() == {"limits": Limits(), "strategy_path": None, "dividends": True}
 
 
 def test_accounts_do_not_share_state(tmp_path):
@@ -188,3 +188,22 @@ def test_a_failed_write_leaves_no_temp_file(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="disk full"):
         paper_state._write_json(tmp_path / "state.json", {"halted": True})
     assert list(tmp_path.iterdir()) == []
+
+
+def test_saved_dividends_setting_is_kept(tmp_path):
+    AccountStore(tmp_path, "paper-A").save_settings(dividends=False)
+    assert AccountStore(tmp_path, "paper-A").settings()["dividends"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock")
+def test_state_write_waits_for_another_process_lock(tmp_path):
+    import fcntl
+    s = AccountStore(tmp_path, "paper-A")
+    with open(s.dir / "state.lock", "a+b") as other:  # its own open file, as another app instance would have
+        fcntl.flock(other, fcntl.LOCK_EX)
+        halt = threading.Thread(target=lambda: s.save_state(halted=True))
+        halt.start()
+        halt.join(0.2)
+        assert halt.is_alive() and s.state()["halted"] is False
+    halt.join(5)
+    assert s.state()["halted"] is True

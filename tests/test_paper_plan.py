@@ -135,3 +135,9 @@ def test_losses_first_run_after_funding_day_is_not_a_loss():
     r = check_losses([(MON_, 0.0), (TUE, 100_000.0)], None, 0.03)
     assert r.breaches == [] and r.problem is None and r.checked_through == TUE
     assert check_losses([(MON_, 100.0), (TUE, 0.0)], None, 0.03).problem
+
+
+def test_losses_keep_checking_past_a_zero_equity():
+    r = check_losses([(MON_, 100.0), (TUE, 0.0), (WED, 90.0), (THU_, 80.0)], MON_, 0.03)
+    assert r.problem and str(TUE) in r.problem and r.checked_through == THU_
+    assert dict(r.breaches)[THU_] == pytest.approx(80 / 90 - 1)  # Wed to Thu, about -11%

@@ -142,9 +142,12 @@ paper account. The money is pretend, but the orders are real orders at Alpaca.
 - **Fills and results.** Paper fills are simulated by Alpaca against quotes.
   The app compares each fill with day T's close, and the compare screen shows
   the paper account as its own line beside your backtests.
-- **No dividends.** Alpaca paper accounts don't pay dividends, so paper
-  results leave them out. A backtest with dividends on will look better than
-  its paper run.
+- **Dividends.** Two separate things:
+  - The account gets no dividends. Alpaca paper accounts don't pay them, so
+    paper results leave them out. A backtest with dividends on will look
+    better than its paper run.
+  - The strategy's input includes dividends by default, the same as a
+    backtest's. You can turn this off under **Safety**, **Edit…**.
 
 ## Setup
 

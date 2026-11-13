@@ -112,10 +112,11 @@ def test_plan_matches_backtest_targets(env):
     plan = env.run()
     assert plan.day == T and plan.next_day == T1 and plan.attempt == 1
     data = load_bars(env.store, NOW, SYMBOLS)
-    result = backtest.run(backtest.buy_spy, data, BAR_DAYS[0], T, dividends=False, now=NOW)
+    result = backtest.run(backtest.buy_spy, data, BAR_DAYS[0], T, now=NOW)  # both sides on their defaults
     last = result.positions[result.positions["date"].isna()]
     assert plan.targets == {r.symbol: r.target_weight for r in last.itertuples() if r.target_weight}
-    prices = backtest.prepare(data, dividends=False)
+    assert plan.dividends is True and result.dividends is True
+    prices = backtest.prepare(data)
     assert plan.input_hash == backtest.input_hash(backtest.history_as_of(prices, prices.days[-1]))
 
 
@@ -379,9 +380,12 @@ def test_send_stops_when_halted_midway(env):
     assert env.acct.journal(T, 1).closed() is None
 
 
-def test_duplicate_id_counts_as_sent(env):
+@pytest.mark.parametrize("error", [None, rejection(DUPLICATE, 422)])  # None: the fake's plain refusal
+def test_duplicate_id_counts_as_sent(env, error):
     plan = env.run()
     env.broker.orders = [order(oid(1, "SPY"), "new")]  # it reached Alpaca before
+    if error:  # Alpaca's real answer is a 422, so the duplicate check must come before the 4xx one
+        env.broker.on_submit = lambda n: (_ for _ in ()).throw(error)
     result = paper.send_plan(env.broker, env.acct, plan, SEND)
     assert result.failed == [] and result.sent == env.broker.orders and env.broker.submitted == []
     assert journaled(env) == [(oid(1, "SPY"), "sending"), (oid(1, "SPY"), "new")]
@@ -399,6 +403,15 @@ def test_duplicate_id_alpaca_cannot_find_is_not_found(env):
     assert result.failed == [] and result.sent == []
     assert journaled(env) == [(oid(1, "SPY"), "sending"), (oid(1, "SPY"), "not_found")]
     assert env.acct.journal(T, 1).closed() is None
+
+
+def test_duplicate_id_whose_lookup_fails_is_not_found(env, monkeypatch):
+    plan = env.run()
+    env.broker.on_submit = lambda n: (_ for _ in ()).throw(rejection(DUPLICATE, 422))
+    monkeypatch.setattr(env.broker, "order", lambda cid: (_ for _ in ()).throw(ConnectionError("down")))
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.failed == [] and result.sent == []
+    assert journaled(env) == [(oid(1, "SPY"), "sending"), (oid(1, "SPY"), "not_found")]
 
 
 def test_rejection_marks_failed(env):
@@ -635,6 +648,13 @@ def test_release_waits_for_cancels(env):
     assert paper.release(env.broker, env.acct) is None and env.acct.state()["halted"] is False
     last = json.loads((env.acct.dir / "events.jsonl").read_text().splitlines()[-1])
     assert last["kind"] == "state" and last["new"] == {"halted": False}  # logged
+
+
+def test_done_for_day_order_does_not_block_release(env):
+    paper.send_plan(env.broker, env.acct, env.run(), SEND)
+    env.acct.save_state(halted=True)
+    env.broker.orders = [replace(o, status="done_for_day") for o in env.broker.orders]
+    assert paper.release(env.broker, env.acct) is None and env.acct.state()["halted"] is False
 
 
 def test_new_attempt_after_release(env):

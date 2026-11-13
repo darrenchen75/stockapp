@@ -26,7 +26,7 @@ from app.backtest import StrategyError, decide, history_as_of, input_hash, load_
 from app.daily import ET, decision_time, load_bars, refresh_daily, universe
 from app.paper_plan import (SEND_DEADLINE, Limits, LossCheck, Note, Order, check_losses, order_id, plan_orders,
                              run_window)
-from app.paper_state import AccountStore, Journal, _write_json
+from app.paper_state import AccountStore, Journal, _write_atomic, _write_json
 from app.store import Store
 
 
@@ -325,7 +325,7 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
                     account, positions, limits, hashlib.sha256(code).hexdigest(), settings["dividends"], loss,
                     lock, last_bars, strategy_name=Path(path).stem)
 
-        (acct.journal(day, attempt).folder / "strategy.py").write_bytes(code)
+        _write_atomic(acct.journal(day, attempt).folder / "strategy.py", code)  # Replay's audit copy
         return _journal_plan(acct, plan)
 
 
@@ -423,7 +423,7 @@ def _send(broker: Broker, acct: AccountStore, plan: Plan, now: datetime, sell_al
             except Exception as e:
                 status = e.status_code if isinstance(e, APIError) else None
                 if "client_order_id must be unique" in str(e):
-                    got = broker.order(cid)  # it reached Alpaca already, from an earlier send or another computer
+                    got = _look_up(broker, cid)  # it reached Alpaca already, from an earlier send or another computer
                     if got is None:
                         j.mark(cid, "not_found")
                         continue
@@ -459,7 +459,8 @@ def recover(broker: Broker, acct: AccountStore) -> list[str]:
         return lines
 
 
-_FINAL = {"canceled", "filled", "expired", "rejected", "failed", "not_found"}  # Alpaca has nothing open for these
+_FINAL = {"canceled", "filled", "expired", "rejected", "done_for_day", "replaced",  # Alpaca has nothing open for these
+          "failed", "not_found"}
 _POLL = 0.5  # seconds between status checks after a cancel
 _RECANCELS = 3  # extra cancel_all calls a kill makes while an order is still unfinished
 

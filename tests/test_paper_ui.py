@@ -494,3 +494,51 @@ def test_endpoint_is_checked_on_every_refresh(env):
         assert not b.isEnabled(), b.text()
     assert {p: p.read_bytes() for p in env.acct().dir.rglob("*") if p.is_file()} == before
     assert not (env.root / "paper-LA9").exists()
+
+
+def test_a_failing_side_check_leaves_the_kill_switch_on(env, monkeypatch):
+    w = env.open()
+    click(w, w.run_button)
+    click(w, w.send_button)
+    monkeypatch.setattr(env.broker, "order", lambda cid: (_ for _ in ()).throw(ConnectionError("lookup down")))
+    w2 = env.open()  # tracking fills looks the sent order up, and that fails
+    assert w2.kill_button.isEnabled() and "lookup down" in w2.message.text()
+    assert NUMBER in w2.account_label.text()
+
+
+def test_refresh_settles_an_order_lost_in_transit(env):
+    w = env.open()
+    click(w, w.run_button)
+    cid = f"sb-{NUMBER}-20261112-a1-SPY"
+    j = env.acct().journal(T, 1)
+    j.mark(cid, "sending")  # its answer was lost and Alpaca didn't know it yet
+    env.broker.orders.append(paper.BrokerOrder(cid, "u1", "SPY", "buy", 1.0, 1.0, 100.0, "filled"))
+    w.refresh()
+    settle(w)
+    assert j.order_states()[cid] == "filled" and cid in w.message.text()
+
+
+def test_refresh_skips_recovery_quietly_while_another_window_holds_the_account(env):
+    w = env.open()
+    w.say("")
+    with env.acct().lock():
+        w.refresh()
+        settle(w)
+    assert w.message.text() == "" and w.kill_button.isEnabled()
+
+
+def test_dividends_setting_is_in_the_safety_dialog(env, monkeypatch):
+    from PySide6.QtWidgets import QCheckBox, QDialog
+    w = env.open()
+    assert env.acct().settings()["dividends"] is True
+
+    def untick(d):
+        (box,) = d.findChildren(QCheckBox)
+        assert box.isChecked()
+        box.setChecked(False)
+        return QDialog.Accepted
+    monkeypatch.setattr(QDialog, "exec", untick)
+    click(w, w.limits_button)
+    assert env.acct().settings()["dividends"] is False
+    event = json.loads((env.acct().dir / "events.jsonl").read_text().splitlines()[-1])
+    assert event["kind"] == "settings" and (event["old"]["dividends"], event["new"]["dividends"]) == (True, False)

@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 from alpaca.common.exceptions import APIError
 
-from app.paper import Account, BrokerOrder
+from app.paper import _FINAL, Account, BrokerOrder
 
-FINISHED = {"filled", "canceled", "expired", "rejected", "replaced"}
+FINISHED = _FINAL  # one list of finished statuses, so the fake and the app never disagree
 DUPLICATE = '{"code":42210000,"message":"client_order_id must be unique"}'  # Alpaca's real 422 body
 
 

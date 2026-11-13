@@ -110,15 +110,18 @@ def check_losses(history: list[tuple[date, float]], after: date | None, cutoff: 
         if after not in dates:
             return LossCheck([], through, f"{after} is not in the portfolio history.")
         start = dates.index(after) + 1
-    breaches = []
+    breaches, problem = [], None
     for i in range(start, len(h)):
         day, eq = h[i]
-        prev = h[i - 1][1]
-        if eq == 0 or (prev == 0 and after is not None):
-            return LossCheck(breaches, through, f"Equity of 0 in the history for {day if eq == 0 else h[i - 1][0]}.")
-        if prev == 0:  # first run: the funding day
+        if eq == 0 or (h[i - 1][1] == 0 and after is not None):
+            problem = problem or f"Equity of 0 in the history for {day if eq == 0 else h[i - 1][0]}."
+        if eq == 0 or (h[i - 1][1] == 0 and after is None):  # first run: the funding day
+            continue
+        # past a 0, against the last nonzero session: checked_through moves on, so later losses must still count
+        prev = next((e for _, e in reversed(h[:i]) if e), None)
+        if prev is None:
             continue
         loss = eq / prev - 1
         if loss < -cutoff:
             breaches.append((day, loss))
-    return LossCheck(breaches, through, None)
+    return LossCheck(breaches, through, problem)

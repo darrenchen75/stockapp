@@ -17,7 +17,7 @@ from app.paper_plan import Limits
 
 log = logging.getLogger(__name__)
 
-_SETTINGS = {"limits": Limits(), "strategy_path": None, "dividends": False}
+_SETTINGS = {"limits": Limits(), "strategy_path": None, "dividends": True}  # the strategy's input, like a backtest
 _WRITE = threading.Lock()  # one read-modify-write at a time, so a kill's halt is never written over
 _STATE = {"halted": False, "loss_lock": None, "loss_checked_through": None, "cleared": [], "killed_at": None}
 
@@ -35,11 +35,15 @@ def _now() -> str:
 
 
 def _write_json(path: Path, data: dict) -> None:
+    _write_atomic(path, json.dumps(data, indent=2).encode())
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
     # a temp name of its own, so two writers of one file (the paper window and the compare screen) never collide
-    f = tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False)
+    f = tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False)
     try:
         with f:
-            json.dump(data, f, indent=2)
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(f.name, path)
@@ -124,7 +128,30 @@ class AccountStore:
                     raise Busy(str(self.dir)) from None
             yield
         finally:
+            if sys.platform == "win32":
+                with suppress(OSError):  # not held when the lock attempt failed
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
             f.close()  # closing drops the OS lock
+
+    @contextmanager
+    def _write_lock(self):
+        """One read-modify-write at a time, across threads and app instances, so a kill's halt is never written
+        over. Short and blocking; separate from lock(), which a kill never takes."""
+        with _WRITE, open(self.dir / "state.lock", "a+b") as f:
+            if sys.platform == "win32":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f, fcntl.LOCK_EX)
+                yield  # closing the file drops the lock
 
     def _log(self, kind: str, old: dict, new: dict) -> None:
         _append(self.dir / "events.jsonl", {"kind": kind, "old": old, "new": new})
@@ -140,7 +167,7 @@ class AccountStore:
         return s
 
     def save_settings(self, **changes) -> None:
-        with _WRITE:
+        with self._write_lock():
             old = self.settings()
             new = {**old, **changes}
             enc = lambda s: {**s, "limits": asdict(s["limits"])}
@@ -151,7 +178,7 @@ class AccountStore:
         return self._load("state.json", _STATE)
 
     def save_state(self, **changes) -> None:
-        with _WRITE:
+        with self._write_lock():
             old = self.state()
             _write_json(self.dir / "state.json", {**old, **changes})
             self._log("state", {k: old[k] for k in changes}, changes)
