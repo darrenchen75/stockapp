@@ -11,9 +11,9 @@ from app import backtest, paper
 from app.daily import load_bars
 from app.paper import BrokerOrder, Refusal
 from app.paper_plan import Order
-from app.paper_state import AccountStore
+from app.paper_state import AccountStore, Busy
 from app.store import ET, DailyBar, Store
-from tests.paper_fakes import FakeBroker
+from tests.paper_fakes import DUPLICATE, FakeBroker
 from tests.test_daily import FakeActions, FakeClient, fake_day
 
 T, T1 = date(2026, 11, 12), date(2026, 11, 13)
@@ -196,6 +196,7 @@ def test_loss_breach_while_closed_locks(env):
     assert plan.orders == [] and [n.kind for n in plan.notes if n.symbol == "SPY"] == ["trim_cap", "blocked_loss"]
     state = env.acct.state()
     assert state["loss_lock"]["session"] == "2026-11-10" and state["loss_checked_through"] == T.isoformat()
+    assert plan.loss_lock == state["loss_lock"]  # what sending rechecks against
 
 
 def test_cleared_breach_does_not_relock_but_new_one_does(env):
@@ -292,3 +293,159 @@ def test_history_after_day_t_is_ignored(env):
 def test_load_error_names_the_chosen_file(env):
     env.use("def target_weights(:\n")
     refused(env, env.run(), f"cannot load {env.tmp / 'strategy.py'}:")
+
+
+# --- sending ---
+
+SEND = datetime(2026, 11, 12, 21, 30, tzinfo=ET)
+
+
+def journaled(env, attempt=1):
+    return [(e.get("id"), e.get("status")) for e in env.acct.journal(T, attempt).events() if "id" in e]
+
+
+def test_send_submits_in_order_with_journal(env):
+    env.use(FIFTHS)
+    env.broker.held = {"XYZ": 5.0}
+    plan = env.run()
+    ids = [o.client_order_id for o in plan.orders]
+    assert [o.side for o in plan.orders] == ["sell", "buy", "buy"]
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.discarded is None and result.failed == []
+    assert [o.client_order_id for o in result.sent] == ids
+    assert env.broker.submitted == [(i, "opg") for i in ids]
+    assert journaled(env) == [x for i in ids for x in ((i, "sending"), (i, "accepted"))]
+    assert env.acct.journal(T, 1).closed() == "sent"
+
+
+def test_send_rechecks_positions(env):
+    plan = env.run()
+    env.broker.held = {"SPY": 1.0}
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.discarded and "Positions" in result.discarded
+    assert env.broker.submitted == [] and env.acct.journal(T, 1).closed() == "discarded"
+
+
+def test_send_after_deadline_discarded(env):
+    plan = env.run()
+    result = paper.send_plan(env.broker, env.acct, plan, datetime(2026, 11, 13, 9, 28, tzinfo=ET))
+    assert result.discarded and "09:28" in result.discarded and env.broker.submitted == []
+
+
+@pytest.mark.parametrize("change, text", [
+    (lambda env: env.acct.save_state(halted=True), "halted"),
+    (lambda env: env.acct.save_state(loss_lock={"session": "2026-11-12", "loss": -0.05, "problem": None}), "loss"),
+    (lambda env: env.acct.save_settings(limits=paper.Limits(max_weight=0.5)), "safety"),
+    (lambda env: setattr(env.broker, "orders", [order(oid(2, "SPY"), "accepted")]), "open order"),
+    (lambda env: setattr(env.broker, "acct", paper.Account("PA0000002", "x", 1e5, 1e5, 2e5)), "PA0000002"),
+    (lambda env: setattr(env.broker, "acct", paper.Account(NUMBER, "https://api.alpaca.markets", 1e5, 1e5, 2e5)),
+     "api.alpaca.markets"),
+    (lambda env: setattr(env.broker, "held", {"SPY": 1e-6}), "Positions"),
+])
+def test_send_recheck_discards(env, change, text):
+    plan = env.run()
+    change(env)
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert text in result.discarded and env.broker.submitted == []
+    assert env.acct.journal(T, 1).closed() == "discarded"
+
+
+def test_send_allows_this_attempts_open_orders_and_tiny_rounding(env):
+    env.use(FIFTHS)
+    env.broker.held = {"AAPL": 2.0}
+    plan = env.run()
+    env.broker.held = {"AAPL": 2.0 + 1e-12}
+    env.broker.orders = [order(oid(1, "AAPL"), "accepted")]
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.discarded is None and [o.client_order_id for o in result.sent] == [oid(1, "AAPL"), oid(1, "SPY")]
+
+
+def test_send_holds_the_account_lock(env):
+    plan = env.run()
+    with env.acct.lock(), pytest.raises(Busy):
+        paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert env.broker.submitted == []
+
+
+def test_send_stops_when_halted_midway(env):
+    env.use(FIFTHS)
+    plan = env.run()
+    env.broker.on_submit = lambda n: env.acct.save_state(halted=True)
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert env.broker.submitted == [(oid(1, "AAPL"), "opg")] and result.discarded is None
+    assert journaled(env) == [(oid(1, "AAPL"), "sending"), (oid(1, "AAPL"), "accepted")]
+    assert env.acct.journal(T, 1).closed() is None
+
+
+def test_duplicate_id_counts_as_sent(env):
+    plan = env.run()
+    env.broker.orders = [order(oid(1, "SPY"), "new")]  # it reached Alpaca before
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.failed == [] and result.sent == env.broker.orders and env.broker.submitted == []
+    assert journaled(env) == [(oid(1, "SPY"), "sending"), (oid(1, "SPY"), "new")]
+    assert env.acct.journal(T, 1).closed() == "sent"
+
+
+def test_duplicate_id_alpaca_cannot_find_is_not_found(env):
+    plan = env.run()
+
+    def refuse(n):
+        raise Exception(DUPLICATE)
+
+    env.broker.on_submit = refuse
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.failed == [] and result.sent == []
+    assert journaled(env) == [(oid(1, "SPY"), "sending"), (oid(1, "SPY"), "not_found")]
+    assert env.acct.journal(T, 1).closed() is None
+
+
+def test_failed_submit_stops_and_offers_the_rest(env):
+    env.use(FIFTHS)
+    plan = env.run()
+    body = '{"code":40310000,"message":"insufficient buying power"}'
+
+    def refuse(n):
+        if n == 1:
+            raise Exception(body)
+
+    env.broker.on_submit = refuse
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.failed == [(oid(1, "AAPL"), body)] and result.sent == [] and env.broker.calls == 1
+    j = env.acct.journal(T, 1)
+    assert j.events()[-1]["detail"] == {"error": body} and j.closed() is None
+    again = env.run()
+    assert again.attempt == 1 and [o.client_order_id for o in again.orders] == [oid(1, "SPY")]
+
+
+def test_recover_resolves_sending(env):
+    env.use(FIFTHS)
+    first = env.run()
+    j = env.acct.journal(T, 1)
+    j.mark(oid(1, "AAPL"), "sending")
+    j.mark(oid(1, "SPY"), "sending")
+    env.broker.orders = [order(oid(1, "AAPL"), "accepted")]
+    lines = paper.recover(env.broker, env.acct)
+    assert len(lines) == 2 and env.acct.unresolved() == []
+    assert j.order_states() == {oid(1, "AAPL"): "accepted", oid(1, "SPY"): "not_found"}
+    again = env.run()  # an order Alpaca never got is offered again, same ID and quantity
+    assert again.attempt == 1 and again.orders == [o for o in first.orders if o.symbol == "SPY"]
+
+
+def test_recover_closes_an_attempt_that_had_every_result(env):
+    plan = env.run()
+    j = env.acct.journal(T, 1)
+    j.mark(oid(1, "SPY"), "sending")
+    env.broker.orders = [order(oid(1, "SPY"), "accepted")]
+    paper.recover(env.broker, env.acct)
+    assert j.closed() == "sent" and plan.orders[0].client_order_id == oid(1, "SPY")
+
+
+def test_send_twice_never_doubles(env):
+    env.use(FIFTHS)
+    plan = env.run()
+    paper.send_plan(env.broker, env.acct, plan, SEND)
+    again = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert again.discarded and again.sent == []
+    ids = [o.client_order_id for o in env.broker.orders]
+    assert sorted(ids) == [oid(1, "AAPL"), oid(1, "SPY")]
+    assert env.acct.journal(T, 1).closed() == "sent"

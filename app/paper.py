@@ -1,4 +1,4 @@
-"""The paper-trading daily step: the Alpaca broker wrapper and preparing a plan. No Qt imports."""
+"""The paper-trading daily step: the Alpaca broker wrapper, preparing, sending and recovering a plan. No Qt imports."""
 import hashlib
 import json
 import re
@@ -19,8 +19,9 @@ from alpaca.trading.requests import (GetCalendarRequest, GetOrdersRequest, GetPo
 
 from app.backtest import StrategyError, decide, history_as_of, input_hash, load_strategy, prepare
 from app.daily import ET, load_bars, refresh_daily, universe
-from app.paper_plan import Limits, LossCheck, Note, Order, check_losses, plan_orders, run_window
-from app.paper_state import AccountStore
+from app.paper_plan import (SEND_DEADLINE, Limits, LossCheck, Note, Order, check_losses, plan_orders,
+                             run_window)
+from app.paper_state import AccountStore, Journal
 from app.store import Store
 
 
@@ -138,6 +139,7 @@ class Plan:
     strategy_sha256: str
     dividends: bool
     loss: LossCheck
+    loss_lock: dict | None  # the account's lock when the plan was made; sending rechecks it
     last_bars: dict[str, dict]  # day-T bar per held or targeted symbol
 
 
@@ -158,6 +160,10 @@ def plan_from_json(d: dict) -> Plan:
                                      _date(loss["checked_through"]), loss["problem"])})
 
 
+_UNSENT = {None, "not_found"}  # journal states of an order that never reached Alpaca
+_NO_RESULT = _UNSENT | {"sending"}
+
+
 def _remainder(acct: AccountStore, day: date, attempts: list[int]) -> Plan | None:
     """The latest attempt's saved plan, cut to its unsent orders, if that attempt is still open and a send
     started (step 11 journals "sending" first). An attempt never sent is recomputed instead."""
@@ -169,7 +175,7 @@ def _remainder(acct: AccountStore, day: date, attempts: list[int]) -> Plan | Non
     except FileNotFoundError:  # a crash before plan.json was written
         return None
     sent = j.order_states()
-    unsent = [o for o in saved.orders if o.client_order_id not in sent]
+    unsent = [o for o in saved.orders if sent.get(o.client_order_id) in _UNSENT]
     return replace(saved, orders=unsent) if sent and unsent and not j.closed() else None
 
 
@@ -289,7 +295,7 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
         plan = Plan(account.number, day, next_day, attempt, orders, more + notes, targets, input_hash(history),
                     store.daily_last("SPY"), now.astimezone(timezone.utc).isoformat(timespec="seconds"),
                     account, positions, limits, hashlib.sha256(code).hexdigest(), settings["dividends"], loss,
-                    last_bars)
+                    lock, last_bars)
 
         # step 8: journal it before anyone can confirm it
         journal = acct.journal(day, attempt)
@@ -300,3 +306,89 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
             if not old.closed() and not old.order_states():
                 old.close("superseded")
         return plan
+
+
+@dataclass(frozen=True)
+class SendResult:
+    sent: list[BrokerOrder]
+    failed: list[tuple[str, str]]  # (client_order_id, Alpaca's error)
+    discarded: str | None  # why the recheck threw the plan away
+
+
+def _close_if_sent(j: Journal) -> None:
+    states = j.order_states()
+    if not j.closed() and all(states.get(o["client_order_id"]) not in _NO_RESULT for o in j.plan()["orders"]):
+        j.close("sent")
+
+
+def _recheck(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> str | None:
+    """Step 10: why the plan no longer holds, or None."""
+    if now >= datetime.combine(plan.next_day, SEND_DEADLINE, ET):
+        return f"The 09:28 New York send deadline for {plan.next_day} has passed."
+    state = acct.state()
+    if state["halted"]:
+        return "The account is halted."
+    if state["loss_lock"] != plan.loss_lock:
+        return "The loss lock changed since the plan was made."
+    if acct.settings()["limits"] != plan.limits:
+        return "The safety settings changed since the plan was made."
+    account = broker.account()
+    if (account.number, account.endpoint) != (plan.account_number, plan.account.endpoint):
+        return f"The keys now point to account {account.number} at {account.endpoint}, not the plan's."
+    mine = f"sb-{plan.account_number}-{plan.day:%Y%m%d}-a{plan.attempt}-"
+    if other := [o.client_order_id for o in broker.open_orders() if not (o.client_order_id or "").startswith(mine)]:
+        return f"{len(other)} open order(s) from another day or attempt, such as {other[0]}."
+    held = broker.positions()
+    if held.keys() != plan.positions.keys() or any(abs(q - plan.positions[s]) > 1e-9 for s, q in held.items()):
+        return "Positions changed since the plan was made."
+    return None
+
+
+def send_plan(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> SendResult:
+    """Steps 10-11: recheck, then send the confirmed orders, journaling each before and after its request."""
+    with acct.lock():
+        j = acct.journal(plan.day, plan.attempt)
+        if why := j.closed():
+            return SendResult([], [], f"This attempt is already closed ({why}). Run again for a new plan.")
+        if why := _recheck(broker, acct, plan, now):
+            j.close("discarded")
+            return SendResult([], [], why)
+        sent, failed, states = [], [], j.order_states()
+        for o in plan.orders:
+            cid = o.client_order_id
+            if states.get(cid) not in _NO_RESULT:  # already answered by Alpaca
+                continue
+            if acct.state()["halted"]:
+                break
+            j.mark(cid, "sending")
+            try:
+                got = broker.submit(o)
+            except Exception as e:
+                if "client_order_id must be unique" not in str(e):
+                    j.mark(cid, "failed", {"error": str(e)})  # str(APIError) is Alpaca's response body
+                    failed.append((cid, str(e)))
+                    break  # the rest is offered again once the error has been seen
+                got = broker.order(cid)  # it reached Alpaca already, from an earlier send or another computer
+                if got is None:
+                    j.mark(cid, "not_found")
+                    continue
+            j.mark(cid, got.status, asdict(got))
+            sent.append(got)
+        _close_if_sent(j)
+        return SendResult(sent, failed, None)
+
+
+def recover(broker: Broker, acct: AccountStore) -> list[str]:
+    """Look up every order a crash left "sending" and record its real state, before anything else is sent."""
+    with acct.lock():
+        lines = []
+        for j, cid in acct.unresolved():
+            got = broker.order(cid)
+            if got:
+                j.mark(cid, got.status, asdict(got))
+                lines.append(f"{cid}: {got.status}")
+            else:
+                j.mark(cid, "not_found")
+                lines.append(f"{cid}: not found at Alpaca, so it is offered again")
+            _close_if_sent(j)
+        return lines

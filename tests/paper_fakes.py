@@ -21,6 +21,8 @@ class FakeBroker:
         self.orders = list(orders)  # BrokerOrder, oldest first
         self.is_open = False
         self.submitted = []  # (client_order_id, tif)
+        self.calls = 0  # submit() calls, including refused ones
+        self.on_submit = None  # called with the call number as each submit starts; may raise or change state
 
     def account(self):
         return self.acct
@@ -41,6 +43,9 @@ class FakeBroker:
         return next((o for o in self.orders if o.client_order_id == client_order_id), None)
 
     def submit(self, order, tif="opg"):
+        self.calls += 1
+        if self.on_submit:
+            self.on_submit(self.calls)
         if self.order(order.client_order_id):
             raise Exception(DUPLICATE)
         out = BrokerOrder(order.client_order_id, f"id-{len(self.orders)}", order.symbol, order.side,
