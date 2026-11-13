@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sys
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
         self.resume_requested = False
         self.updating = False
         self.compare = None  # the backtest compare window, once opened
+        self.paper = None  # the paper trading window, once opened
         self.store = Store(db_path)
         self.symbol: str | None = None
         self.range = "1D"
@@ -151,7 +153,9 @@ class MainWindow(QMainWindow):
         split.addWidget(right)
         split.setSizes([520, 680])
         self.setCentralWidget(split)
-        self.menuBar().addMenu("Tools").addAction("Backtests…", self.open_backtests)
+        tools = self.menuBar().addMenu("Tools")
+        tools.addAction("Backtests…", self.open_backtests)
+        tools.addAction("Paper trading…", self.open_paper)
 
         # Bound methods of QObjects on the UI thread: Qt queues these cross-thread calls.
         self.progressed.connect(self.on_progress)
@@ -208,21 +212,53 @@ class MainWindow(QMainWindow):
         if release is not None:
             self.update_found.emit(release)
 
+    def make_clients(self):
+        return StockHistoricalDataClient(*self.keys), CorporateActionsClient(*self.keys)
+
     def open_backtests(self):
         if self.compare is None:  # imported here so the viewer never loads the backtest code
             from app.compare_ui import CompareWindow
+            from app.paper_state import paper_dir
             from app.runs import runs_dir
 
-            def make_clients():
-                return StockHistoricalDataClient(*self.keys), CorporateActionsClient(*self.keys)
+            current = paper_dir() / "current.json"  # the last paper account confirmed in the paper window
+            paper_source = None
+            if self.keys and current.exists():
+                def paper_source():  # runs on the compare window's worker thread
+                    from app.paper import account_key, make_broker, paper_lines, track_fills
+                    from app.paper_state import AccountStore
 
-            self.compare = CompareWindow(self.db_path, runs_dir(), make_clients, VERSION)
+                    key = json.loads(current.read_text())["account_key"]
+                    broker = make_broker(self.keys)
+                    if (found := account_key(broker.account())) != key:
+                        raise ValueError(f"the keys point to {found}, not the confirmed {key}")
+                    acct, store = AccountStore(paper_dir(), key), Store(self.db_path)
+                    try:
+                        track_fills(broker, acct, store)
+                    finally:
+                        store.db.close()
+                    return paper_lines(acct, broker.equity_history())
+
+            self.compare = CompareWindow(self.db_path, runs_dir(), self.make_clients, VERSION,
+                                         paper_source=paper_source)
         self.compare.show()
         self.compare.raise_()
         self.compare.activateWindow()
 
+    def open_paper(self):
+        if self.paper is None:  # imported here so the viewer never loads the paper code
+            from app.paper import make_broker
+            from app.paper_state import paper_dir
+            from app.paper_ui import PaperWindow
+
+            self.paper = PaperWindow(self.db_path, paper_dir(), (lambda: make_broker(self.keys)) if self.keys else None,
+                                     self.make_clients, VERSION)
+        self.paper.show()
+        self.paper.raise_()
+        self.paper.activateWindow()
+
     def offer_update(self, release: update.Release):
-        if self.compare is not None and self.compare.busy:
+        if any(w is not None and w.busy for w in (self.compare, self.paper)):
             return  # offered again on the next daily check
         if release.version in self.declined or not self.lock.tryLock(0):
             return
@@ -352,6 +388,12 @@ class MainWindow(QMainWindow):
         if self.updating:  # quitting mid-swap could leave no app installed
             event.ignore()
             return
+        if self.paper is not None:
+            if self.paper.busy and QMessageBox.question(
+                    self, "Stock Bars", "Paper orders are being sent or cancelled. Quit anyway?") != QMessageBox.Yes:
+                event.ignore()
+                return
+            self.paper.hide()  # a visible paper window would keep the app running
         if self.compare is not None:
             if self.compare.busy:
                 answer = QMessageBox.question(self, "Stock Bars", "A backtest is running. Stop it and quit?")
