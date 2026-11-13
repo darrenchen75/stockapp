@@ -170,19 +170,6 @@ def test_corporate_actions_reach_next_day():
 
 
 def test_buying_power_with_pending_sale(client):
-    positions = client.get_all_positions()
-    if not positions:
-        note("buying power with pending sale: not checked (no position)")
-        return
-    p = positions[0]
-    before = client.get_account().buying_power
-    o = None
-    try:
-        o = client.submit_order(opg(symbol=p.symbol, side=OrderSide.SELL, client_order_id=cid("e")))
-        after = client.get_account().buying_power
-        note("buying power", p.symbol, "before", before, "after pending 1-share sell", after)
-    except APIError as e:
-        note("pending sell rejected", err(e))
-    finally:
-        if o:
-            client.cancel_order_by_id(o.id)
+    note("buying_power", client.get_account().buying_power, "positions", len(client.get_all_positions()))
+    pytest.skip("not checked: pending-sale buying power needs a held SPY position; "
+                "selling is not allowed in this check")
