@@ -205,6 +205,7 @@ def test_paper_day_end_to_end(tmp_path):
     acct = AccountStore(tmp_path / "paper", account_key(broker.account()))
     acct.save_settings(strategy_path="tests/fixtures/buy_spy.py", limits=Limits(max_weight=0.01))
     store = Store(str(tmp_path / "bars.db"))
+    passed = False
     try:
         plan = prepare_plan(broker, acct, store, StockHistoricalDataClient(*keys), broker.actions, now)
         assert isinstance(plan, Plan), plan
@@ -222,11 +223,15 @@ def test_paper_day_end_to_end(tmp_path):
         assert seen[0] == "sending" and seen[-1] == "canceled"
         assert any(st in ("accepted", "new", "pending_new") for st in seen[1:-1])
         assert j.closed() == "killed"
+        passed = True
     finally:
-        for o in broker.open_orders():  # never leave an order open, even when an assert failed
-            if o.client_order_id not in before and (o.client_order_id or "").startswith(f"sb-{number}-"):
-                try:
-                    broker.trading.cancel_order_by_id(o.id)
-                except Exception as e:  # keep the original failure and cancel the rest
-                    print("cleanup failed for", o.client_order_id, err(e))
+        mine = lambda: [o for o in broker.open_orders()
+                        if o.client_order_id not in before and (o.client_order_id or "").startswith(f"sb-{number}-")]
+        for o in mine():  # never leave an order open, even when an assert failed
+            try:
+                broker.trading.cancel_order_by_id(o.id)
+            except Exception as e:  # keep the original failure and cancel the rest
+                print("cleanup failed for", o.client_order_id, err(e))
         store.db.close()
+        if (left := [o.client_order_id for o in mine()]) and passed:  # a failure in the body must stay the error
+            pytest.fail(f"left open at Alpaca: {left}")

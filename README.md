@@ -6,8 +6,8 @@ minute while the stock market is open.
 
 It only shows prices. It never touches your real money. The only buying and
 selling it can do is pretend trading in an Alpaca paper account (see Paper
-trading below), and orders go out only after a person confirms them (**Send**,
-or the confirmation that **Sell everything** asks for).
+trading below), and orders go out only after a person confirms them (**Send** on the
+plan shown, or the confirmation that **Sell everything** asks for).
 
 ## What you'll see
 
@@ -119,7 +119,7 @@ paper account. The money is pretend, but the orders are real orders at Alpaca.
   Alpaca's market calendar, so weekends and holidays are skipped.
 - **Run, then Send.** **Run today** makes a plan and saves it. It sells first, then
   buys, and shows each order with the reason for it. Nothing goes to Alpaca
-  until you click **Send** and confirm. Orders are market orders that fill at
+  until you click **Send** on the plan shown. Orders are market orders that fill at
   the next open (Alpaca calls this `opg`).
 - **Whole shares.** Alpaca refuses fractional at-the-open orders, so paper
   trades whole shares, sized from day T's close.
