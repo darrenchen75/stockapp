@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import date, datetime, timezone
@@ -16,6 +17,7 @@ from app.paper_plan import Limits
 log = logging.getLogger(__name__)
 
 _SETTINGS = {"limits": Limits(), "strategy_path": None, "dividends": False}
+_WRITE = threading.Lock()  # one read-modify-write at a time, so a kill's halt is never written over
 _STATE = {"halted": False, "loss_lock": None, "loss_checked_through": None, "cleared": [], "killed_at": None}
 
 
@@ -131,19 +133,21 @@ class AccountStore:
         return s
 
     def save_settings(self, **changes) -> None:
-        old = self.settings()
-        new = {**old, **changes}
-        enc = lambda s: {**s, "limits": asdict(s["limits"])}
-        _write_json(self.dir / "settings.json", enc(new))
-        self._log("settings", enc(old), enc(new))
+        with _WRITE:
+            old = self.settings()
+            new = {**old, **changes}
+            enc = lambda s: {**s, "limits": asdict(s["limits"])}
+            _write_json(self.dir / "settings.json", enc(new))
+            self._log("settings", enc(old), enc(new))
 
     def state(self) -> dict:
         return self._load("state.json", _STATE)
 
     def save_state(self, **changes) -> None:
-        old = self.state()
-        _write_json(self.dir / "state.json", {**old, **changes})
-        self._log("state", {k: old[k] for k in changes}, changes)
+        with _WRITE:
+            old = self.state()
+            _write_json(self.dir / "state.json", {**old, **changes})
+            self._log("state", {k: old[k] for k in changes}, changes)
 
     def attempts(self, day: date) -> list[int]:
         folder = self.dir / "days" / day.isoformat()

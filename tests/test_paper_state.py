@@ -2,10 +2,12 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 from datetime import date
 
 import pytest
 
+from app import paper_state
 from app import settings as app_settings
 from app.paper_plan import Limits
 from app.paper_state import AccountStore, Busy
@@ -125,3 +127,26 @@ def test_state_defaults_are_not_shared(tmp_path):
     AccountStore(tmp_path, "paper-A").state()["cleared"].append("2026-11-10")
     assert AccountStore(tmp_path, "paper-B").state()["cleared"] == []
     assert AccountStore(tmp_path, "paper-A").state()["cleared"] == []
+
+
+def test_a_racing_state_write_cannot_undo_a_halt(tmp_path, monkeypatch):
+    s = AccountStore(tmp_path, "paper-A")
+    real, started, go = paper_state._write_json, threading.Event(), threading.Event()
+
+    def slow(path, data):  # the first write stalls after reading the old state, before writing it back
+        if not started.is_set():
+            started.set()
+            go.wait(1)
+        real(path, data)
+
+    monkeypatch.setattr(paper_state, "_write_json", slow)
+    loss = threading.Thread(target=lambda: s.save_state(loss_checked_through="2026-11-12"))
+    halt = threading.Thread(target=lambda: s.save_state(halted=True))
+    loss.start()
+    started.wait(1)
+    halt.start()
+    halt.join(0.2)  # without a lock the halt is written now, then overwritten
+    go.set()
+    loss.join()
+    halt.join()
+    assert s.state()["halted"] is True and s.state()["loss_checked_through"] == "2026-11-12"

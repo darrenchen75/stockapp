@@ -611,6 +611,16 @@ def test_kill_cancels_an_order_that_got_out_after_its_cancel(env):
     assert paper.unresolved_cancels(env.broker, env.acct) == []
 
 
+def test_alpacas_open_list_beats_a_journal_that_calls_an_order_finished(env):
+    partly_sent(env)
+    paper.kill(env.broker, env.acct, sleep=no_wait)
+    env.acct.journal(T, 2).mark(oid(2, "SPY"), "not_found")  # an attempt still open, wrong about its order
+    env.broker.orders.append(order(oid(2, "SPY"), "accepted"))  # Alpaca has it open
+    assert oid(2, "SPY") in paper.unresolved_cancels(env.broker, env.acct)
+    assert oid(2, "SPY") in paper.release(env.broker, env.acct) and env.acct.state()["halted"]
+    assert env.acct.journal(T, 2).closed() is None
+
+
 def test_release_waits_for_cancels(env):
     paper.send_plan(env.broker, env.acct, env.run(), SEND)  # attempt 1 is closed "sent", its order still open
     env.broker.cancel_to = "pending_cancel"
@@ -714,3 +724,12 @@ def test_sell_all_order_type(env, is_open, now, tif):
         assert result.discarded is None and env.broker.submitted == [(oid(1, "SPY"), tif)]
     else:
         assert result.discarded == WINDOW_CLOSED and env.broker.submitted == []
+
+
+def test_sell_all_send_refuses_a_buy(env):
+    env.broker.held = {"SPY": 2.0}
+    plan = paper.plan_sell_all(env.broker, env.acct, SEND)
+    bad = replace(plan, orders=[*plan.orders, Order("AAPL", "buy", 1, oid(1, "AAPL"), 50.0)])
+    with pytest.raises(ValueError):
+        paper.send_sell_all(env.broker, env.acct, bad, SEND)
+    assert env.broker.calls == 0 and journaled(env) == []

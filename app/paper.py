@@ -391,6 +391,8 @@ def send_sell_all(broker: Broker, acct: AccountStore, plan: Plan, now: datetime)
 def _send(broker: Broker, acct: AccountStore, plan: Plan, now: datetime, sell_all: bool) -> SendResult:
     if plan.sell_all != sell_all:
         raise ValueError("send a sell-everything plan with send_sell_all and a daily plan with send_plan")
+    if plan.sell_all and any(o.side != "sell" or o.qty <= 0 for o in plan.orders):
+        raise ValueError("a sell-everything plan may hold only sales")  # it is sent under the halt
     with acct.lock():
         killed = acct.state()["killed_at"]  # a sell-all runs halted, so a kill shows as a new kill time
         j = acct.journal(plan.day, plan.attempt)
@@ -471,19 +473,22 @@ def _settle(broker: Broker, acct: AccountStore, polls: int = 0, sleep=_sleep, cl
             if n <= recancel:  # an order may have got out after the last cancel
                 broker.cancel_all()
             sleep(_POLL)
-        status = {o.client_order_id or o.id: o.status for o in broker.open_orders()}
+        live = {o.client_order_id or o.id: o for o in broker.open_orders()}
+        status = {cid: o.status for cid, o in live.items()}
         journals = [j for j in acct.entries() if not j.closed()]
         for j in journals:
             for cid, st in j.order_states().items():
-                if st not in _FINAL:
+                got, new = live.get(cid), st
+                if got:  # Alpaca lists it open, whatever the journal says
+                    new = got.status
+                elif st not in _FINAL:
                     with suppress(Exception):  # no answer leaves it unconfirmed
                         got = broker.order(cid)
                         # a "sending" order Alpaca doesn't know may still arrive; recover() settles it later
                         new = got.status if got else st if st == "sending" else "not_found"
-                        if new != st:
-                            j.mark(cid, new, got and asdict(got))
-                        st = new
-                status[cid] = st
+                if new != st:
+                    j.mark(cid, new, got and asdict(got))
+                status[cid] = new
         if all(st in _FINAL for st in status.values()):
             break
     if close:
