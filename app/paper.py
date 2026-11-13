@@ -457,14 +457,19 @@ def recover(broker: Broker, acct: AccountStore) -> list[str]:
 
 _FINAL = {"canceled", "filled", "expired", "rejected", "failed", "not_found"}  # Alpaca has nothing open for these
 _POLL = 0.5  # seconds between status checks after a cancel
+_RECANCELS = 3  # extra cancel_all calls a kill makes while an order is still unfinished
 
 
-def _settle(broker: Broker, acct: AccountStore, polls: int = 0, sleep=_sleep, close: bool = False) -> dict[str, str]:
+def _settle(broker: Broker, acct: AccountStore, polls: int = 0, sleep=_sleep, close: bool = False,
+            recancel: int = 0) -> dict[str, str]:
     """The latest status of every order of every open attempt and of every order Alpaca still has open. Orders
-    not finished are looked up again, up to `polls` more times, and new statuses are journaled. With `close`,
-    attempts whose orders are all finished are closed "killed"."""
+    not finished are looked up again, up to `polls` more times (cancelling everything again before the first
+    `recancel` of them), and new statuses are journaled. With `close`, attempts whose orders are all finished
+    are closed "killed"."""
     for n in range(polls + 1):
         if n:
+            if n <= recancel:  # an order may have got out after the last cancel
+                broker.cancel_all()
             sleep(_POLL)
         status = {o.client_order_id or o.id: o.status for o in broker.open_orders()}
         journals = [j for j in acct.entries() if not j.closed()]
@@ -489,11 +494,12 @@ def _settle(broker: Broker, acct: AccountStore, polls: int = 0, sleep=_sleep, cl
 
 
 def kill(broker: Broker, acct: AccountStore, timeout: float = 5.0, sleep=_sleep) -> list[tuple[str, str]]:
-    """Halt, cancel every open order, then confirm each one finished for up to `timeout` seconds, closing the
-    attempts that are. Takes no account lock: it must work while a send holds it."""
+    """Halt, cancel every open order, then confirm each one finished for up to `timeout` seconds, cancelling
+    again while any isn't, and close the attempts that are. Takes no account lock: it must work while a send
+    holds it."""
     acct.save_state(halted=True, killed_at=datetime.now(timezone.utc).isoformat())  # on disk first
     broker.cancel_all()
-    return list(_settle(broker, acct, round(timeout / _POLL), sleep, close=True).items())
+    return list(_settle(broker, acct, round(timeout / _POLL), sleep, close=True, recancel=_RECANCELS).items())
 
 
 def unresolved_cancels(broker: Broker, acct: AccountStore) -> list[str]:

@@ -595,6 +595,22 @@ def test_kill_halts_before_cancelling(env):
     assert j.order_states()[oid(1, "XYZ")] == "canceled" and j.closed() == "killed"
 
 
+def test_kill_cancels_an_order_that_got_out_after_its_cancel(env):
+    partly_sent(env)
+    env.acct.journal(T, 1).mark(oid(1, "SPY"), "sending")  # the sender passed its halt check just before the kill
+    cancels = []
+    env.broker.on_cancel = lambda: cancels.append(1)
+
+    def lands(seconds):  # the order reaches Alpaca after the first cancel, while kill is confirming
+        if not env.broker.order(oid(1, "SPY")):
+            env.broker.orders.append(order(oid(1, "SPY"), "accepted"))
+
+    result = paper.kill(env.broker, env.acct, sleep=lands)
+    assert dict(result)[oid(1, "SPY")] == "canceled" and env.broker.order(oid(1, "SPY")).status == "canceled"
+    assert len(cancels) >= 2 and env.acct.journal(T, 1).closed() == "killed"
+    assert paper.unresolved_cancels(env.broker, env.acct) == []
+
+
 def test_release_waits_for_cancels(env):
     paper.send_plan(env.broker, env.acct, env.run(), SEND)  # attempt 1 is closed "sent", its order still open
     env.broker.cancel_to = "pending_cancel"
