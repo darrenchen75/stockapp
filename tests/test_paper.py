@@ -13,7 +13,7 @@ from app.paper import BrokerOrder, Refusal
 from app.paper_plan import Order
 from app.paper_state import AccountStore, Busy
 from app.store import ET, DailyBar, Store
-from tests.paper_fakes import DUPLICATE, FakeBroker
+from tests.paper_fakes import DUPLICATE, FakeBroker, rejection
 from tests.test_daily import FakeActions, FakeClient, fake_day
 
 T, T1 = date(2026, 11, 12), date(2026, 11, 13)
@@ -399,22 +399,58 @@ def test_duplicate_id_alpaca_cannot_find_is_not_found(env):
     assert env.acct.journal(T, 1).closed() is None
 
 
-def test_failed_submit_stops_and_offers_the_rest(env):
+def test_rejection_marks_failed(env):
     env.use(FIFTHS)
     plan = env.run()
-    body = '{"code":40310000,"message":"insufficient buying power"}'
+    body = '{"code":42210000,"message":"asset AAPL is not tradable"}'
 
     def refuse(n):
         if n == 1:
-            raise Exception(body)
+            raise rejection(body, 422)
 
     env.broker.on_submit = refuse
     result = paper.send_plan(env.broker, env.acct, plan, SEND)
     assert result.failed == [(oid(1, "AAPL"), body)] and result.sent == [] and env.broker.calls == 1
     j = env.acct.journal(T, 1)
-    assert j.events()[-1]["detail"] == {"error": body} and j.closed() is None
-    again = env.run()
+    assert j.events()[-1]["status"] == "failed" and j.events()[-1]["detail"] == {"error": body}
+    assert j.closed() is None
+    again = env.run()  # the rest is offered once the error has been seen
     assert again.attempt == 1 and [o.client_order_id for o in again.orders] == [oid(1, "SPY")]
+
+
+def test_timeout_with_order_at_alpaca_is_recorded(env):
+    env.use(FIFTHS)
+    plan = env.run()
+
+    def lost_answer(n):
+        if n == 1:  # the order reached Alpaca, but its answer never came back
+            env.broker.orders.append(order(oid(1, "AAPL"), "accepted"))
+            raise ConnectionError("read timed out")
+
+    env.broker.on_submit = lost_answer
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.failed == [] and [o.client_order_id for o in result.sent] == [oid(1, "AAPL"), oid(1, "SPY")]
+    assert env.acct.journal(T, 1).order_states() == {oid(1, "AAPL"): "accepted", oid(1, "SPY"): "accepted"}
+    assert env.acct.journal(T, 1).closed() == "sent"
+
+
+@pytest.mark.parametrize("lookup_fails", [False, True])
+def test_timeout_without_order_stays_sending(env, monkeypatch, lookup_fails):
+    env.use(FIFTHS)
+    plan = env.run()
+
+    def no_answer(n):
+        raise ConnectionError("connection reset")
+
+    env.broker.on_submit = no_answer
+    if lookup_fails:
+        monkeypatch.setattr(env.broker, "order", lambda cid: (_ for _ in ()).throw(ConnectionError("down")))
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.sent == [] and env.broker.calls == 1
+    assert [cid for cid, _ in result.failed] == [oid(1, "AAPL")] and "no answer" in result.failed[0][1]
+    j = env.acct.journal(T, 1)
+    assert journaled(env) == [(oid(1, "AAPL"), "sending")] and j.closed() is None
+    assert [(x.folder, cid) for x, cid in env.acct.unresolved()] == [(j.folder, oid(1, "AAPL"))]
 
 
 def test_recover_resolves_sending(env):

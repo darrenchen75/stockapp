@@ -364,14 +364,23 @@ def send_plan(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> 
             try:
                 got = broker.submit(o)
             except Exception as e:
-                if "client_order_id must be unique" not in str(e):
+                if "client_order_id must be unique" in str(e):
+                    got = broker.order(cid)  # it reached Alpaca already, from an earlier send or another computer
+                    if got is None:
+                        j.mark(cid, "not_found")
+                        continue
+                elif isinstance(e, APIError) and e.status_code is not None:  # Alpaca answered: a rejection
                     j.mark(cid, "failed", {"error": str(e)})  # str(APIError) is Alpaca's response body
                     failed.append((cid, str(e)))
                     break  # the rest is offered again once the error has been seen
-                got = broker.order(cid)  # it reached Alpaca already, from an earlier send or another computer
-                if got is None:
-                    j.mark(cid, "not_found")
-                    continue
+                else:  # no answer: the request may have reached Alpaca
+                    try:
+                        got = broker.order(cid)
+                    except Exception:
+                        got = None
+                    if got is None:  # left at "sending" for recover() on the next open
+                        failed.append((cid, "no answer from Alpaca; will be checked on next open"))
+                        break
             j.mark(cid, got.status, asdict(got))
             sent.append(got)
         _close_if_sent(j)

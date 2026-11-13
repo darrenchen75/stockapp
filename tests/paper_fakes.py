@@ -1,10 +1,18 @@
 """In-memory stand-ins for the Alpaca broker, shared by the paper tests."""
 from dataclasses import replace
+from types import SimpleNamespace
+
+from alpaca.common.exceptions import APIError
 
 from app.paper import Account, BrokerOrder
 
 FINISHED = {"filled", "canceled", "expired", "rejected", "replaced"}
 DUPLICATE = '{"code":42210000,"message":"client_order_id must be unique"}'  # Alpaca's real 422 body
+
+
+def rejection(body: str, status: int = 422) -> APIError:
+    """What alpaca-py raises when Alpaca answers a request with an error status."""
+    return APIError(body, SimpleNamespace(response=SimpleNamespace(status_code=status)))
 
 
 class FakeBroker:
