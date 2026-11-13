@@ -17,6 +17,7 @@ from app import paper, paper_ui
 from app.paper_state import AccountStore
 from app.paper_ui import LIVE_OFF, PaperWindow
 from app.store import ET, DailyBar, Store
+from tests import paper_fakes
 from tests.paper_fakes import FakeBroker
 from tests.test_compare_ui import wait
 from tests.test_daily import FakeActions, FakeClient
@@ -351,3 +352,47 @@ def test_quit_while_paper_is_busy_asks(main_window, monkeypatch, answer, closes)
     event = QCloseEvent()
     main_window.closeEvent(event)
     assert event.isAccepted() is closes and main_window.paper.hide.called is closes
+
+
+def test_cancel_is_off_once_an_order_went_out(env, tmp_path):
+    w = env.open()
+    two = tmp_path / "two.py"
+    two.write_text("def target_weights(history, as_of):\n    return {'SPY': 0.2, 'AAPL': 0.2}\n")
+    env.acct().save_settings(strategy_path=str(two))
+    cid = f"sb-{NUMBER}-20261112-a1-SPY"
+
+    def lost(call):  # the second order's answer is lost and Alpaca doesn't know it: left unsent
+        if call == 2:
+            raise Exception(paper_fakes.DUPLICATE)
+    env.broker.on_submit = lost
+    click(w, w.run_button)
+    click(w, w.send_button)
+    env.broker.on_submit = None
+    click(w, w.run_button)  # offers the unsent rest of attempt 1
+    assert [o.client_order_id for o in w.plan.orders] == [cid]
+    assert not w.cancel_button.isEnabled()
+    assert w.cancel_button.toolTip() == "Orders already went out — use the kill switch to stop them."
+    assert w.send_button.isEnabled() and w.kill_button.isEnabled()
+    w.cancel()
+    assert env.acct().journal(T, 1).closed() is None
+
+
+def test_safety_settings_edit_is_saved_and_logged(env, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QDoubleSpinBox
+    w = env.open()
+    monkeypatch.setattr(QDialog, "exec",
+                        lambda d: (d.findChildren(QDoubleSpinBox)[0].setValue(30), QDialog.Accepted)[1])
+    click(w, w.limits_button)
+    assert env.acct().settings()["limits"].max_weight == 0.3
+    event = json.loads((env.acct().dir / "events.jsonl").read_text().splitlines()[-1])
+    assert event["kind"] == "settings"
+    assert (event["old"]["limits"]["max_weight"], event["new"]["limits"]["max_weight"]) == (0.25, 0.3)
+    assert "30%" in w.limits_label.text()
+
+
+def test_change_strategy(env, monkeypatch, tmp_path):
+    w = env.open()
+    other = str(tmp_path / "other.py")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (other, "")))
+    click(w, w.strategy_button)
+    assert env.acct().settings()["strategy_path"] == other and w.strategy_label.text() == other

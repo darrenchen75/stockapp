@@ -26,6 +26,7 @@ LIVE_OFF = "Live trading is off: the app has no code signing, so a tampered upda
 SIMULATOR_NOTE = ("Alpaca's paper fills are simulated against quotes, so the gap to the official open includes the "
                   "simulator's behaviour, not just real trading costs.")
 RED = "color: #c62828"
+WENT_OUT = "Orders already went out — use the kill switch to stop them."
 BUSY_JOBS = {"send", "kill", "sell", "sell_send"}  # closing or updating mid-way asks first
 fill = RunDetail.fill
 
@@ -397,7 +398,9 @@ class PaperWindow(QWidget):
         self.run_button.setToolTip(why or "")
         self.send_button.setEnabled(ready and self.plan is not None and not halted and not working
                                     and self.acct.dir.name in self.recovered)
-        self.cancel_button.setEnabled(ready and self.plan is not None and not working)
+        went_out = ready and self.plan is not None and self.went_out()  # the attempt stays open until settled
+        self.cancel_button.setEnabled(ready and self.plan is not None and not working and not went_out)
+        self.cancel_button.setToolTip(WENT_OUT if went_out else "")
         self.kill_button.setEnabled(ready)  # always, even mid-send
         self.release_button.setEnabled(bool(halted) and not self.status["unresolved"] and not working)
         for b in (self.sell_button, self.clear_button, self.strategy_button, self.limits_button):
@@ -457,7 +460,12 @@ class PaperWindow(QWidget):
             text += " Not sent: " + "; ".join(f"{cid}: {err}" for cid, err in result.failed)
         self.say(text, error=bool(result.failed))
 
+    def went_out(self) -> bool:
+        return bool(self.acct.journal(self.plan.day, self.plan.attempt).order_states())
+
     def cancel(self) -> None:
+        if self.went_out():
+            return
         j = self.acct.journal(self.plan.day, self.plan.attempt)
         if not j.closed():
             j.close("cancelled")
