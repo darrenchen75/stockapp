@@ -344,19 +344,35 @@ def _recheck(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> s
     return None
 
 
+_NO_ANSWER = "no answer from Alpaca; will be checked on next open"
+
+
+def _look_up(broker: Broker, cid: str) -> BrokerOrder | None:
+    """The order at Alpaca, or None when Alpaca doesn't know it or the lookup itself fails."""
+    try:
+        return broker.order(cid)
+    except Exception:
+        return None
+
+
 def send_plan(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> SendResult:
     """Steps 10-11: recheck, then send the confirmed orders, journaling each before and after its request."""
     with acct.lock():
         j = acct.journal(plan.day, plan.attempt)
         if why := j.closed():
             return SendResult([], [], f"This attempt is already closed ({why}). Run again for a new plan.")
+        for cid in [c for c, st in j.order_states().items() if st == "sending"]:  # looked up before anything goes
+            if not (got := _look_up(broker, cid)):
+                return SendResult([], [(cid, _NO_ANSWER)], None)
+            j.mark(cid, got.status, asdict(got))
         if why := _recheck(broker, acct, plan, now):
-            j.close("discarded")
+            if all(st in _UNSENT for st in j.order_states().values()):  # nothing of it is at Alpaca
+                j.close("discarded")
             return SendResult([], [], why)
         sent, failed, states = [], [], j.order_states()
         for o in plan.orders:
             cid = o.client_order_id
-            if states.get(cid) not in _NO_RESULT:  # already answered by Alpaca
+            if states.get(cid) not in _UNSENT:  # already answered by Alpaca
                 continue
             if acct.state()["halted"]:
                 break
@@ -364,24 +380,23 @@ def send_plan(broker: Broker, acct: AccountStore, plan: Plan, now: datetime) -> 
             try:
                 got = broker.submit(o)
             except Exception as e:
+                status = e.status_code if isinstance(e, APIError) else None
                 if "client_order_id must be unique" in str(e):
                     got = broker.order(cid)  # it reached Alpaca already, from an earlier send or another computer
                     if got is None:
                         j.mark(cid, "not_found")
                         continue
-                elif isinstance(e, APIError) and e.status_code is not None:  # Alpaca answered: a rejection
+                elif status is not None and 400 <= status < 500:  # Alpaca answered: a rejection
                     j.mark(cid, "failed", {"error": str(e)})  # str(APIError) is Alpaca's response body
                     failed.append((cid, str(e)))
                     break  # the rest is offered again once the error has been seen
-                else:  # no answer: the request may have reached Alpaca
-                    try:
-                        got = broker.order(cid)
-                    except Exception:
-                        got = None
-                    if got is None:  # left at "sending" for recover() on the next open
-                        failed.append((cid, "no answer from Alpaca; will be checked on next open"))
-                        break
+                elif not (got := _look_up(broker, cid)):  # no answer, or a 5xx: it may have reached Alpaca
+                    failed.append((cid, _NO_ANSWER))  # left at "sending" for recover() on the next open
+                    break
             j.mark(cid, got.status, asdict(got))
+            if got.status == "rejected":
+                failed.append((cid, got.status))
+                break
             sent.append(got)
         _close_if_sent(j)
         return SendResult(sent, failed, None)

@@ -485,3 +485,77 @@ def test_send_twice_never_doubles(env):
     ids = [o.client_order_id for o in env.broker.orders]
     assert sorted(ids) == [oid(1, "AAPL"), oid(1, "SPY")]
     assert env.acct.journal(T, 1).closed() == "sent"
+
+
+def test_server_error_with_order_at_alpaca_is_recorded(env):
+    plan = env.run()
+
+    def created_then_503(n):  # a 5xx can come back after Alpaca created the order
+        env.broker.orders.append(order(oid(1, "SPY"), "accepted"))
+        raise rejection('{"message":"service unavailable"}', 503)
+
+    env.broker.on_submit = created_then_503
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.failed == [] and [o.client_order_id for o in result.sent] == [oid(1, "SPY")]
+    assert journaled(env) == [(oid(1, "SPY"), "sending"), (oid(1, "SPY"), "accepted")]
+
+
+def halted_after_first(env):
+    env.use(FIFTHS)
+    plan = env.run()
+    env.broker.on_submit = lambda n: env.acct.save_state(halted=True)
+    paper.send_plan(env.broker, env.acct, plan, SEND)
+    env.broker.on_submit = None
+    return plan
+
+
+def test_failed_recheck_keeps_a_partly_sent_attempt_open(env):
+    plan = halted_after_first(env)
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert "halted" in result.discarded and env.acct.journal(T, 1).closed() is None
+    assert env.broker.submitted == [(oid(1, "AAPL"), "opg")]
+
+
+def test_resend_after_halt_skips_sent_orders(env):
+    plan = halted_after_first(env)
+    env.acct.save_state(halted=False)
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)  # the same full plan
+    assert result.discarded is None and [o.client_order_id for o in result.sent] == [oid(1, "SPY")]
+    assert env.broker.submitted == [(oid(1, "AAPL"), "opg"), (oid(1, "SPY"), "opg")] and env.broker.calls == 2
+    assert env.acct.journal(T, 1).closed() == "sent"
+
+
+def test_unknown_sending_order_blocks_a_second_send(env):
+    env.use(FIFTHS)
+    plan = env.run()
+
+    def no_answer(n):
+        raise ConnectionError("connection reset")
+
+    env.broker.on_submit = no_answer
+    paper.send_plan(env.broker, env.acct, plan, SEND)
+    env.broker.on_submit = None
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert env.broker.calls == 1 and env.broker.submitted == [] and result.sent == []
+    assert [cid for cid, _ in result.failed] == [oid(1, "AAPL")] and "no answer" in result.failed[0][1]
+    assert journaled(env) == [(oid(1, "AAPL"), "sending")] and env.acct.journal(T, 1).closed() is None
+
+
+def test_sending_order_found_on_resend_is_recorded_not_resubmitted(env):
+    env.use(FIFTHS)
+    plan = env.run()
+    env.acct.journal(T, 1).mark(oid(1, "AAPL"), "sending")  # a crash, and no recover() since
+    env.broker.orders = [order(oid(1, "AAPL"), "accepted")]
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert env.broker.submitted == [(oid(1, "SPY"), "opg")] and env.broker.calls == 1 and result.failed == []
+    assert env.acct.journal(T, 1).order_states() == {oid(1, "AAPL"): "accepted", oid(1, "SPY"): "accepted"}
+
+
+def test_order_alpaca_reports_rejected_is_a_failure(env):
+    env.use(FIFTHS)
+    plan = env.run()
+    env.broker.orders = [order(oid(1, "AAPL"), "rejected")]  # duplicate: the lookup finds it rejected
+    result = paper.send_plan(env.broker, env.acct, plan, SEND)
+    assert result.sent == [] and result.failed == [(oid(1, "AAPL"), "rejected")]
+    assert journaled(env) == [(oid(1, "AAPL"), "sending"), (oid(1, "AAPL"), "rejected")]
+    assert env.broker.calls == 1  # a rejection stops the rest, like a failed request
