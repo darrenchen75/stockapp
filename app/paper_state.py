@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -36,11 +36,17 @@ def _now() -> str:
 
 def _write_json(path: Path, data: dict) -> None:
     # a temp name of its own, so two writers of one file (the paper window and the compare screen) never collide
-    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(f.name, path)
+    f = tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False)
+    try:
+        with f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(f.name, path)
+    except BaseException:  # never leave a half-written temp file in the journal folder
+        with suppress(FileNotFoundError):
+            os.unlink(f.name)
+        raise
 
 
 def _append(path: Path, event: dict) -> None:

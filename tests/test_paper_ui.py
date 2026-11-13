@@ -466,3 +466,17 @@ def test_sell_everything_entry_records_the_app_version(env):
     w = env.open()
     click(w, w.sell_button)
     assert (env.acct().journal(T, 1).folder / "app_version.txt").read_text() == "0.1.4"
+
+
+def test_endpoint_is_checked_on_every_refresh(env):
+    w = env.open()
+    click(w, w.run_button)
+    assert w.send_button.isEnabled()
+    env.broker.acct = paper.Account(NUMBER, "https://api.alpaca.markets", 1e5, 1e5, 2e5)
+    w.refresh()
+    settle(w)
+    assert not w.run_button.isEnabled() and not w.send_button.isEnabled() and w.plan is None
+    assert "paper endpoint" in w.message.text()
+    assert w.kill_button.isEnabled()  # confirmed before: a person can still halt
+    click(w, w.kill_button)
+    assert env.acct().state()["halted"]

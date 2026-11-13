@@ -177,3 +177,14 @@ def test_two_writers_of_one_file_do_not_collide(tmp_path, monkeypatch):
     first.join(5)
     assert errors == [] and json.loads((tmp_path / "fills.json").read_text()) == {"from": "first"}
     assert [p.name for p in tmp_path.iterdir()] == ["fills.json"]
+
+
+def test_a_failed_write_leaves_no_temp_file(tmp_path, monkeypatch):
+    import os
+
+    def broken(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr(os, "replace", broken)
+    with pytest.raises(OSError, match="disk full"):
+        paper_state._write_json(tmp_path / "state.json", {"halted": True})
+    assert list(tmp_path.iterdir()) == []

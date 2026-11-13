@@ -322,26 +322,26 @@ class PaperWindow(QWidget):
         self.recovered.add(key)
         if s["recovered"]:
             self.say("Checked orders left unfinished last time: " + "; ".join(s["recovered"]))
-        if (self.acct is None or self.acct.dir.name != key) and (why := self.confirm(s)):
+        why = None
+        if PAPER_ENDPOINT not in s["account"].endpoint:  # checked on every refresh, not only at setup
+            why = (f"{s['account'].endpoint} is not Alpaca's paper endpoint ({PAPER_ENDPOINT}), so paper trading is "
+                   "off for these keys.")
+            self.drop_plan()
+            self.status = None
+            self.acct = s["acct"] if (self.root / "current.json").exists() else None  # still able to halt
+        elif (self.acct is None or self.acct.dir.name != key) and (why := self.confirm(s)):
             self.acct = self.status = None
-            self.say(why, error=True)
         else:
             self.status = s
+        if why:
+            self.say(why, error=True)
         self.show_status()
 
     def confirm(self, s: dict) -> str | None:
         """The account check: a new or different account is confirmed by the user before anything runs. Returns
         why it isn't, or None."""
-        if self.plan is not None:  # the keys now point elsewhere: an unsent plan is discarded
-            j = self.acct.journal(self.plan.day, self.plan.attempt)
-            if not j.closed() and not j.order_states():
-                j.close("discarded")
-            self.plan = None
-            self.show_plan()
+        self.drop_plan()  # the keys now point elsewhere: an unsent plan is discarded
         account, acct = s["account"], s["acct"]
-        if PAPER_ENDPOINT not in account.endpoint:
-            return (f"{account.endpoint} is not Alpaca's paper endpoint ({PAPER_ENDPOINT}), so paper trading is off "
-                    "for these keys.")
         current = self.root / "current.json"
         last = json.loads(current.read_text())["account_key"] if current.exists() else None
         if last != acct.dir.name:
@@ -356,6 +356,14 @@ class PaperWindow(QWidget):
         if not acct.settings()["strategy_path"]:
             self.pick_strategy()
         return None
+
+    def drop_plan(self) -> None:
+        if self.plan is not None:
+            j = self.acct.journal(self.plan.day, self.plan.attempt)
+            if not j.closed() and not j.order_states():
+                j.close("discarded")
+            self.plan = None
+            self.show_plan()
 
     def show_status(self) -> None:
         s, acct = self.status, self.acct
@@ -411,7 +419,7 @@ class PaperWindow(QWidget):
         went_out = ready and self.plan is not None and self.went_out()  # the attempt stays open until settled
         self.cancel_button.setEnabled(ready and self.plan is not None and not working and not went_out)
         self.cancel_button.setToolTip(WENT_OUT if went_out else "")
-        self.kill_button.setEnabled(ready)  # always, even mid-send
+        self.kill_button.setEnabled(self.acct is not None and self.broker is not None)  # always, even mid-send
         self.release_button.setEnabled(bool(halted) and not self.status["unresolved"] and not working)
         for b in (self.sell_button, self.clear_button, self.strategy_button, self.limits_button):
             b.setEnabled(ready and not working)
