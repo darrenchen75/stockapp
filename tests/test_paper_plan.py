@@ -1,5 +1,5 @@
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -29,9 +29,12 @@ def test_window_skips_holiday():
 
 
 def test_window_across_dst_change():
+    # UTC-aware now: zoneinfo-vs-zoneinfo comparison would ignore the offset. DST ends 2026-11-01.
     cal = [date(2026, 10, 30), date(2026, 11, 2)]
-    assert run_window(cal, at(2026, 10, 30, 20, 30))[2] is None
-    assert run_window(cal, at(2026, 11, 2, 9, 27))[2] is None
+    fri, mon = cal
+    assert run_window(cal, datetime(2026, 10, 31, 0, 30, tzinfo=timezone.utc)) == (fri, mon, None)  # Fri 20:30 EDT
+    assert run_window(cal, datetime(2026, 11, 2, 14, 27, tzinfo=timezone.utc)) == (fri, mon, None)  # Mon 09:27 EST
+    assert run_window(cal, datetime(2026, 11, 2, 14, 28, tzinfo=timezone.utc))[2]  # Mon 09:28 EST
 
 
 def test_window_closed_before_first_session_or_after_last():
