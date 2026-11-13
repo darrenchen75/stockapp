@@ -4,8 +4,9 @@ Stock Bars shows you minute-by-minute prices for every company in the S&P 500,
 right on your computer. It keeps the last 30 days of prices and updates every
 minute while the stock market is open.
 
-It only shows prices. It never buys or sells anything, and it never touches
-your money.
+It only shows prices. It never touches your real money. The only buying and
+selling it can do is pretend trading in an Alpaca paper account (see Paper
+trading below), and only when you click **Send**.
 
 ## What you'll see
 
@@ -80,6 +81,67 @@ app never buys or sells anything. A backtest only replays history on paper.
   look better than they would have been (survivorship bias). The note on the
   screen, in the run detail and in exports says this, and names the data source
   and the dividend setting. Past results don't predict future ones.
+
+## Strategy contract
+
+A strategy file has one job: given the prices up to a day, say what to hold.
+Its answer must depend only on `history` and `as_of`, the two things it is
+given. It must not keep state between calls, use unseeded randomness, read
+files, read the clock or use the network. The same history must always give
+the same answer.
+
+Backtests and paper trading both run your file this way. Paper trading has a
+**Replay** button that runs a past day's saved inputs through the saved copy
+of the strategy again and checks that it gives the same targets. Replay checks
+that the same data and code give the same targets. It can't catch a strategy
+whose state resets on each load, such as a module-level counter, because each
+run loads the file fresh.
+
+## Paper trading
+
+Open **Tools**, then **Paper trading…** to run a strategy against an Alpaca
+paper account. The money is pretend, but the orders are real orders at Alpaca.
+
+- **Paper only.** The app only talks to Alpaca's paper endpoint. Live trading
+  is off, and there is no switch to turn it on: the app has no code signing,
+  so a tampered update could otherwise trade real money. A strategy bug that can only
+  lose pretend money is a much safer way to find out. If the keys don't reach
+  a paper account, the window does nothing, and any orders must be stopped
+  from Alpaca's dashboard.
+- **Setup.** Use the paper key from Setup below. In the window, confirm the
+  account it shows, choose a strategy file and check the limits.
+- **When you can run.** The strategy decides after 20:30 New York time on a
+  trading day (day T), once that day's prices are in. You can run it any time
+  from then until 09:28 New York time on the next trading day (T+1). After
+  that the window closes and you wait for the next 20:30. T and T+1 come from
+  Alpaca's market calendar, so weekends and holidays are skipped.
+- **Run, then Send.** **Run today** makes a plan and saves it. It sells first, then
+  buys, and shows each order with the reason for it. Nothing goes to Alpaca
+  until you click **Send** and confirm. Orders are market orders that fill at
+  the next open (Alpaca calls this `opg`).
+- **Whole shares.** Alpaca refuses fractional at-the-open orders, so paper
+  trades whole shares, sized from day T's close.
+- **Limits.** Defaults: no more than 25% of the account in one company, stop
+  buying after a 3% one-day loss (sales still go out, and you clear the lock
+  yourself), and keep 2% of the money as cash. You can edit all three.
+  Each edit is saved in the log.
+- **Kill switch.** **Kill switch** stops everything at once: it halts the
+  account, cancels every open order and closes the plan. Nothing runs again until you
+  click **Release halt**, which works only once every order has finished.
+- **Sell everything.** Makes a plan that sells every position. It works while
+  the account is halted. It still waits for your confirmation.
+- **One computer per account at a time.** Two computers running the same
+  account can send the same orders twice. The window warns you if Alpaca shows
+  orders this computer has no record of.
+- **Logs stay on this computer.** Plans, orders and the log of fills are in
+  Stock Bars' own data folder, per account. They are not shared between
+  computers.
+- **Fills and results.** Paper fills are simulated by Alpaca against quotes.
+  The app compares each fill with day T's close, and the compare screen shows
+  the paper account as its own line beside your backtests.
+- **No dividends.** Alpaca paper accounts don't pay dividends, so paper
+  results leave them out. A backtest with dividends on will look better than
+  its paper run.
 
 ## Setup
 

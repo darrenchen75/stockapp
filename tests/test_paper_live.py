@@ -173,3 +173,57 @@ def test_buying_power_with_pending_sale(client):
     note("buying_power", client.get_account().buying_power, "positions", len(client.get_all_positions()))
     pytest.skip("not checked: pending-sale buying power needs a held SPY position; "
                 "selling is not allowed in this check")
+
+
+def test_paper_day_end_to_end(tmp_path):
+    """Run window only: prepare, send, kill, release one SPY share. Temp journal and a temp copy of bars.db."""
+    import shutil
+    from pathlib import Path
+
+    from alpaca.data.historical import StockHistoricalDataClient
+    from platformdirs import user_data_dir
+
+    from app.paper import (Plan, account_key, kill, make_broker, prepare_plan, release, send_plan)
+    from app.paper_plan import Limits, run_window
+    from app.paper_state import AccountStore
+    from app.store import Store
+
+    keys = load_keys()
+    assert keys, "no stored Alpaca key"
+    broker = make_broker(keys)
+    now = datetime.now(NY)
+    today = now.date()
+    if why := run_window(broker.calendar(today - timedelta(days=10), today + timedelta(days=10)), now)[2]:
+        pytest.skip(f"run window is closed: {why}")
+
+    real = Path(user_data_dir("stockapp", appauthor=False)) / "bars.db"
+    for suffix in ("", "-wal", "-shm"):
+        if Path(f"{real}{suffix}").exists():
+            shutil.copy(f"{real}{suffix}", tmp_path / f"bars.db{suffix}")
+    number = broker.account().number
+    before = {o.client_order_id for o in broker.open_orders()}
+    acct = AccountStore(tmp_path / "paper", account_key(broker.account()))
+    acct.save_settings(strategy_path="tests/fixtures/buy_spy.py", limits=Limits(max_weight=0.01))
+    store = Store(str(tmp_path / "bars.db"))
+    try:
+        plan = prepare_plan(broker, acct, store, StockHistoricalDataClient(*keys), broker.actions, now)
+        assert isinstance(plan, Plan), plan
+        assert [(o.symbol, o.side) for o in plan.orders] == [("SPY", "buy")] and plan.orders[0].qty >= 1
+        res = send_plan(broker, acct, plan, datetime.now(NY))
+        assert not res.failed and res.discarded is None and [o.client_order_id for o in res.sent] == [
+            plan.orders[0].client_order_id]
+        assert res.sent[0].status == "accepted"
+        kill(broker, acct)
+        j = acct.journal(plan.day, plan.attempt)
+        cid = plan.orders[0].client_order_id
+        assert broker.order(cid).status == "canceled"
+        assert release(broker, acct) is None
+        seen = [e["status"] for e in j.events() if e.get("id") == cid]
+        assert seen[0] == "sending" and "accepted" in seen and seen[-1] == "canceled"
+        assert seen.index("sending") < seen.index("accepted") < len(seen) - 1
+        assert j.closed() == "killed"
+    finally:
+        for o in broker.open_orders():  # never leave an order open, even when an assert failed
+            if o.client_order_id not in before and (o.client_order_id or "").startswith(f"sb-{number}-"):
+                broker.trading.cancel_order_by_id(o.id)
+        store.db.close()
