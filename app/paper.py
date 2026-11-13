@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -158,7 +159,8 @@ def plan_from_json(d: dict) -> Plan:
 
 
 def _remainder(acct: AccountStore, day: date, attempts: list[int]) -> Plan | None:
-    """The latest attempt's saved plan, cut to its unsent orders, if that attempt is still open."""
+    """The latest attempt's saved plan, cut to its unsent orders, if that attempt is still open and a send
+    started (step 11 journals "sending" first). An attempt never sent is recomputed instead."""
     if not attempts:
         return None
     j = acct.journal(day, attempts[-1])
@@ -168,7 +170,18 @@ def _remainder(acct: AccountStore, day: date, attempts: list[int]) -> Plan | Non
         return None
     sent = j.order_states()
     unsent = [o for o in saved.orders if o.client_order_id not in sent]
-    return replace(saved, orders=unsent) if unsent and not j.closed() else None
+    return replace(saved, orders=unsent) if sent and unsent and not j.closed() else None
+
+
+def _load_exactly(code: bytes, path: str):
+    """The strategy from these bytes, not from the file again, so what runs is what is saved and hashed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "strategy.py"
+        copy.write_bytes(code)
+        try:
+            return load_strategy(str(copy))
+        except StrategyError as e:
+            raise StrategyError(str(e).replace(str(copy), path)) from e
 
 
 def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, actions_client,
@@ -213,7 +226,7 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
             return Refusal(f"Strategy file not found: {path}")
         code = Path(path).read_bytes()
         try:
-            strategy = load_strategy(path)
+            strategy = _load_exactly(code, path)
         except StrategyError as e:
             return Refusal(str(e))
 
@@ -239,7 +252,7 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
         # step 4: the account and the loss cutoff over every session since the last one checked
         positions = broker.positions()
         limits = settings["limits"]
-        equity = broker.equity_history()
+        equity = [p for p in broker.equity_history() if p[0] <= day]  # a morning run may see T+1's point
         loss = check_losses(equity, _date(state["loss_checked_through"]), limits.loss_cutoff)
         last = max(equity, default=None)  # (date, equity) of the latest history point
         live = not loss.problem and last and last[0] < day and last[1] > 0
@@ -282,4 +295,8 @@ def prepare_plan(broker: Broker, acct: AccountStore, store: Store, data_client, 
         journal = acct.journal(day, attempt)
         (journal.folder / "strategy.py").write_bytes(code)
         journal.write_plan(plan_to_json(plan))
+        for n in local:  # earlier attempts nobody started sending are replaced by this one
+            old = acct.journal(day, n)
+            if not old.closed() and not old.order_states():
+                old.close("superseded")
         return plan

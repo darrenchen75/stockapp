@@ -257,3 +257,38 @@ def test_day_t_loss_from_live_equity_locks(env):
 def test_day_t_small_move_from_live_equity_does_not_lock(env):
     plan = day_t_from_live_equity(env, 99_000.0, None)
     assert plan.loss.breaches == []
+
+
+def test_edited_strategy_supersedes_an_unsent_attempt(env):
+    assert env.run().targets == {"SPY": 1.0}
+    env.use(FIFTHS)
+    again = env.run()
+    assert again.attempt == 2 and again.targets == {"SPY": 0.2, "AAPL": 0.2}
+    assert env.acct.journal(T, 1).closed() == "superseded" and env.acct.journal(T, 2).closed() is None
+
+
+def test_what_ran_is_what_was_saved(env, monkeypatch):
+    real = paper.load_strategy
+
+    def edit_then_load(path):  # the file changes after it was read for the copy
+        (env.tmp / "strategy.py").write_text(FIFTHS)
+        return real(path)
+
+    env.use(BUY_SPY.read_text())
+    monkeypatch.setattr(paper, "load_strategy", edit_then_load)  # the copy it loads is the bytes read first
+    plan = env.run()
+    j = env.acct.journal(T, 1)
+    assert plan.targets == {"SPY": 1.0} and (j.folder / "strategy.py").read_bytes() == BUY_SPY.read_bytes()
+    assert plan.strategy_sha256 == hashlib.sha256(BUY_SPY.read_bytes()).hexdigest()
+
+
+def test_history_after_day_t_is_ignored(env):
+    env.broker.history = [(date(2026, 11, 11), 1e5), (T, 1e5), (T1, 5e4)]
+    plan = env.run()
+    assert env.acct.state()["loss_checked_through"] == T.isoformat() and env.acct.state()["loss_lock"] is None
+    assert plan.orders and plan.loss.checked_through == T
+
+
+def test_load_error_names_the_chosen_file(env):
+    env.use("def target_weights(:\n")
+    refused(env, env.run(), f"cannot load {env.tmp / 'strategy.py'}:")
