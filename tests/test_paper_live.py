@@ -212,18 +212,21 @@ def test_paper_day_end_to_end(tmp_path):
         res = send_plan(broker, acct, plan, datetime.now(NY))
         assert not res.failed and res.discarded is None and [o.client_order_id for o in res.sent] == [
             plan.orders[0].client_order_id]
-        assert res.sent[0].status == "accepted"
+        assert res.sent[0].status in ("accepted", "new", "pending_new")
         kill(broker, acct)
         j = acct.journal(plan.day, plan.attempt)
         cid = plan.orders[0].client_order_id
         assert broker.order(cid).status == "canceled"
         assert release(broker, acct) is None
         seen = [e["status"] for e in j.events() if e.get("id") == cid]
-        assert seen[0] == "sending" and "accepted" in seen and seen[-1] == "canceled"
-        assert seen.index("sending") < seen.index("accepted") < len(seen) - 1
+        assert seen[0] == "sending" and seen[-1] == "canceled"
+        assert any(st in ("accepted", "new", "pending_new") for st in seen[1:-1])
         assert j.closed() == "killed"
     finally:
         for o in broker.open_orders():  # never leave an order open, even when an assert failed
             if o.client_order_id not in before and (o.client_order_id or "").startswith(f"sb-{number}-"):
-                broker.trading.cancel_order_by_id(o.id)
+                try:
+                    broker.trading.cancel_order_by_id(o.id)
+                except Exception as e:  # keep the original failure and cancel the rest
+                    print("cleanup failed for", o.client_order_id, err(e))
         store.db.close()

@@ -6,7 +6,8 @@ minute while the stock market is open.
 
 It only shows prices. It never touches your real money. The only buying and
 selling it can do is pretend trading in an Alpaca paper account (see Paper
-trading below), and only when you click **Send**.
+trading below), and orders go out only after a person confirms them (**Send**,
+or the confirmation that **Sell everything** asks for).
 
 ## What you'll see
 
@@ -58,7 +59,7 @@ its own.
 ## Backtests
 
 Open **Tools**, then **Backtests…** to try a trading idea on past prices. The
-app never buys or sells anything. A backtest only replays history on paper.
+app never buys or sells anything in a backtest. A backtest only replays history on paper.
 
 - **Make a run.** Click **New…**, pick a strategy file (a small Python file
   that decides what to hold each day), choose the dates, starting money, a
@@ -103,9 +104,10 @@ Open **Tools**, then **Paper trading…** to run a strategy against an Alpaca
 paper account. The money is pretend, but the orders are real orders at Alpaca.
 
 - **Paper only.** The app only talks to Alpaca's paper endpoint. Live trading
-  is off, and there is no switch to turn it on: the app has no code signing,
-  so a tampered update could otherwise trade real money. A strategy bug that can only
-  lose pretend money is a much safer way to find out. If the keys don't reach
+  is off. The window has a **Live trading** switch, but it is permanently
+  disabled: the app has no code signing, so a tampered update could otherwise
+  trade real money. A strategy bug that can only lose pretend money is a much
+  safer way to find out. If the keys don't reach
   a paper account, the window does nothing, and any orders must be stopped
   from Alpaca's dashboard.
 - **Setup.** Use the paper key from Setup below. In the window, confirm the
@@ -128,8 +130,9 @@ paper account. The money is pretend, but the orders are real orders at Alpaca.
 - **Kill switch.** **Kill switch** stops everything at once: it halts the
   account, cancels every open order and closes the plan. Nothing runs again until you
   click **Release halt**, which works only once every order has finished.
-- **Sell everything.** Makes a plan that sells every position. It works while
-  the account is halted. It still waits for your confirmation.
+- **Sell everything.** First it halts the account and cancels open orders, after you confirm.
+  Then it makes a plan that sells every position and sends the sales only after
+  a second confirmation.
 - **One computer per account at a time.** Two computers running the same
   account can send the same orders twice. The window warns you if Alpaca shows
   orders this computer has no record of.
