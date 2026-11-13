@@ -1,4 +1,5 @@
 """On-disk state for one paper account: settings, halt/loss lock, journal, event log, one-writer lock."""
+import copy
 import json
 import logging
 import os
@@ -121,7 +122,8 @@ class AccountStore:
 
     def _load(self, name: str, defaults: dict) -> dict:
         path = self.dir / name
-        return {**defaults, **json.loads(path.read_text())} if path.exists() else dict(defaults)
+        data = json.loads(path.read_text()) if path.exists() else {}
+        return {**copy.deepcopy(defaults), **data}
 
     def settings(self) -> dict:
         s = self._load("settings.json", {**_SETTINGS, "limits": asdict(_SETTINGS["limits"])})

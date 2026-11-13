@@ -118,3 +118,9 @@ def test_no_key_written(tmp_path, monkeypatch):
     for p in files:
         text = p.read_text()
         assert "KEYID123" not in text and "SECRET456" not in text
+
+
+def test_state_defaults_are_not_shared(tmp_path):
+    AccountStore(tmp_path, "paper-A").state()["cleared"].append("2026-11-10")
+    assert AccountStore(tmp_path, "paper-B").state()["cleared"] == []
+    assert AccountStore(tmp_path, "paper-A").state()["cleared"] == []
