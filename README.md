@@ -1,6 +1,7 @@
 # Stock Bars
 
-Stock Bars shows you minute-by-minute prices for every company in the S&P 500,
+Stock Bars shows you minute-by-minute prices for the companies in the S&P 500,
+Nasdaq-100 and Dow 30, plus the sector and index funds (ETFs) that track them,
 right on your computer. It keeps the last 35 days of prices and updates every
 minute while the stock market is open.
 
@@ -11,8 +12,8 @@ plan shown, or the confirmation that **Sell everything** asks for).
 
 ## What you'll see
 
-**On the left: a list of about 500 companies**, by their stock symbol (for
-example, AAPL is Apple). For each one you'll see:
+**On the left: a list of about 530 companies and funds**, by their stock symbol
+(for example, AAPL is Apple). For each one you'll see:
 
 - **Last**: the most recent price.
 - **% Chg**: how much the price moved since the previous trading day's last
@@ -23,7 +24,9 @@ example, AAPL is Apple). For each one you'll see:
 
 Click any column title to sort the list by it. **Group by** above the list
 sorts it into sectors, exchanges or an index (such as the Nasdaq-100 or Dow 30).
-Each company also shows its name.
+Click a sector or index row to chart its fund, and double-click it to open or
+close the group. Click an exchange row to open or close it. Each company also shows its name. Next to **Group by** you'll see where the
+prices come from (for example, **SIP, 15 min delayed**).
 
 Last, % Chg and Volume count regular trading hours only (9:30 a.m. to 4:00 p.m.
 New York time). They come from the minute prices, so a close can differ from
@@ -38,6 +41,22 @@ the buttons above the chart to see:
 - **5D**: the last 5 days.
 - **30D**: the last 30 days.
 
+The app keeps 35 days, not 30, so the 30-day change has a starting price from
+before the window.
+
+**Under the chart: a stats panel** that puts the company you clicked next to
+SPY (the S&P 500 fund), so you can compare them:
+
+- **Last**: the latest regular-hours price.
+- **Change 1D, 5D, 30D**: how much the price moved over 1, 5 and 30 days.
+- **Volume**: shares traded on the latest trading day.
+- **Volatility (30D)**: how much the price swings from day to day, over the
+  last 30 days, as a yearly figure. The number in brackets is how many days it
+  is based on, so a figure from only a few days deserves less trust.
+- **Sector**: the company's industry group.
+
+A cell stays blank when there isn't enough data to work it out.
+
 **Light or dark:** use **View** then **System**, **Light** or **Dark**. I've
 only checked this on Linux; Windows and macOS haven't been looked at yet.
 
@@ -48,9 +67,9 @@ its own.
 
 ## What to expect
 
-- **The first time you open it**, the app spends a few minutes downloading a
-  month of prices. The status line shows its progress. You can watch the list
-  fill in while it works.
+- **The first time you open it**, the app spends a few minutes downloading
+  35 days of prices. The status line shows its progress, and the list fills in
+  when it's done.
 - **The first launch after an update** re-downloads about 35 days of prices,
   because the price source changed. It takes a few minutes, like the first time.
 - **After that**, opening the app is quick. It only downloads what's new since
