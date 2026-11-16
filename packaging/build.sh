@@ -4,5 +4,5 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 uv run pyinstaller --noconfirm --windowed "${1:---onedir}" --name StockBars --paths . \
-  --add-data "app/sp500.csv:app" --collect-submodules keyring.backends \
+  --add-data "app/sp500.csv:app" --add-data "app/nasdaq100.csv:app" --add-data "app/dow30.csv:app" --collect-submodules keyring.backends \
   --additional-hooks-dir packaging/hooks app/main.py

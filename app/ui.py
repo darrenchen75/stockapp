@@ -18,12 +18,13 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QMainWindow,
 from app import prefs, sessions, settings, theme, update
 from app.chart import PriceChart
 from app.feed import Poller
+from app.listing import load_listings
 from app.store import ET, Store
 from app.version import VERSION
 
 log = logging.getLogger(__name__)
 
-COLUMNS = ["Symbol", "Last", "% Chg", "Volume", "Gaps"]
+COLUMNS = ["Symbol", "Name", "Last", "% Chg", "Volume", "Gaps"]
 UP, DOWN = QColor("#26a69a"), QColor("#ef5350")
 LIVE_SECONDS = 300 + 900  # SIP bars arrive 15 minutes late
 
@@ -84,6 +85,7 @@ class MainWindow(QMainWindow):
         self.compare = None  # the backtest compare window, once opened
         self.paper = None  # the paper trading window, once opened
         self.store = Store(db_path)
+        self.listings = load_listings()
         self.symbol: str | None = None
         self.poller: Poller | None = None
 
@@ -91,7 +93,10 @@ class MainWindow(QMainWindow):
         self.model.setHorizontalHeaderLabels(COLUMNS)
         self.model.setHeaderData(COLUMNS.index("Gaps"), Qt.Horizontal, "Trading days with no bars in the last 30 days", Qt.ToolTipRole)
         for s in symbols:
-            self.model.appendRow([QStandardItem(s)] + [QStandardItem() for _ in COLUMNS[1:]])
+            row = [QStandardItem() for _ in COLUMNS]
+            row[0].setText(s)
+            row[1].setText(self.listings[s].name if s in self.listings else "")
+            self.model.appendRow(row)
         self.rows = {s: i for i, s in enumerate(symbols)}
         self.proxy = QSortFilterProxyModel()  # re-sorts on data change; source rows stay put
         self.proxy.setSourceModel(self.model)
@@ -322,10 +327,10 @@ class MainWindow(QMainWindow):
             pct = x.pct if x else None
             values = [round(x.last, 2), None if pct is None else round(pct, 2), x.volume] if x else [None] * 3
             values.append(gaps.get(symbol))  # None (no data) = blank, like the other columns
-            for col, value in enumerate(values, start=1):
+            for col, value in enumerate(values, start=COLUMNS.index("Last")):
                 self.model.item(row, col).setData(value, Qt.DisplayRole)  # None = blank cell
             color = None if pct is None else (UP if pct >= 0 else DOWN)
-            self.model.item(row, 2).setData(color, Qt.ForegroundRole)
+            self.model.item(row, COLUMNS.index("% Chg")).setData(color, Qt.ForegroundRole)
         self.model.setHeaderData(COLUMNS.index("Last"), Qt.Horizontal, self.feed_label(), Qt.ToolTipRole)
         self.show_status()
         self.draw()
@@ -353,7 +358,8 @@ class MainWindow(QMainWindow):
             return
         # Always 30 days (+1 for DST slack); the chart's range only picks the view.
         since = (self.store.session_start(self.symbol) or 0) - 31 * 86400
-        self.chart.set_data(self.symbol, self.symbol, self.store.bars(self.symbol, since),
+        name = self.listings[self.symbol].name if self.symbol in self.listings else ""
+        self.chart.set_data(self.symbol, f"{self.symbol} · {name}" if name else self.symbol, self.store.bars(self.symbol, since),
                             sessions.load(self.store), self.feed_label())
 
     def closeEvent(self, event):

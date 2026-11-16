@@ -7,7 +7,7 @@ from platformdirs import user_data_dir, user_log_dir
 from PySide6.QtWidgets import QApplication
 
 from app import prefs, settings, theme, update
-from app.feed import load_symbols
+from app.listing import viewer_symbols
 from app.ui import MainWindow, clean_after_update
 
 APP = "stockapp"
@@ -39,7 +39,7 @@ def main() -> int:
             return 0
         settings.remember(None, keys)
 
-    window = MainWindow(str(data_dir / "bars.db"), load_symbols(), keys, data_dir)
+    window = MainWindow(str(data_dir / "bars.db"), viewer_symbols(), keys, data_dir)
     window.resize(1200, 700)
     window.show()
     return app.exec()

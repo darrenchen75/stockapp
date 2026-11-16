@@ -1,0 +1,31 @@
+Symbol,Name,GICS Sector
+MMM,3M,Industrials
+GOOGL,Alphabet Inc. (Class A),Communication Services
+AXP,American Express,Financials
+AMGN,Amgen,Health Care
+AMZN,Amazon,Consumer Discretionary
+AAPL,Apple Inc.,Information Technology
+BA,Boeing,Industrials
+CAT,Caterpillar Inc.,Industrials
+CVX,Chevron Corporation,Energy
+CSCO,Cisco,Information Technology
+KO,Coca-Cola Company (The),Consumer Staples
+DIS,Walt Disney Company (The),Communication Services
+GS,Goldman Sachs,Financials
+HD,Home Depot (The),Consumer Discretionary
+HON,Honeywell Technologies,Industrials
+IBM,IBM,Information Technology
+JNJ,Johnson & Johnson,Health Care
+JPM,JPMorgan Chase,Financials
+MCD,McDonald's,Consumer Discretionary
+MRK,Merck & Co.,Health Care
+MSFT,Microsoft,Information Technology
+NKE,"Nike, Inc.",Consumer Discretionary
+NVDA,Nvidia,Information Technology
+PG,Procter & Gamble,Consumer Staples
+CRM,Salesforce,Information Technology
+SHW,Sherwin-Williams,Materials
+TRV,Travelers Companies (The),Financials
+UNH,UnitedHealth Group,Health Care
+V,Visa Inc.,Financials
+WMT,Walmart,Consumer Staples
