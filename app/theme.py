@@ -25,7 +25,6 @@ DARK = Colors("#1e1e1e", "#e0e0e0", "#6f94ff", "#66bb6a", "#ef9a9a")
 SHADES = {"#7b3fb0": "#b388ff", "#3a6bff": "#6f94ff", "#c62828": "#ef9a9a"}
 
 ORIGINAL_STYLE: str | None = None
-_original_palette: QPalette | None = None
 _watcher: "Watcher | None" = None
 
 
@@ -47,19 +46,20 @@ def _palette(c: Colors) -> QPalette:
 
 
 def apply(app: QApplication, choice: str) -> None:
-    global ORIGINAL_STYLE, _original_palette
+    global ORIGINAL_STYLE
     if ORIGINAL_STYLE is None:
-        ORIGINAL_STYLE, _original_palette = app.style().name(), QPalette(app.palette())
+        ORIGINAL_STYLE = app.style().name()
     watcher()  # installed before the first change, so every window hears it
     scheme = {"light": Qt.ColorScheme.Light, "dark": Qt.ColorScheme.Dark}.get(choice, Qt.ColorScheme.Unknown)
     app.styleHints().setColorScheme(scheme)
     if scheme != Qt.ColorScheme.Unknown and not _override_took(scheme):
         app.setStyle("Fusion")
         app.setPalette(_palette(DARK if choice == "dark" else LIGHT))
-    else:
-        if app.style().name().lower() != ORIGINAL_STYLE.lower():
-            app.setStyle(ORIGINAL_STYLE)
-        app.setPalette(_original_palette)
+    elif app.style().name().lower() != ORIGINAL_STYLE.lower():  # undo an earlier Fusion fallback
+        app.setStyle(ORIGINAL_STYLE)
+        app.setPalette(QPalette())
+    elif scheme == Qt.ColorScheme.Unknown:
+        app.setPalette(QPalette())  # unpinned, so Qt follows the OS again
 
 
 def colors() -> Colors:

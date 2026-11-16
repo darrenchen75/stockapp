@@ -169,9 +169,7 @@ class PaperWindow(QWidget):
         self.limits_button.clicked.connect(self.edit_limits)
         self.last_label = QLabel()
         self.missed_label = QLabel(wordWrap=True)
-        self.missed_label.setStyleSheet(f"color: {theme.shade('#e65100')}")
         self.cash_label = QLabel(wordWrap=True)
-        self.cash_label.setStyleSheet(red())
 
         self.banner = QWidget()
         self.banner.setStyleSheet("background: #c62828; color: white")
@@ -200,11 +198,13 @@ class PaperWindow(QWidget):
         self.release_button.clicked.connect(self.release)
         self.sell_button.clicked.connect(self.sell_everything)
         self.unresolved = QLabel(wordWrap=True)
-        self.unresolved.setStyleSheet(red())
         self.unresolved.hide()
 
         self.log = QListWidget()
         self.log.itemDoubleClicked.connect(lambda item: self.open_entry(self.log.row(item)))
+        self._message_error = False
+        self.restyle()
+        theme.watcher().changed.connect(self.restyle)
         self.fills_table = QTableWidget()
         self.fills_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.costs = QLabel(wordWrap=True)
@@ -293,7 +293,14 @@ class PaperWindow(QWidget):
             self.refresh()  # halt, loss lock and journals may all have changed
         self.update_buttons()
 
+    def restyle(self) -> None:
+        self.missed_label.setStyleSheet(f"color: {theme.shade('#e65100')}")
+        for label in (self.cash_label, self.unresolved):
+            label.setStyleSheet(red())
+        self.message.setStyleSheet(red() if self._message_error else "")
+
     def say(self, text: str, error: bool = False) -> None:
+        self._message_error = error
         self.message.setStyleSheet(red() if error else "")
         self.message.setText(one_line(text))
 

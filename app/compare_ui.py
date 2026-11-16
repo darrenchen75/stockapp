@@ -201,7 +201,8 @@ class NewRunDialog(QDialog):
         self.note_label = QLabel(note, wordWrap=True)
         self.bar = QProgressBar(visible=False)
         self.error = QLabel(wordWrap=True)
-        self.error.setStyleSheet(f"color: {theme.shade('#c62828')}")
+        self.restyle()
+        theme.watcher().changed.connect(self.restyle)
         self.run_button = QPushButton("Run", default=True)
         self.cancel_button = QPushButton("Cancel")
         self.run_button.clicked.connect(self.request_run)
@@ -216,6 +217,9 @@ class NewRunDialog(QDialog):
         column.addLayout(buttons)
         self.running = False
         self.setMinimumWidth(460)
+
+    def restyle(self) -> None:
+        self.error.setStyleSheet(f"color: {theme.shade('#c62828')}")
 
     def note(self) -> str:
         return self.note_label.text()
