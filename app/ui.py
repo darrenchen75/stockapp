@@ -40,7 +40,7 @@ class StatsPanel(QTableWidget):
         self.setSelectionMode(QAbstractItemView.NoSelection)
         self.horizontalHeader().setStretchLastSection(True)
 
-    def show(self, left: quotes.Quote, right: quotes.Quote, names=("", "SPY")):
+    def set_quotes(self, left: quotes.Quote, right: quotes.Quote, names=("", "SPY")):
         self.setHorizontalHeaderLabels(list(names))
         pct = lambda v: None if v is None else f"{v:+.2f}%"
         for col, q in enumerate((left, right)):
@@ -383,18 +383,18 @@ class MainWindow(QMainWindow):
     def draw(self):
         if self.symbol is None:
             return
+        sess = sessions.load(self.store)
         # Always 30 days (+1 for DST slack); the chart's range only picks the view.
         since = (self.store.session_start(self.symbol) or 0) - 31 * 86400
         name = self.listings[self.symbol].name if self.symbol in self.listings else ""
         self.chart.set_data(self.symbol, f"{self.symbol} · {name}" if name else self.symbol, self.store.bars(self.symbol, since),
-                            sessions.load(self.store), self.feed_label())
-        sess, today = sessions.load(self.store), datetime.now(ET).date()
-        since = int(time.time()) - KEEP_DAYS * 86400
+                            sess, self.feed_label())
+        today, quote_since = datetime.now(ET).date(), int(time.time()) - KEEP_DAYS * 86400
 
         def q(sym):
             lst = self.listings.get(sym) or Listing(sym, "", "", frozenset())
-            return quotes.quote(lst, self.store.bars(sym, since), sess, today)
-        self.stats.show(q(self.symbol), q("SPY"), (self.symbol, "SPY"))
+            return quotes.quote(lst, self.store.bars(sym, quote_since), sess, today)
+        self.stats.set_quotes(q(self.symbol), q("SPY"), (self.symbol, "SPY"))
 
     def closeEvent(self, event):
         if self.updating:  # quitting mid-swap could leave no app installed

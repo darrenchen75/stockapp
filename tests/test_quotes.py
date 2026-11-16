@@ -77,7 +77,13 @@ def test_panel_blanks_none():
     from app.ui import StatsPanel
     QApplication.instance() or QApplication([])
     p = StatsPanel()
-    p.show(quote(L, *build(days(4), [100, 101, 99, 100])[:1], build(days(4), [1] * 4)[1], TODAY), Quote())
+    p.set_quotes(quote(L, *build(days(4), [100, 101, 99, 100])[:1], build(days(4), [1] * 4)[1], TODAY), Quote())
     assert p.item(0, 0).text() == "Acme" and p.item(0, 1).text() == ""
     assert p.item(6, 0).text().endswith("(3 d)") and p.item(6, 1).text() == ""
     assert p.item(4, 0).text() == ""  # 30D change missing
+
+
+def test_stale_symbol_has_no_reference_session():
+    b, s = build([date(2026, 11, 6)], [100])
+    q = quote(L, b, s, TODAY)
+    assert q.last == 100 and q.chg_5d is None and q.chg_30d is None

@@ -35,7 +35,7 @@ def quote(listing: Listing, bars: list[Bar], sessions: list[Session], today: dat
         return (last - ref) / ref * 100 if ref else None  # same form as Summary.pct
 
     def since(n):
-        old = [d for d in order if d <= today - timedelta(days=n)]
+        old = [d for d in order[:-1] if d <= today - timedelta(days=n)]
         return chg(closes[old[-1]]) if old else None
 
     recent = [closes[d] for d in order if d >= today - timedelta(days=30)]
