@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog, QDialogBut
                                QFormLayout, QHBoxLayout, QLabel, QListWidget, QMessageBox, QPushButton, QSplitter,
                                QTableWidget, QTabWidget, QVBoxLayout, QWidget)
 
+from app import theme
 from app.compare_ui import RunDetail, fixed, one_line
 from app.daily import ET
 from app.paper import (FILL_COLUMNS, Broker, Plan, Refusal, account_key, cost_summary, export_fills, kill,
@@ -25,7 +26,8 @@ from app.store import Store
 LIVE_OFF = "Live trading is off: the app has no code signing, so a tampered update could trade real money."
 SIMULATOR_NOTE = ("Alpaca's paper fills are simulated against quotes, so the gap to the official open includes the "
                   "simulator's behaviour, not just real trading costs.")
-RED = "color: #c62828"
+def red() -> str:
+    return f"color: {theme.shade('#c62828')}"
 PAPER_ENDPOINT = "paper-api.alpaca.markets"
 NOT_PAPER = ("These keys don't reach an Alpaca paper account. Nothing will be sent or cancelled from here. To stop "
              "orders on the paper account, use Alpaca's dashboard.")
@@ -167,9 +169,9 @@ class PaperWindow(QWidget):
         self.limits_button.clicked.connect(self.edit_limits)
         self.last_label = QLabel()
         self.missed_label = QLabel(wordWrap=True)
-        self.missed_label.setStyleSheet("color: #e65100")
+        self.missed_label.setStyleSheet(f"color: {theme.shade('#e65100')}")
         self.cash_label = QLabel(wordWrap=True)
-        self.cash_label.setStyleSheet(RED)
+        self.cash_label.setStyleSheet(red())
 
         self.banner = QWidget()
         self.banner.setStyleSheet("background: #c62828; color: white")
@@ -198,7 +200,7 @@ class PaperWindow(QWidget):
         self.release_button.clicked.connect(self.release)
         self.sell_button.clicked.connect(self.sell_everything)
         self.unresolved = QLabel(wordWrap=True)
-        self.unresolved.setStyleSheet(RED)
+        self.unresolved.setStyleSheet(red())
         self.unresolved.hide()
 
         self.log = QListWidget()
@@ -292,7 +294,7 @@ class PaperWindow(QWidget):
         self.update_buttons()
 
     def say(self, text: str, error: bool = False) -> None:
-        self.message.setStyleSheet(RED if error else "")
+        self.message.setStyleSheet(red() if error else "")
         self.message.setText(one_line(text))
 
     # --- account and status ---

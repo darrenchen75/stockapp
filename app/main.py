@@ -6,7 +6,7 @@ from pathlib import Path
 from platformdirs import user_data_dir, user_log_dir
 from PySide6.QtWidgets import QApplication
 
-from app import settings, update
+from app import prefs, settings, theme, update
 from app.feed import load_symbols
 from app.ui import MainWindow, clean_after_update
 
@@ -28,6 +28,7 @@ def main() -> int:
     data_dir.mkdir(parents=True, exist_ok=True)
 
     app = QApplication(sys.argv)
+    theme.apply(app, prefs.load(data_dir).get("theme", "system"))
     # Confirm first: a slow or missing keychain must not run out the old copy's timeout.
     update.confirm_from_argv(sys.argv)
     clean_after_update(data_dir)

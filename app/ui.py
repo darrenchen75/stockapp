@@ -11,12 +11,12 @@ import pyqtgraph as pg
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from PySide6.QtCore import QLockFile, QPointF, QRectF, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPicture, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QActionGroup, QColor, QDesktopServices, QPainter, QPicture, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QHBoxLayout, QMainWindow,
                                QMessageBox, QProgressDialog, QPushButton, QSplitter, QTableView,
                                QVBoxLayout, QWidget)
 
-from app import settings, update
+from app import prefs, settings, theme, update
 from app.feed import Poller
 from app.store import ET, Bar, Store
 from app.version import VERSION
@@ -153,6 +153,16 @@ class MainWindow(QMainWindow):
         split.addWidget(right)
         split.setSizes([520, 680])
         self.setCentralWidget(split)
+        view = self.menuBar().addMenu("View")
+        self.theme_actions = {}
+        theme_group = QActionGroup(self)
+        current = prefs.load(data_dir).get("theme", "system")
+        for choice in theme.CHOICES:
+            action = view.addAction(choice.capitalize(), lambda c=choice: self.set_theme(c))
+            action.setCheckable(True)
+            action.setChecked(choice == current)
+            theme_group.addAction(action)
+            self.theme_actions[choice] = action
         tools = self.menuBar().addMenu("Tools")
         tools.addAction("Backtests…", self.open_backtests)
         tools.addAction("Paper trading…", self.open_paper)
@@ -339,6 +349,10 @@ class MainWindow(QMainWindow):
 
     def restart_poller(self):
         self.start_poller(self.keys)
+
+    def set_theme(self, choice: str) -> None:
+        theme.apply(QApplication.instance(), choice)
+        prefs.save(self.data_dir, theme=choice)
 
     def refresh(self):
         summaries, gaps = self.store.summary(), self.store.gaps(self.symbols)
