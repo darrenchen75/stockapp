@@ -13,12 +13,13 @@ from alpaca.trading.client import TradingClient
 from PySide6.QtCore import QLockFile, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QActionGroup, QColor, QDesktopServices, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QMainWindow,
-                               QMessageBox, QProgressDialog, QSplitter, QTableView)
+                               QMessageBox, QProgressDialog, QSplitter, QTableView, QTableWidget,
+                               QTableWidgetItem)
 
-from app import prefs, sessions, settings, theme, update
+from app import prefs, quotes, sessions, settings, theme, update
 from app.chart import PriceChart
-from app.feed import Poller
-from app.listing import load_listings
+from app.feed import KEEP_DAYS, Poller
+from app.listing import Listing, load_listings
 from app.store import ET, Store
 from app.version import VERSION
 
@@ -27,6 +28,27 @@ log = logging.getLogger(__name__)
 COLUMNS = ["Symbol", "Name", "Last", "% Chg", "Volume", "Gaps"]
 UP, DOWN = QColor("#26a69a"), QColor("#ef5350")
 LIVE_SECONDS = 300 + 900  # SIP bars arrive 15 minutes late
+
+
+class StatsPanel(QTableWidget):
+    ROWS = ["Name", "Last", "Change 1D", "Change 5D", "Change 30D", "Volume", "Volatility (30D)", "Sector"]
+
+    def __init__(self):
+        super().__init__(len(self.ROWS), 2)
+        self.setVerticalHeaderLabels(self.ROWS)
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.setSelectionMode(QAbstractItemView.NoSelection)
+        self.horizontalHeader().setStretchLastSection(True)
+
+    def show(self, left: quotes.Quote, right: quotes.Quote, names=("", "SPY")):
+        self.setHorizontalHeaderLabels(list(names))
+        pct = lambda v: None if v is None else f"{v:+.2f}%"
+        for col, q in enumerate((left, right)):
+            vol = None if q.vol is None else f"{q.vol * 100:.1f}% ({q.vol_n} d)"
+            cells = [q.name, None if q.last is None else f"{q.last:,.2f}", pct(q.chg_1d), pct(q.chg_5d),
+                     pct(q.chg_30d), None if q.volume is None else f"{q.volume:,.0f}", vol, q.sector]
+            for row, text in enumerate(cells):
+                self.setItem(row, col, QTableWidgetItem(text or ""))
 
 
 def update_lock(data_dir: Path) -> QLockFile:
@@ -113,9 +135,14 @@ class MainWindow(QMainWindow):
 
         self.chart = PriceChart()
 
+        self.stats = StatsPanel()
+        right = QSplitter(Qt.Vertical)
+        right.addWidget(self.chart)
+        right.addWidget(self.stats)
+        right.setSizes([480, 220])
         split = QSplitter()
         split.addWidget(self.table)
-        split.addWidget(self.chart)
+        split.addWidget(right)
         split.setSizes([520, 680])
         self.setCentralWidget(split)
         view = self.menuBar().addMenu("View")
@@ -361,6 +388,13 @@ class MainWindow(QMainWindow):
         name = self.listings[self.symbol].name if self.symbol in self.listings else ""
         self.chart.set_data(self.symbol, f"{self.symbol} · {name}" if name else self.symbol, self.store.bars(self.symbol, since),
                             sessions.load(self.store), self.feed_label())
+        sess, today = sessions.load(self.store), datetime.now(ET).date()
+        since = int(time.time()) - KEEP_DAYS * 86400
+
+        def q(sym):
+            lst = self.listings.get(sym) or Listing(sym, "", "", frozenset())
+            return quotes.quote(lst, self.store.bars(sym, since), sess, today)
+        self.stats.show(q(self.symbol), q("SPY"), (self.symbol, "SPY"))
 
     def closeEvent(self, event):
         if self.updating:  # quitting mid-swap could leave no app installed
