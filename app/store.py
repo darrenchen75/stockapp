@@ -224,9 +224,9 @@ class Store:
                 last = volume = prev = None
                 for x in sorted(sessions, key=lambda x: x.day, reverse=True):
                     row = self.db.execute(
-                        "SELECT c, (SELECT SUM(v) FROM bars WHERE symbol = ?1 AND ts >= ?2 AND ts < ?3)"
-                        " FROM bars WHERE symbol = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts DESC LIMIT 1",
-                        (s, x.open, x.close)).fetchone()
+                        "SELECT c, (SELECT SUM(v) FROM bars WHERE symbol = ? AND ts >= ? AND ts < ?)"
+                        " FROM bars WHERE symbol = ? AND ts >= ? AND ts < ? ORDER BY ts DESC LIMIT 1",
+                        (s, x.open, x.close, s, x.open, x.close)).fetchone()
                     if row is None:
                         continue
                     if last is None:

@@ -1,4 +1,5 @@
 import sqlite3
+import warnings
 from datetime import datetime
 
 import pytest
@@ -142,6 +143,14 @@ def test_summary_before_open_shows_previous_session(tmp_path):
               bar("A", ts(2026, 10, 19, 8, 0), c=120.0, v=9)])
     x = s.summary(SESSIONS)["A"]
     assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 20)
+
+
+def test_summary_raises_no_warnings(tmp_path):  # sqlite3 deprecates mixed placeholder styles
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 16, 15, 59))])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert "A" in s.summary(SESSIONS)
 
 
 def test_summary_early_close(tmp_path):
