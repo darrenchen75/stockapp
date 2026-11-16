@@ -1,7 +1,7 @@
 # Stock Bars
 
 Stock Bars shows you minute-by-minute prices for every company in the S&P 500,
-right on your computer. It keeps the last 30 days of prices and updates every
+right on your computer. It keeps the last 35 days of prices and updates every
 minute while the stock market is open.
 
 It only shows prices. It never touches your real money. The only buying and
@@ -21,15 +21,25 @@ example, AAPL is Apple). For each one you'll see:
 - **Gaps**: how many market days in the past month are missing prices for that
   company. Usually 0. A higher number means some of its history is incomplete.
 
-Click any column title to sort the list by it.
+Click any column title to sort the list by it. **Group by** above the list
+sorts it into sectors, exchanges or an index (such as the Nasdaq-100 or Dow 30).
+Each company also shows its name.
+
+Last, % Chg and Volume count regular trading hours only (9:30 a.m. to 4:00 p.m.
+New York time). They come from the minute prices, so a close can differ from
+the official closing price by a few cents.
 
 **On the right: a price chart** for whichever company you click. Each small
 bar is one minute: green if the price rose during that minute, red if it fell.
-Use the buttons above the chart to see:
+The chart uses the full market's prices (SIP), shown 15 minutes behind. Use
+the buttons above the chart to see:
 
 - **1D**: the latest trading day.
 - **5D**: the last 5 days.
 - **30D**: the last 30 days.
+
+**Light or dark:** use **View** then **System**, **Light** or **Dark**. I've
+only checked this on Linux; Windows and macOS haven't been looked at yet.
 
 **At the bottom: a status line.** It says **Live** while new prices are coming
 in. It says **Market closed** outside trading hours, with the time of the
@@ -41,6 +51,8 @@ its own.
 - **The first time you open it**, the app spends a few minutes downloading a
   month of prices. The status line shows its progress. You can watch the list
   fill in while it works.
+- **The first launch after an update** re-downloads about 35 days of prices,
+  because the price source changed. It takes a few minutes, like the first time.
 - **After that**, opening the app is quick. It only downloads what's new since
   you last used it.
 - **Prices update every minute** on weekdays from about 8:00 a.m. to 5:00 p.m.
@@ -49,9 +61,8 @@ its own.
   prices from before trading stopped.
 - **Some minutes have no bar.** Quiet stocks don't trade every minute, so their
   charts can have small empty spaces. This is normal.
-- **Volume looks lower than on other websites.** The free price source sees
-  only part of the market's trading. Prices are accurate, but volume numbers
-  are smaller than the full-market totals you see elsewhere.
+- **Prices are 15 minutes behind.** That's how Alpaca's free plan delivers
+  full-market data.
 - **Stock splits are handled for you.** When a company splits its stock, the
   app fixes that company's past prices so the chart doesn't show a sudden fake
   drop or jump.
