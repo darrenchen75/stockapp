@@ -21,6 +21,7 @@ T = TypeVar("T")
 DAYS = 30                    # the chart's 30D window and the Gaps column
 KEEP_DAYS = 35               # minute bars kept: 30 days plus a reference close for "Change 30D"
 DELAY = timedelta(minutes=15)  # the free plan rejects SIP data newer than this
+MARGIN = timedelta(minutes=1)  # slack for a local clock running ahead of Alpaca's
 MAX_SYMBOLS = 100            # symbols per request
 MAX_SPAN = 10 * DAYS * 1440  # symbol-minutes per request (10 symbols x 30 days, ~120k bars) bounds memory
 RETRIES = 5
@@ -97,7 +98,7 @@ def fetch(client, symbols, start, end, sleep=time.sleep):
 def backfill(client, store: Store, symbols, include_empty=True, now=None,
              sleep=time.sleep, progress=lambda done, total: None,
              stop: threading.Event | None = None) -> int:
-    end = (now or datetime.now(timezone.utc)) - DELAY
+    end = (now or datetime.now(timezone.utc)) - DELAY - MARGIN
     jobs = plan(symbols, store.latest_all(), end, include_empty)
     count = 0
     for i, (batch, start) in enumerate(jobs, 1):
@@ -112,6 +113,13 @@ def backfill(client, store: Store, symbols, include_empty=True, now=None,
     return count
 
 
+def key_rejected(e) -> bool:
+    """401/403, except a 403 about recent SIP data: the local clock ran ahead of Alpaca's, so retry."""
+    status = getattr(e, "status_code", None)
+    text = str(e).lower()
+    return status == 401 or (status == 403 and not any(w in text for w in ("sip", "subscription", "recent")))
+
+
 def log_missing(symbols, latest):
     missing = sorted(set(symbols) - latest.keys())
     if missing:
@@ -121,15 +129,20 @@ def log_missing(symbols, latest):
 def migrate(client, store: Store, symbols, now=None, sleep=time.sleep,
             progress=lambda done, total: None, stop: threading.Event | None = None) -> bool:
     """Download KEEP_DAYS of SIP bars into staging, then swap them in for the IEX bars in one
-    transaction. Resumes from staging. False if stopped first (nothing swapped); errors propagate."""
-    end = (now or datetime.now(timezone.utc)) - DELAY
+    transaction. Resumes from staging. False if stopped first, or if SIP gave no bars at all while IEX
+    bars exist (nothing swapped, staging kept); errors propagate."""
+    end = (now or datetime.now(timezone.utc)) - DELAY - MARGIN
     jobs = plan(symbols, store.staged_latest_all(), end, include_empty=True)
     for i, (batch, start) in enumerate(jobs, 1):
         if stop and stop.is_set():
             return False
         store.upsert_staged(fetch(client, batch, start, end, sleep))  # per batch: a restart resumes here
         progress(i, len(jobs))
-    log_missing(symbols, store.staged_latest_all())
+    staged = store.staged_latest_all()
+    if not staged and store.latest() is not None:
+        log.warning("SIP returned no bars; keeping the IEX bars and retrying later")
+        return False
+    log_missing(symbols, staged)
     store.swap_staged()
     return True
 
@@ -141,7 +154,7 @@ def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.s
     only after its ex-date, since Alpaca may not have adjusted history yet on the day itself.
     Returns how many splits are still pending: empty refetch, ex-date is today, or skipped by stop."""
     now = now or datetime.now(timezone.utc)
-    end = now - DELAY
+    end = now - DELAY - MARGIN
     today = now.astimezone(ET).date()
     data = actions.get_corporate_actions(CorporateActionsRequest(
         symbols=symbols, start=today - timedelta(days=KEEP_DAYS), end=today,
@@ -199,16 +212,21 @@ class Poller:
         while not self.stop.is_set():
             try:
                 if store.meta("feed") != "sip":
-                    if not migrate(self.client, store, self.symbols, progress=self.on_progress,
-                                   sleep=self.stop.wait, stop=self.stop):
-                        return  # stopped; the next launch resumes from staging
+                    done = migrate(self.client, store, self.symbols, progress=self.on_progress,
+                                   sleep=self.stop.wait, stop=self.stop)
+                    if self.stop.is_set():
+                        return  # the next launch resumes from staging
+                    if not done:  # SIP had no bars at all: keep IEX, try again later
+                        self.on_status(f"No SIP bars yet — retrying in {self.poll_seconds}s")
+                        self.stop.wait(self.poll_seconds)
+                        continue
                     self.on_updated()
                 backfill(self.client, store, self.symbols, include_empty=first,
                          progress=self.on_progress, sleep=self.stop.wait, stop=self.stop)
             except Exception as e:
                 if self.stop.is_set():
                     return  # the wait was cut short by stop; the error is just fallout
-                if getattr(e, "status_code", None) in (401, 403):
+                if key_rejected(e):
                     log.warning("key rejected: %s", e)
                     self.on_auth_failed()
                     return

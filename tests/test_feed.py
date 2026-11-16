@@ -12,7 +12,8 @@ NOW = datetime(2026, 10, 19, 15, 0, tzinfo=timezone.utc)
 NOW_TS = int(NOW.timestamp())
 FLOOR = NOW - timedelta(days=30)
 KEEP_FLOOR = NOW - timedelta(days=35)
-END = NOW - timedelta(minutes=15)
+END = NOW - timedelta(minutes=16)  # 15-minute SIP delay plus a minute for clock skew
+SIP_403 = "subscription does not permit querying recent SIP data"
 
 
 def fake_bar(t: datetime, c=10.0):
@@ -20,8 +21,8 @@ def fake_bar(t: datetime, c=10.0):
 
 
 class HTTPError(Exception):
-    def __init__(self, status, headers=None):
-        super().__init__(f"HTTP {status}")
+    def __init__(self, status, headers=None, message=None):
+        super().__init__(message or f"HTTP {status}")
         self.status_code = status
         self.response = SimpleNamespace(headers=headers or {})
 
@@ -179,7 +180,7 @@ def test_fetch_asks_for_sip_ending_15_minutes_ago(tmp_path):
 
 def test_backfill_resumes_from_last_bar(tmp_path):
     store = Store(str(tmp_path / "bars.db"))
-    t1, t2 = NOW - timedelta(minutes=20), NOW - timedelta(minutes=16)
+    t1, t2 = NOW - timedelta(minutes=20), NOW - timedelta(minutes=17)
     client = FakeClient({"AAPL": [fake_bar(t1), fake_bar(t2)]})
     progress = []
     n = feed.backfill(client, store, ["AAPL", "GONE"], now=NOW, progress=lambda d, t: progress.append((d, t)))
@@ -197,16 +198,36 @@ def sip(db):
     return db
 
 
-@pytest.mark.parametrize("migrated", [False, True])  # a data-client 401 is a real key failure in both phases
-def test_poller_stops_on_rejected_key(tmp_path, migrated):
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("migrated", [False, True])  # a data-client 401/403 is a real key failure in both phases
+def test_poller_stops_on_rejected_key(tmp_path, migrated, status):
     seen = []
     db = str(tmp_path / "bars.db")
     if migrated:
         sip(db)
-    p = feed.Poller(FakeClient(errors=[HTTPError(401)]), db, ["AAPL"],
+    p = feed.Poller(FakeClient(errors=[HTTPError(status)]), db, ["AAPL"],
                     on_auth_failed=lambda: seen.append("auth"))
     p.run()  # must return instead of looping
     assert seen == ["auth"]
+
+
+def test_requests_end_a_minute_before_the_sip_delay():
+    assert feed.DELAY == timedelta(minutes=15) and feed.MARGIN == timedelta(minutes=1)
+
+
+@pytest.mark.parametrize("migrated", [False, True])
+def test_poller_treats_recent_sip_403_as_offline(tmp_path, migrated):
+    # The local clock running ahead of Alpaca's makes the end too recent: retry, don't ask for keys.
+    db = str(tmp_path / "bars.db")
+    if migrated:
+        sip(db)
+    client = FakeClient(errors=[HTTPError(403, message=SIP_403)])
+    statuses, seen = [], []
+    p = feed.Poller(client, db, ["AAPL"], poll_seconds=0, retry_seconds=0,
+                    on_status=statuses.append, on_auth_failed=lambda: seen.append("auth"))
+    p.on_updated = p.stop.set
+    p.run()
+    assert seen == [] and statuses == ["Offline — retrying in 0s"] and len(client.requests) == 2
 
 
 def test_poller_reports_offline_and_retries(tmp_path):
@@ -303,7 +324,7 @@ def test_backfill_stops_between_batches(tmp_path):
     stop = threading.Event()
     client = FakeClient()
     n = feed.backfill(client, store, syms(25), now=NOW, stop=stop,
-                      progress=lambda d, t: stop.set())  # 3 batches of 10; stop after the first
+                      progress=lambda d, t: stop.set())  # 4 batches of 8; stop after the first
     assert n == 0 and len(client.requests) == 1
 
 
@@ -388,6 +409,26 @@ def test_migrate_stop_returns_false_and_resume_finishes(tmp_path):
     assert {x for r in c.requests for x in r.symbol_or_symbols} == set(syms(20)) - first
     assert s.latest_all() == {x: int(END.timestamp()) for x in syms(20)}  # IEX-only "A" is gone
     assert s.meta("feed") == "sip" and s.staged_latest_all() == {}
+
+
+def test_migrate_with_no_sip_bars_keeps_iex_bars(tmp_path):
+    s = Store(str(tmp_path / "bars.db")); iex(s)
+    assert feed.migrate(StrictClient(now=NOW), s, syms(20), now=NOW) is False
+    assert s.latest_all() == {"A": NOW_TS - 3600} and s.meta("feed") is None
+
+
+def test_poller_retries_migration_that_found_no_sip_bars(tmp_path):
+    db = str(tmp_path / "bars.db")
+    iex(Store(db))
+    client = FakeClient()
+    statuses = []
+    p = feed.Poller(client, db, ["A"], poll_seconds=0, on_status=statuses.append)
+    p.on_progress = lambda d, t: client.data.update(A=[fake_bar(END, c=7.0)])  # empty first, bars on the retry
+    p.on_updated = p.stop.set
+    p.run()
+    assert statuses == ["No SIP bars yet — retrying in 0s"]
+    s = Store(db)
+    assert s.meta("feed") == "sip" and [b.c for b in s.bars("A", 0)] == [7.0]
 
 
 def test_migrate_fresh_install_swaps_in_what_it_fetched(tmp_path):

@@ -189,7 +189,7 @@ class Store:
         )
         return [Bar(*r) for r in rows]
 
-    def prune(self, days: int = 30, now: float | None = None) -> int:
+    def prune(self, days: int, now: float | None = None) -> int:
         cutoff = int(time.time() if now is None else now) - days * 86400
         with self.db:
             return self.db.execute("DELETE FROM bars WHERE ts < ?", (cutoff,)).rowcount
