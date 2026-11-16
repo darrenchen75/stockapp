@@ -7,25 +7,23 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import pyqtgraph as pg
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.trading.client import TradingClient
-from PySide6.QtCore import QLockFile, QPointF, QRectF, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QActionGroup, QColor, QDesktopServices, QPainter, QPicture, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QHBoxLayout, QMainWindow,
-                               QMessageBox, QProgressDialog, QPushButton, QSplitter, QTableView,
-                               QVBoxLayout, QWidget)
+from PySide6.QtCore import QLockFile, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QActionGroup, QColor, QDesktopServices, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QMainWindow,
+                               QMessageBox, QProgressDialog, QSplitter, QTableView)
 
-from app import prefs, settings, theme, update
+from app import prefs, sessions, settings, theme, update
+from app.chart import PriceChart
 from app.feed import Poller
-from app.store import ET, Bar, Store
+from app.store import ET, Store
 from app.version import VERSION
 
 log = logging.getLogger(__name__)
 
 COLUMNS = ["Symbol", "Last", "% Chg", "Volume", "Gaps"]
-RANGES = {"1D": None, "5D": 5, "30D": 30}  # None = since the start of the latest session
 UP, DOWN = QColor("#26a69a"), QColor("#ef5350")
 LIVE_SECONDS = 300
 
@@ -43,32 +41,6 @@ def clean_after_update(data_dir: Path):
         update.cleanup(update.target(sys.platform, sys.executable, os.environ), sys.platform)
     finally:
         lock.unlock()
-
-
-class Candles(pg.GraphicsObject):
-    """Minute candles drawn once into a QPicture (pyqtgraph's custom-item pattern)."""
-
-    def __init__(self, bars: list[Bar]):
-        super().__init__()
-        self.bounds = QRectF(bars[0].ts, min(b.l for b in bars),
-                             bars[-1].ts + 60 - bars[0].ts,
-                             max(b.h for b in bars) - min(b.l for b in bars))
-        self.picture = QPicture()
-        p = QPainter(self.picture)
-        for b in bars:
-            color = UP if b.c >= b.o else DOWN
-            p.setPen(pg.mkPen(color))
-            p.setBrush(pg.mkBrush(color))
-            mid = b.ts + 30
-            p.drawLine(QPointF(mid, b.l), QPointF(mid, b.h))
-            p.drawRect(QRectF(mid - 20, b.o, 40, b.c - b.o))
-        p.end()
-
-    def paint(self, painter, *args):
-        painter.drawPicture(0, 0, self.picture)
-
-    def boundingRect(self):
-        return self.bounds
 
 
 class UpdateProgress(QProgressDialog):
@@ -113,7 +85,6 @@ class MainWindow(QMainWindow):
         self.paper = None  # the paper trading window, once opened
         self.store = Store(db_path)
         self.symbol: str | None = None
-        self.range = "1D"
         self.poller: Poller | None = None
 
         self.model = QStandardItemModel(0, len(COLUMNS))
@@ -135,23 +106,11 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().hide()
         self.table.selectionModel().currentRowChanged.connect(self.on_select)
 
-        self.plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem()})
-        buttons = QHBoxLayout()
-        group = QButtonGroup(self)
-        for name in RANGES:
-            button = QPushButton(name, checkable=True, checked=name == self.range)
-            button.clicked.connect(lambda _=False, n=name: self.set_range(n))
-            group.addButton(button)
-            buttons.addWidget(button)
-        buttons.addStretch()
-        right = QWidget()
-        column = QVBoxLayout(right)
-        column.addLayout(buttons)
-        column.addWidget(self.plot)
+        self.chart = PriceChart()
 
         split = QSplitter()
         split.addWidget(self.table)
-        split.addWidget(right)
+        split.addWidget(self.chart)
         split.setSizes([520, 680])
         self.setCentralWidget(split)
         view = self.menuBar().addMenu("View")
@@ -385,20 +344,13 @@ class MainWindow(QMainWindow):
         self.symbol = self.model.item(self.proxy.mapToSource(current).row(), 0).text()
         self.draw()
 
-    def set_range(self, name: str):
-        self.range = name
-        self.draw()
-
     def draw(self):
-        self.plot.clear()
         if self.symbol is None:
             return
-        days = RANGES[self.range]
-        since = (self.store.session_start(self.symbol) or 0) if days is None else int(time.time()) - days * 86400
-        bars = self.store.bars(self.symbol, since)
-        self.plot.setTitle(f"{self.symbol} · {self.range}")
-        if bars:
-            self.plot.addItem(Candles(bars))
+        # Always 30 days (+1 for DST slack); the chart's range only picks the view.
+        since = (self.store.session_start(self.symbol) or 0) - 31 * 86400
+        self.chart.set_data(self.symbol, self.symbol, self.store.bars(self.symbol, since),
+                            sessions.load(self.store), "")
 
     def closeEvent(self, event):
         if self.updating:  # quitting mid-swap could leave no app installed
