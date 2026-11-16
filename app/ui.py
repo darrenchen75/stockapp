@@ -156,6 +156,8 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Group by"))
         bar.addWidget(self.group_by_box)
+        self.feed_tag = QLabel()
+        bar.addWidget(self.feed_tag)
         bar.addStretch()
         left = QWidget()
         box = QVBoxLayout(left)
@@ -455,6 +457,7 @@ class MainWindow(QMainWindow):
             self.group_rows[g.name][0].setData(g, Qt.UserRole)
             paint(self.group_rows[g.name][pct_col], g.avg_pct)
         self.model.setHeaderData(COLUMNS.index("Last"), Qt.Horizontal, self.feed_label(), Qt.ToolTipRole)
+        self.feed_tag.setText(self.feed_label())
         self.show_status()
         self.draw()
 

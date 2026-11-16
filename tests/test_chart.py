@@ -152,7 +152,7 @@ def test_main_window_labels_the_feed(qapp, tmp_path, monkeypatch):
         if marker:
             w.store.set_meta("feed", marker)
         w.refresh()
-        assert w.feed_label() == label and w.chart.feed_label == label
+        assert w.feed_label() == label and w.chart.feed_label == label and w.feed_tag.text() == label
         assert w.statusBar().currentMessage().endswith(label)
         assert label in w.model.headerData(ui.COLUMNS.index("Last"), Qt.Horizontal, Qt.ToolTipRole)
     w.close()
