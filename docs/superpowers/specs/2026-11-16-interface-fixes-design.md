@@ -1,6 +1,6 @@
 # Interface Fixes (Feedback Part 2) Design
 
-Date: 2026-11-16. Status: draft for owner approval (builder-checked). Branch `feat/interface`, based on
+Date: 2026-11-16. Status: draft for owner approval (builder-checked, Codex adversarial review fixed). Branch `feat/interface`, based on
 `feat/risk-stats` (head 5f7fde9). Building starts after the Task 11 part B live paper check
 on `feat/risk-stats` has run and that branch is finished.
 
@@ -81,6 +81,10 @@ the data source for the minute chart, so Part 2 can go first.
   is also an ETF table mapping each ETF to its name and to the group it stands for. That table
   can be a small constant in code. The README says where each list came from and its date.
   Lists are refreshed by hand.
+- **Packaging** *(Codex review)*: `packaging/build.sh` bundles only `app/sp500.csv` today
+  (`--add-data`). It must also bundle both new CSVs. The packaged selftest (`--selftest`, run
+  by `tests/test_selftest.py` and the build) must load the full viewer symbol list with names
+  and sectors, so a missing file fails the build rather than the reviewer's launch.
 - Exchange comes from Alpaca's asset list (`TradingClient.get_all_assets`, field `exchange`).
   It is fetched in the background and cached in `bars.db`, then refreshed at most once a
   week. Until it loads, the "exchange" grouping shows a single "Unknown" group. *(My call:
@@ -99,10 +103,24 @@ the data source for the minute chart, so Part 2 can go first.
   since the free plan rejects SIP data newer than that. `app/daily.py` already does this.
   Backfill, the poller and `repair_splits` all follow this rule.
 - First launch after the update: a marker in `bars.db` records the feed. When the marker is
-  missing or says IEX, all minute bars are deleted and the 35-day backfill runs again from
-  SIP. The marker is written only after the backfill completes, so an interrupted run starts
-  over. The existing first-run progress UI is reused. The `splits` table stays, because SIP
-  bars are split-adjusted the same way.
+  missing or says IEX, a migration runs. **It never deletes the working IEX bars before
+  their replacement is complete.** *(Codex review.)*
+  - SIP bars download into a separate staging table with the same layout as `bars`. The
+    existing batching and per-batch commits apply, so an interrupted migration resumes from
+    the staging table on the next launch instead of starting over.
+  - While it runs, the chart and list keep showing the IEX bars and are labelled "IEX, switching
+    to SIP…". The existing first-run progress UI shows progress. The poller doesn't add new
+    IEX bars during the migration.
+  - It is complete only when every batch of the plan was fetched without an error and without
+    a stop request. Symbols for which Alpaca returned no bars count as fetched. They are logged,
+    as backfill does today. `backfill` must report this outcome explicitly, because today it
+    returns normally after a stop, so its return alone proves nothing.
+  - On completion, one transaction does three things: replaces the contents of `bars` with the
+    staging rows, drops the staging table, and writes the marker "sip". If anything fails before
+    that commit, the IEX bars and the old marker are untouched.
+  - The `splits` table stays, because SIP bars are split-adjusted the same way. A split repair
+    that lands during the migration also refetches into staging, so the staged bars are
+    adjusted too.
 - The chart and the list header say "SIP, 15 min delayed". The status bar shows the time of
   the newest bar as before. Its "live" check (`LIVE_SECONDS` in `app/ui.py`) allows for the
   15-minute delay, so it doesn't always read "Market closed". *(My call.)*
@@ -117,8 +135,18 @@ the data source for the minute chart, so Part 2 can go first.
 - A title gives the symbol, company name and range (e.g. "AAPL · Apple Inc. · 5D"). The axes
   are labelled: time on the bottom, in New York time, and "Price (USD)" on the left.
 - The bottom axis is a date/time axis whose ticks fit the range: times of day for 1D, and
-  days for 5D and 30D. Nights, weekends and holidays have no bars and are collapsed, so the
-  line has no long flat gaps. *(My call: collapse them; how is left to the builder.)*
+  days for 5D and 30D. Time outside the extended trading day (04:00-20:00 ET) is collapsed,
+  and so are days that aren't sessions in the session calendar (weekends, holidays). The
+  line therefore has no long flat gaps. Missing minutes *inside* the trading day, such as
+  halts or no trades, are not collapsed. They show as gaps, so the chart doesn't hide them.
+  *(My call: collapse them.)*
+- **Stable coordinates** *(Codex review)*: the x position of a bar is a fixed function of its
+  timestamp: trading-day minutes elapsed since a fixed anchor, computed from the session
+  calendar. It is never an ordinal of the currently loaded bars. A refresh, pruning, or a late
+  bar therefore never shifts other bars. When the user has zoomed or panned, the view is held
+  as a pair of timestamps and re-applied through the same mapping after each redraw. Switching
+  symbols keeps a held view's timestamps. Tick labels map x back to New York time with the
+  inverse function.
 - A bold close-price line is drawn over faint candles. Up/down candle colours stay as they
   are, at low opacity. The line colour is theme-aware.
 - The mouse wheel zooms the time axis only. Dragging pans in time. The price axis auto-fits
@@ -138,18 +166,35 @@ itself is selected, both columns show SPY. Rows:
 | Row | Definition |
 |---|---|
 | Name | Company or ETF name |
-| Last price | Latest regular-session bar's close: the newest bar at or before 16:00 ET (15 min delayed during the session; frozen at the 16:00 close afterwards) |
-| Change 1D / 5D / 30D | % change from a reference regular-session close to the last price. 1D: the previous session's close. 5D/30D: see below |
-| Volume | Shares traded 09:30-16:00 ET in the latest session |
+| Last price | Close of the latest regular-session bar (15 min delayed during the session; fixed at the session's last regular bar afterwards) |
+| Change 1D / 5D / 30D | % change from a reference session close to the last price. 1D: the previous session's close. 5D/30D: see below |
+| Volume | Shares traded in the latest session's regular hours |
 | Volatility (30D) | Std of daily close-to-close returns over the last 30 days × √252, with the number of returns shown, e.g. "21.4% (20 d)" |
 | Sector | GICS sector, "ETF" for ETFs |
 
 - **Owner's decision: regular session only.** Last, % changes, Volume and volatility use
-  regular-session bars (09:30-16:00 ET). A session's close is its last bar at or before
-  16:00 ET. Pre- and post-market bars are left out of every number, so the figures match
-  published quotes. They still appear on the chart. The same rule applies to the list's
-  Last, % Chg and Volume and to the group averages. `Store.summary()` changes to this rule,
-  so the list and the panel never disagree for the same symbol.
+  regular-session bars only. Pre- and post-market bars are left out of every number, so the
+  figures match published quotes. They still appear on the chart. The same rule applies to
+  the list's Last, % Chg and Volume and to the group averages. `Store.summary()` changes to
+  this rule, so the list and the panel never disagree for the same symbol.
+- **Session boundaries** *(Codex review)*:
+  - A session's open and close times come from the **session calendar** below, not from fixed
+    09:30/16:00, so early-close days (e.g. 13:00) are right.
+  - `Bar.ts` is the bar's *start* (Alpaca's convention). A bar is in the regular session when
+    `open <= ts < close`. The 16:00 bar holds trades after 16:00, so it is excluded.
+  - A session's close is the close of its last regular bar. It is derived from minute bars,
+    not the official closing-auction price, and can differ from published closes by a few
+    cents. The README says so.
+  - Before today's open, the "latest session" is the previous one. Last and 1D then show that
+    session's figures, as quote sites do before the open. Pre-market bars never count.
+  - Tests cover an early-close day, the closing minute (the 16:00 bar is excluded), a day with
+    only pre-market bars so far, and a session with no regular bars (blank, never 0).
+- **Session calendar** *(Codex review)*: Alpaca's market calendar (`get_calendar`, open and
+  close per date), fetched from the **paper** trading endpoint under the same rules as the
+  exchange lookup. It is cached in `bars.db` and refreshed at most daily. It covers the kept
+  35 days and the next 10. If it has never loaded, sessions fall back to weekdays that have bars,
+  with 09:30-16:00 hours. That fallback is logged and gets early closes wrong. The chart's
+  gap collapsing uses the same calendar.
 - *(My call.)* The 5D/30D reference is the close of the latest session whose date is on or
   before the date that many calendar days back, New York time. This matches the chart
   buttons. If there is not enough data, the cell is blank, never 0.
@@ -180,6 +225,18 @@ itself is selected, both columns show SPY. Rows:
 - Default: follow the OS (Qt 6.12 `QStyleHints.colorScheme`, with live changes followed).
 - Override: a View menu choice of System / Light / Dark, applied with
   `QStyleHints.setColorScheme`. It is remembered between launches.
+- **Fallback** *(Codex review)*: Qt documents that the override is unsupported on some
+  platforms. After requesting a scheme, the app checks the effective scheme. If it didn't
+  take, the app switches to the Fusion style with its own light or dark `QPalette`, set on
+  the whole application. "System" undoes the fallback.
+- **One place applies it.** A small theme module owns the choice and the fallback. It also
+  owns the custom colours for plots, candles and run lines. Custom colours are re-read on the
+  *effective palette change*: `QEvent.ApplicationPaletteChange` / `QGuiApplication.paletteChanged`.
+  They are not re-read on `colorSchemeChanged`, which Qt fires before the palette updates.
+  Windows opened later, such as Backtests, Paper and dialogs, read the current colours when
+  they are built and then follow the same signal.
+- Native check: the owner looks at both themes on Linux before finishing. Windows and macOS
+  are not checked on this computer, and the README says so.
 - It covers every window: main, Backtests (compare), Paper, and their dialogs. pyqtgraph
   plots get matching backgrounds, axis, text and line colours. Fixed colours in code, like
   `UP`/`DOWN` in `app/ui.py` and `COLORS` in `app/compare_ui.py`, are checked for contrast
@@ -192,9 +249,11 @@ itself is selected, both columns show SPY. Rows:
 
 Each phase can be reviewed and shipped on its own, in this order:
 
-1. **Chart and theme:** range-button fix, zoom/pan/double-click, axis labels and title, close
-   line over faint candles, gap collapsing, theme in every window.
-2. **SIP switch:** feed change, the 15-minute end, the feed marker and re-download, labels.
+1. **Chart and theme:** session calendar cache, range-button fix, zoom/pan/double-click with
+   stable coordinates, axis labels and title, close line over faint candles, gap collapsing,
+   theme in every window.
+2. **SIP switch:** feed change, the 15-minute end, 35-day keep period, staged migration with
+   marker, labels.
 3. **Names and stats:** Name column, member lists, viewer symbol list (Nasdaq-100/Dow 30
    extras and ETFs added to the poller), stats panel.
 4. **Grouping:** Group-by control, exchange cache, group rows, ETF charts on group click,
@@ -206,6 +265,14 @@ Each phase can be reviewed and shipped on its own, in this order:
   calendar lookback, too little data gives a blank), volatility and its sample size, group
   averages (skipping blanks), the regular-session rule in `Store.summary()` (post-market bars ignored), the 35-day keep period, the viewer symbol union (no duplicates, `load_symbols()`
   unchanged) and the feed marker re-download (including an interrupted re-download).
+- Migration: an error mid-download and a stop request both leave `bars` and the IEX marker
+  untouched, with staged rows kept. A restart resumes from staging. Completion swaps in one
+  transaction.
+- Chart: the x mapping is stable across refresh, pruning of the oldest bar, a late insert and
+  a symbol change while panned. A held view keeps its timestamps.
+- Theme: the fallback path, forced in a test, sets the Fusion palette. Plot colours change on
+  the palette-change event, and a window opened after the switch starts in the new colours.
+- Packaging: the build's selftest loads the full viewer list.
 - A test that `daily.universe()` is unchanged. This guards the anti-goal.
 - `fetch` sends SIP and an end at least 15 minutes old (fake client, as in `tests/test_feed.py`).
 - UI tests in the existing offscreen-Qt style (`QT_QPA_PLATFORM=offscreen`, as in `tests/test_compare_ui.py`): a range button resets a panned view, grouping
