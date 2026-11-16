@@ -1,6 +1,6 @@
 import logging
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app import feed, market, sessions
@@ -81,3 +81,33 @@ def test_poller_calendar_401_does_not_report_bad_key(tmp_path):
     assert updated.wait(10)
     p.halt()
     assert auth == []
+
+
+def test_refresh_failure_retries_at_most_hourly(tmp_path):
+    calls = []
+
+    class Rejecting:
+        def get_calendar(self, req): calls.append(1); raise HTTPError(401)
+    s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
+    market.refresh(Rejecting(), s, now)
+    market.refresh(Rejecting(), s, now + timedelta(minutes=59))
+    assert len(calls) == 1
+    market.refresh(Rejecting(), s, now + timedelta(minutes=61))
+    assert len(calls) == 2
+
+
+def test_mapping_30k_bars_is_fast():
+    import time
+    days = [date(2026, 10, 1) + timedelta(days=i) for i in range(30) if (date(2026, 10, 1) + timedelta(days=i)).weekday() < 5]
+    sess = [Session(d, _t(d, 9, 30), _t(d, 16, 0)) for d in days]
+    bars = [bar("A", _t(d, 9, 30) + 60 * i) for d in days for i in range(1430)][:30000]
+    hol = sessions.holidays(sess)
+    t0 = time.perf_counter()
+    for b in bars:
+        sessions.to_x(b.ts, hol)
+    sessions.regular(bars, sess)
+    assert time.perf_counter() - t0 < 1
+
+
+def _t(d, h, m):
+    return int(datetime(d.year, d.month, d.day, h, m, tzinfo=ET).timestamp())

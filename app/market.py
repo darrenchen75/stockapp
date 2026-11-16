@@ -7,6 +7,8 @@ from app.sessions import Session
 from app.store import ET, Store
 
 log = logging.getLogger(__name__)
+RETRY = timedelta(hours=1)
+_failed = False  # first failure logs a traceback, later ones one line
 
 
 def fetch_sessions(trading, start: date, end: date) -> list[Session]:
@@ -17,8 +19,13 @@ def fetch_sessions(trading, start: date, end: date) -> list[Session]:
 
 
 def refresh(trading, store: Store, now: datetime) -> None:
-    """Re-download the calendar at most daily. Failures are logged: bars never depend on it."""
+    """Re-download the calendar at most daily, after a failure at most hourly. Failures are logged:
+    bars never depend on it."""
+    global _failed
     try:
+        failed = store.meta("calendar_failed_at")
+        if failed and now - datetime.fromisoformat(failed) < RETRY:
+            return
         at = store.meta("calendar_at")
         if at and now - datetime.fromisoformat(at) < timedelta(days=1):
             return
@@ -29,5 +36,14 @@ def refresh(trading, store: Store, now: datetime) -> None:
         store.set_meta("calendar_from", min(lo, start.isoformat()) if lo else start.isoformat())
         store.set_meta("calendar_to", max(hi, end.isoformat()) if hi else end.isoformat())
         store.set_meta("calendar_at", now.isoformat())
-    except Exception:
-        log.exception("market calendar refresh failed")
+        _failed = False
+    except Exception as e:
+        if _failed:
+            log.warning("market calendar refresh failed: %s", e)
+        else:
+            log.exception("market calendar refresh failed")
+            _failed = True
+        try:
+            store.set_meta("calendar_failed_at", now.isoformat())
+        except Exception:
+            pass

@@ -1,4 +1,6 @@
 import logging
+from bisect import bisect_left
+from functools import lru_cache
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -60,14 +62,23 @@ def holidays(sessions: list[Session]) -> list[date]:
 
 
 def regular(bars: list[Bar], sessions: list[Session]) -> dict[date, list[Bar]]:
-    out = defaultdict(list)
+    """Bars must be in time order; each session is a bisect slice."""
+    times = [b.ts for b in bars]
+    out = {}
     for s in sessions:
-        out[s.day] = [b for b in bars if s.open <= b.ts < s.close]
-    return {d: v for d, v in out.items() if v}
+        got = bars[bisect_left(times, s.open):bisect_left(times, s.close)]
+        if got:
+            out[s.day] = got
+    return out
 
 
-def _hol(holidays: list[date]):
-    return np.array(holidays, dtype="datetime64[D]")
+def _hol(holidays) -> np.ndarray:
+    return np.array(list(holidays), dtype="datetime64[D]")
+
+
+@lru_cache(maxsize=4096)
+def _days(day: date, holidays: tuple) -> float:
+    return float(np.busday_count(ANCHOR, day, holidays=_hol(holidays)))
 
 
 def to_x(ts: int, holidays: list[date]) -> float | None:
@@ -75,7 +86,7 @@ def to_x(ts: int, holidays: list[date]) -> float | None:
     m = (t.hour - 4) * 60 + t.minute + t.second / 60
     if t.weekday() >= 5 or t.date() in holidays or not 0 <= m < DAY_MIN:
         return None
-    return float(np.busday_count(ANCHOR, t.date(), holidays=_hol(holidays))) * DAY_MIN + m
+    return _days(t.date(), tuple(holidays)) * DAY_MIN + m
 
 
 def from_x(x: float, holidays: list[date]) -> int:

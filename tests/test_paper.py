@@ -82,10 +82,10 @@ def test_make_broker_is_always_paper(monkeypatch):
     monkeypatch.setattr(paper, "CorporateActionsClient", lambda *a, **k: SimpleNamespace())
     assert isinstance(paper.make_broker(("KEY", "SECRET")), paper.Broker)
     assert seen == [{"paper": True}]
-    app = Path(paper.__file__).parent
-    hits = [p.name for p in app.rglob("*.py") for _ in range(p.read_text().count("TradingClient("))]
-    assert sorted(hits) == ["paper.py", "ui.py"]  # ui.py: the calendar client, also paper=True
-    assert "TradingClient(*keys, paper=True)" in (app / "ui.py").read_text()
+    import re
+    for p in Path(paper.__file__).parent.rglob("*.py"):
+        for call in re.findall(r"TradingClient\(([^)]*)\)", p.read_text()):
+            assert "paper=True" in call, f"{p.name}: TradingClient({call})"
 
 
 def test_equity_history_dates_by_new_york_day():
