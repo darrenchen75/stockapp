@@ -111,3 +111,50 @@ def test_mapping_30k_bars_is_fast():
 
 def _t(d, h, m):
     return int(datetime(d.year, d.month, d.day, h, m, tzinfo=ET).timestamp())
+
+
+def _assets(**kw):
+    return [SimpleNamespace(symbol=k, exchange=SimpleNamespace(value=v)) for k, v in kw.items()]
+
+
+def test_refresh_caches_exchanges_for_a_week(tmp_path):
+    calls = []
+
+    class Trading:
+        def get_calendar(self, req): return []
+        def get_all_assets(self, req):
+            calls.append(req)
+            return _assets(AAPL="NASDAQ", KO="NYSE")
+    s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
+    market.refresh(Trading(), s, now)
+    market.refresh(Trading(), s, now + timedelta(days=6))
+    assert len(calls) == 1 and s.exchanges() == {"AAPL": "NASDAQ", "KO": "NYSE"}
+    assert s.meta("exchanges_at") == now.isoformat()
+    market.refresh(Trading(), s, now + timedelta(days=8))
+    assert len(calls) == 2
+
+
+def test_exchange_failure_is_logged_retried_hourly_and_spares_calendar(tmp_path, caplog):
+    calls = []
+
+    class Trading:
+        def get_calendar(self, req):
+            return [SimpleNamespace(date=date(2026, 11, 16), open=datetime(2026, 11, 16, 9, 30),
+                                    close=datetime(2026, 11, 16, 16, 0))]
+        def get_all_assets(self, req): calls.append(1); raise HTTPError(401)
+    s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
+    market.refresh(Trading(), s, now)
+    market.refresh(Trading(), s, now + timedelta(minutes=59))
+    assert len(calls) == 1 and s.exchanges() == {} and "exchanges" in caplog.text
+    assert len(s.sessions()) == 1
+    market.refresh(Trading(), s, now + timedelta(minutes=61))
+    assert len(calls) == 2
+
+
+def test_calendar_failure_spares_exchanges(tmp_path):
+    class Trading:
+        def get_calendar(self, req): raise HTTPError(500)
+        def get_all_assets(self, req): return _assets(AAPL="NASDAQ")
+    s = store(tmp_path)
+    market.refresh(Trading(), s, datetime(2026, 11, 16, 12, tzinfo=ET))
+    assert s.exchanges() == {"AAPL": "NASDAQ"}

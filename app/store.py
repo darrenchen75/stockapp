@@ -82,6 +82,7 @@ class Store:
             "CREATE TABLE IF NOT EXISTS sessions("
             "day TEXT PRIMARY KEY, open INTEGER, close INTEGER) WITHOUT ROWID"
         )
+        self.db.execute("CREATE TABLE IF NOT EXISTS exchanges(symbol TEXT PRIMARY KEY, exchange TEXT) WITHOUT ROWID")
         self.db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID")
         self.db.execute("CREATE TABLE IF NOT EXISTS daily_meta(through TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS daily_symbols(symbol TEXT PRIMARY KEY) WITHOUT ROWID")
@@ -169,6 +170,14 @@ class Store:
         from app.sessions import Session  # sessions imports this module
         return [Session(date.fromisoformat(d), o, c)
                 for d, o, c in self.db.execute("SELECT day, open, close FROM sessions ORDER BY day")]
+
+    def save_exchanges(self, d: dict[str, str]) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM exchanges")
+            self.db.executemany("INSERT INTO exchanges VALUES (?,?)", d.items())
+
+    def exchanges(self) -> dict[str, str]:
+        return dict(self.db.execute("SELECT symbol, exchange FROM exchanges"))
 
     def meta(self, key: str) -> str | None:
         row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
