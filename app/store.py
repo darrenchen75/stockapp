@@ -56,12 +56,13 @@ class Store:
     def __init__(self, path: str):
         self.db = sqlite3.connect(path)
         self.db.execute("PRAGMA journal_mode=WAL")  # UI reads while the poller writes
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS bars("
-            "symbol TEXT NOT NULL, ts INTEGER NOT NULL,"
-            "o REAL, h REAL, l REAL, c REAL, v INTEGER,"
-            "PRIMARY KEY(symbol, ts)) WITHOUT ROWID"
-        )
+        for table in ("bars", "bars_staging"):  # staging holds SIP bars until the migration swaps them in
+            self.db.execute(
+                f"CREATE TABLE IF NOT EXISTS {table}("
+                "symbol TEXT NOT NULL, ts INTEGER NOT NULL,"
+                "o REAL, h REAL, l REAL, c REAL, v INTEGER,"
+                "PRIMARY KEY(symbol, ts)) WITHOUT ROWID"
+            )
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS splits("
             "symbol TEXT NOT NULL, ex_date TEXT NOT NULL,"
@@ -81,12 +82,28 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS daily_meta(through TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS daily_symbols(symbol TEXT PRIMARY KEY) WITHOUT ROWID")
 
-    def upsert(self, bars: Iterable[Bar]) -> None:
+    def upsert(self, bars: Iterable[Bar], table: str = "bars") -> None:
         with self.db:
             self.db.executemany(
-                "INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?)",
+                f"INSERT OR REPLACE INTO {table} VALUES (?,?,?,?,?,?,?)",
                 [(b.symbol, b.ts, b.o, b.h, b.l, b.c, b.v) for b in bars],
             )
+
+    def upsert_staged(self, bars: Iterable[Bar]) -> None:
+        self.upsert(bars, "bars_staging")
+
+    def staged_latest_all(self) -> dict[str, int]:
+        return dict(self.db.execute("SELECT symbol, MAX(ts) FROM bars_staging GROUP BY symbol"))
+
+    def swap_staged(self) -> None:
+        """Replace `bars` with the staged rows and mark the feed SIP, in one transaction. Splits are
+        forgotten so repair_splits re-checks every split against the new rows."""
+        with self.db:  # sqlite3 opens the transaction at the first DELETE; any error rolls all back
+            self.db.execute("DELETE FROM bars")
+            self.db.execute("INSERT INTO bars SELECT * FROM bars_staging")
+            self.db.execute("DELETE FROM bars_staging")
+            self.db.execute("DELETE FROM splits")
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("feed", "sip"))
 
     def replace(self, symbol: str, bars: Iterable[Bar], ex_date: str | None) -> None:
         """Swap all of `symbol`'s rows for split-adjusted `bars` and mark the split handled (unless

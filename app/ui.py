@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 
 COLUMNS = ["Symbol", "Last", "% Chg", "Volume", "Gaps"]
 UP, DOWN = QColor("#26a69a"), QColor("#ef5350")
-LIVE_SECONDS = 300
+LIVE_SECONDS = 300 + 900  # SIP bars arrive 15 minutes late
 
 
 def update_lock(data_dir: Path) -> QLockFile:
@@ -326,17 +326,21 @@ class MainWindow(QMainWindow):
                 self.model.item(row, col).setData(value, Qt.DisplayRole)  # None = blank cell
             color = None if pct is None else (UP if pct >= 0 else DOWN)
             self.model.item(row, 2).setData(color, Qt.ForegroundRole)
+        self.model.setHeaderData(COLUMNS.index("Last"), Qt.Horizontal, self.feed_label(), Qt.ToolTipRole)
         self.show_status()
         self.draw()
+
+    def feed_label(self) -> str:
+        return "SIP, 15 min delayed" if self.store.meta("feed") == "sip" else "IEX, switching to SIP…"
 
     def show_status(self):
         ts = self.store.latest()
         if ts is None:
-            self.statusBar().showMessage("No data yet")
+            self.statusBar().showMessage(f"No data yet · {self.feed_label()}")
             return
         when = datetime.fromtimestamp(ts, ET).strftime("%a %b %d %H:%M ET")
         state = "Live" if time.time() - ts < LIVE_SECONDS else "Market closed"
-        self.statusBar().showMessage(f"{state} · last bar {when}")
+        self.statusBar().showMessage(f"{state} · last bar {when} · {self.feed_label()}")
 
     def on_select(self, current, _previous):
         if not current.isValid():
@@ -350,7 +354,7 @@ class MainWindow(QMainWindow):
         # Always 30 days (+1 for DST slack); the chart's range only picks the view.
         since = (self.store.session_start(self.symbol) or 0) - 31 * 86400
         self.chart.set_data(self.symbol, self.symbol, self.store.bars(self.symbol, since),
-                            sessions.load(self.store), "")
+                            sessions.load(self.store), self.feed_label())
 
     def closeEvent(self, event):
         if self.updating:  # quitting mid-swap could leave no app installed

@@ -136,3 +136,23 @@ def test_full_extended_day_still_gets_hourly_ticks(qapp):
     axis = c.plot.getAxis("bottom"); axis.setRange(lo, hi)
     (step, values), = axis.tickValues(lo, hi, 800)
     assert step < 960 and axis.tickStrings(values[:1], 1, step) == ["04:00"]
+
+
+def test_main_window_labels_the_feed(qapp, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+
+    from app import ui
+    from app.store import Store
+    monkeypatch.setattr(ui.MainWindow, "start_poller", lambda self, keys: None)
+    monkeypatch.setattr(ui.MainWindow, "check_for_update", lambda self: None)
+    Store(str(tmp_path / "bars.db")).upsert(bars)
+    w = ui.MainWindow(str(tmp_path / "bars.db"), ["A"], ("k", "s"), tmp_path)
+    w.symbol = "A"
+    for marker, label in [(None, "IEX, switching to SIP…"), ("sip", "SIP, 15 min delayed")]:
+        if marker:
+            w.store.set_meta("feed", marker)
+        w.refresh()
+        assert w.feed_label() == label and w.chart.feed_label == label
+        assert w.statusBar().currentMessage().endswith(label)
+        assert label in w.model.headerData(ui.COLUMNS.index("Last"), Qt.Horizontal, Qt.ToolTipRole)
+    w.close()

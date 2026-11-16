@@ -202,3 +202,59 @@ def test_daily_symbols_round_trip(tmp_path):
     s.set_daily_symbols(["B", "A"])
     s.set_daily_symbols(["C", "A"])
     assert s.daily_symbols() == {"A", "C"}
+
+
+class FailingDb:
+    """Wraps a connection so the statement starting with `fail` raises (sqlite3.Connection can't be patched)."""
+
+    def __init__(self, db, fail):
+        self.db, self.fail = db, fail
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    def __enter__(self):
+        return self.db.__enter__()
+
+    def __exit__(self, *exc):
+        return self.db.__exit__(*exc)
+
+    def execute(self, sql, *args):
+        if sql.startswith(self.fail):
+            raise sqlite3.OperationalError("disk I/O error")
+        return self.db.execute(sql, *args)
+
+
+def staged_store(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("A", 60, c=1.0), bar("IEXONLY", 60)])
+    s.replace("A", [bar("A", 60, c=1.0)], "2026-11-01")
+    s.upsert_staged([bar("A", 60, c=2.0), bar("A", 120, c=3.0), bar("B", 60)])
+    return s
+
+
+def test_staged_rows_stay_out_of_bars_until_swap(tmp_path):
+    s = staged_store(tmp_path)
+    assert s.staged_latest_all() == {"A": 120, "B": 60}
+    assert s.latest_all() == {"A": 60, "IEXONLY": 60}
+
+
+def test_swap_is_atomic_and_clears_splits(tmp_path):
+    s = staged_store(tmp_path)
+    s.swap_staged()
+    s = store(tmp_path)  # committed: visible from a fresh connection
+    assert s.bars("A", 0) == [bar("A", 60, c=2.0), bar("A", 120, c=3.0)]
+    assert s.latest_all() == {"A": 120, "B": 60}
+    assert s.staged_latest_all() == {} and s.handled_splits() == set() and s.meta("feed") == "sip"
+
+
+@pytest.mark.parametrize("fail", ["INSERT INTO bars", "DELETE FROM splits", "INSERT OR REPLACE INTO meta"])
+def test_failed_swap_changes_nothing(tmp_path, fail):
+    s = staged_store(tmp_path)
+    s.db = FailingDb(s.db, fail)
+    with pytest.raises(sqlite3.OperationalError):
+        s.swap_staged()
+    s = store(tmp_path)
+    assert s.latest_all() == {"A": 60, "IEXONLY": 60} and s.bars("A", 0)[0].c == 1.0
+    assert s.staged_latest_all() == {"A": 120, "B": 60}
+    assert s.handled_splits() == {("A", "2026-11-01")} and s.meta("feed") is None

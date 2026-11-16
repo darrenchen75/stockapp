@@ -18,7 +18,9 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-DAYS = 30
+DAYS = 30                    # the chart's 30D window and the Gaps column
+KEEP_DAYS = 35               # minute bars kept: 30 days plus a reference close for "Change 30D"
+DELAY = timedelta(minutes=15)  # the free plan rejects SIP data newer than this
 MAX_SYMBOLS = 100            # symbols per request
 MAX_SPAN = 10 * DAYS * 1440  # symbol-minutes per request (10 symbols x 30 days, ~120k bars) bounds memory
 RETRIES = 5
@@ -31,12 +33,14 @@ def load_symbols() -> list[str]:
 
 
 def plan(symbols, latest, now, include_empty):
-    """Group symbols into requests, oldest first. Each request starts at its earliest
-    member's last bar (refetching it is harmless: upsert), never before the 30-day floor.
-    Symbols with no rows get 30 days only when include_empty is set (first run)."""
+    """Group symbols into requests ending at `now`, oldest first. Each request starts at its earliest
+    member's last bar (refetching it is harmless: upsert), never before the KEEP_DAYS floor.
+    Symbols with no rows get KEEP_DAYS only when include_empty is set (first run). Symbols whose
+    last bar is at or after `now` are skipped: their window would be empty or inverted."""
     now_ts = int(now.timestamp())
-    floor = now_ts - DAYS * 86400
+    floor = now_ts - KEEP_DAYS * 86400
     starts = {s: max(latest.get(s, floor), floor) for s in symbols if include_empty or s in latest}
+    starts = {s: t for s, t in starts.items() if t < now_ts}
     jobs, batch = [], []
     for s in sorted(starts, key=starts.get):
         if batch:
@@ -81,7 +85,7 @@ def with_retries(call: Callable[[], T], sleep=time.sleep) -> T:
 def fetch(client, symbols, start, end, sleep=time.sleep):
     req = StockBarsRequest(
         symbol_or_symbols=symbols, timeframe=TimeFrame.Minute,
-        start=start, end=end, feed=DataFeed.IEX, adjustment=Adjustment.SPLIT,
+        start=start, end=end, feed=DataFeed.SIP, adjustment=Adjustment.SPLIT,
     )
     data = with_retries(lambda: client.get_stock_bars(req).data, sleep)
     return [
@@ -93,33 +97,54 @@ def fetch(client, symbols, start, end, sleep=time.sleep):
 def backfill(client, store: Store, symbols, include_empty=True, now=None,
              sleep=time.sleep, progress=lambda done, total: None,
              stop: threading.Event | None = None) -> int:
-    now = now or datetime.now(timezone.utc)
-    jobs = plan(symbols, store.latest_all(), now, include_empty)
+    end = (now or datetime.now(timezone.utc)) - DELAY
+    jobs = plan(symbols, store.latest_all(), end, include_empty)
     count = 0
     for i, (batch, start) in enumerate(jobs, 1):
         if stop and stop.is_set():
             break
-        bars = fetch(client, batch, start, now, sleep)
+        bars = fetch(client, batch, start, end, sleep)
         store.upsert(bars)  # per batch, so an interrupted backfill resumes where it stopped
         count += len(bars)
         progress(i, len(jobs))
     if include_empty:
-        missing = sorted(set(symbols) - store.latest_all().keys())
-        if missing:
-            log.info("no bars for %d symbols: %s", len(missing), ", ".join(missing))
+        log_missing(symbols, store.latest_all())
     return count
+
+
+def log_missing(symbols, latest):
+    missing = sorted(set(symbols) - latest.keys())
+    if missing:
+        log.info("no bars for %d symbols: %s", len(missing), ", ".join(missing))
+
+
+def migrate(client, store: Store, symbols, now=None, sleep=time.sleep,
+            progress=lambda done, total: None, stop: threading.Event | None = None) -> bool:
+    """Download KEEP_DAYS of SIP bars into staging, then swap them in for the IEX bars in one
+    transaction. Resumes from staging. False if stopped first (nothing swapped); errors propagate."""
+    end = (now or datetime.now(timezone.utc)) - DELAY
+    jobs = plan(symbols, store.staged_latest_all(), end, include_empty=True)
+    for i, (batch, start) in enumerate(jobs, 1):
+        if stop and stop.is_set():
+            return False
+        store.upsert_staged(fetch(client, batch, start, end, sleep))  # per batch: a restart resumes here
+        progress(i, len(jobs))
+    log_missing(symbols, store.staged_latest_all())
+    store.swap_staged()
+    return True
 
 
 def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.sleep,
                   stop: threading.Event | None = None) -> int:
-    """Refetch 30 split-adjusted days for each symbol with an unhandled split in the last 30 days.
+    """Refetch KEEP_DAYS split-adjusted days for each symbol with an unhandled split in that window.
     The window is rolling so splits Alpaca posts late still get caught. A split is marked handled
     only after its ex-date, since Alpaca may not have adjusted history yet on the day itself.
     Returns how many splits are still pending: empty refetch, ex-date is today, or skipped by stop."""
     now = now or datetime.now(timezone.utc)
+    end = now - DELAY
     today = now.astimezone(ET).date()
     data = actions.get_corporate_actions(CorporateActionsRequest(
-        symbols=symbols, start=today - timedelta(days=DAYS), end=today,
+        symbols=symbols, start=today - timedelta(days=KEEP_DAYS), end=today,
         types=[CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT],
     )).data
     found = {(a.symbol, a.ex_date.isoformat()) for actions_ in data.values() for a in actions_}
@@ -128,7 +153,7 @@ def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.s
         if stop and stop.is_set():
             pending += 1
             continue
-        bars = fetch(client, [symbol], now - timedelta(days=DAYS), now, sleep)
+        bars = fetch(client, [symbol], now - timedelta(days=KEEP_DAYS), end, sleep)  # all kept days: replace drops the rest
         if not bars:
             log.warning("split refetch for %s came back empty; retrying in an hour", symbol)
             pending += 1
@@ -142,6 +167,7 @@ def repair_splits(client, actions, store: Store, symbols, now=None, sleep=time.s
 
 class Poller:
     """Runs backfill() on a background thread: full on start, then a gap fill every poll_seconds.
+    Until the store's feed is SIP it runs only migrate(), so IEX and SIP bars never mix.
     Plain Python so it runs without a GUI; callbacks fire on the poller thread."""
 
     def __init__(self, client, db_path, symbols, actions=None, trading=None, poll_seconds=60, retry_seconds=30,
@@ -172,6 +198,11 @@ class Poller:
         first, pruned, next_split_check = True, 0.0, 0.0
         while not self.stop.is_set():
             try:
+                if store.meta("feed") != "sip":
+                    if not migrate(self.client, store, self.symbols, progress=self.on_progress,
+                                   sleep=self.stop.wait, stop=self.stop):
+                        return  # stopped; the next launch resumes from staging
+                    self.on_updated()
                 backfill(self.client, store, self.symbols, include_empty=first,
                          progress=self.on_progress, sleep=self.stop.wait, stop=self.stop)
             except Exception as e:
@@ -190,8 +221,8 @@ class Poller:
             first = False
             if self.trading:
                 market.refresh(self.trading, store, datetime.now(ET))  # logs and swallows its own errors
-            if time.time() - pruned > 86400:  # keep the cache a rolling 30 days while the app stays open
-                store.prune(DAYS)
+            if time.time() - pruned > 86400:  # keep the cache a rolling KEEP_DAYS while the app stays open
+                store.prune(KEEP_DAYS)
                 pruned = time.time()
             if self.actions and not self.stop.is_set() and time.time() >= next_split_check:
                 try:
