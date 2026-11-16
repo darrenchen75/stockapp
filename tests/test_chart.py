@@ -156,3 +156,12 @@ def test_main_window_labels_the_feed(qapp, tmp_path, monkeypatch):
         assert w.statusBar().currentMessage().endswith(label)
         assert label in w.model.headerData(ui.COLUMNS.index("Last"), Qt.Horizontal, Qt.ToolTipRole)
     w.close()
+
+
+def test_fresh_install_never_says_iex(qapp, tmp_path, monkeypatch):
+    from app import ui
+    monkeypatch.setattr(ui.MainWindow, "start_poller", lambda self, keys: None)
+    monkeypatch.setattr(ui.MainWindow, "check_for_update", lambda self: None)
+    w = ui.MainWindow(str(tmp_path / "bars.db"), ["A"], ("k", "s"), tmp_path)  # no bars, no feed marker
+    assert w.feed_label() == w.feed_tag.text() == "SIP, 15 min delayed"
+    w.close()

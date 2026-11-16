@@ -26,6 +26,7 @@ MAX_SYMBOLS = 100            # symbols per request
 MAX_SPAN = 10 * DAYS * 1440  # symbol-minutes per request (10 symbols x 30 days, ~120k bars) bounds memory
 RETRIES = 5
 MAX_WAIT = 60                # seconds; Alpaca's limit window is one minute
+MAX_EMPTY_WAIT = 3600        # seconds; cap on the backoff while SIP keeps returning nothing
 
 
 def load_symbols() -> list[str]:
@@ -208,17 +209,21 @@ class Poller:
 
     def run(self):
         store = Store(self.db_path)  # own connection: sqlite3 connections stay on their thread
-        first, pruned, next_split_check = True, 0.0, 0.0
+        first, pruned, next_split_check, empty = True, 0.0, 0.0, 0
         while not self.stop.is_set():
             try:
+                if store.meta("feed") != "sip" and store.latest() is None and not store.staged_latest_all():
+                    store.set_meta("feed", "sip")  # fresh install: no IEX bars to replace, so a plain backfill
                 if store.meta("feed") != "sip":
                     done = migrate(self.client, store, self.symbols, progress=self.on_progress,
                                    sleep=self.stop.wait, stop=self.stop)
                     if self.stop.is_set():
                         return  # the next launch resumes from staging
-                    if not done:  # SIP had no bars at all: keep IEX, try again later
-                        self.on_status(f"No SIP bars yet — retrying in {self.poll_seconds}s")
-                        self.stop.wait(self.poll_seconds)
+                    if not done:  # SIP had no bars at all: keep IEX; each retry refetches the whole plan, so back off
+                        wait = min(self.retry_seconds * 2**empty, MAX_EMPTY_WAIT)
+                        empty += 1
+                        self.on_status(f"No SIP bars yet — retrying in {wait}s")
+                        self.stop.wait(wait)
                         continue
                     self.on_updated()
                 backfill(self.client, store, self.symbols, include_empty=first,

@@ -422,7 +422,7 @@ def test_poller_retries_migration_that_found_no_sip_bars(tmp_path):
     iex(Store(db))
     client = FakeClient()
     statuses = []
-    p = feed.Poller(client, db, ["A"], poll_seconds=0, on_status=statuses.append)
+    p = feed.Poller(client, db, ["A"], poll_seconds=0, retry_seconds=0, on_status=statuses.append)
     p.on_progress = lambda d, t: client.data.update(A=[fake_bar(END, c=7.0)])  # empty first, bars on the retry
     p.on_updated = p.stop.set
     p.run()
@@ -465,3 +465,47 @@ def test_poller_does_not_backfill_or_repair_before_migration_completes(tmp_path,
     p.run()
     s = Store(db)
     assert s.latest_all() == {"A": old} and s.meta("feed") is None and s.staged_latest_all()
+
+
+class CountingStop(threading.Event):
+    """Records each wait and returns at once; sets itself after `n` waits."""
+    def __init__(self, n):
+        super().__init__()
+        self.n, self.waits = n, []
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if len(self.waits) == self.n:
+            self.set()
+        return self.is_set()
+
+
+def test_empty_sip_retry_backs_off_to_an_hour(tmp_path, monkeypatch):
+    monkeypatch.setattr(feed, "migrate", lambda *a, **k: False)  # SIP keeps returning nothing
+    db = str(tmp_path / "bars.db")
+    iex(Store(db))
+    p = feed.Poller(FakeClient(), db, ["A"], retry_seconds=30)
+    p.stop = CountingStop(9)
+    p.run()
+    assert p.stop.waits == [30, 60, 120, 240, 480, 960, 1920, 3600, 3600]
+
+
+def test_fresh_install_backfills_without_migrating(tmp_path, monkeypatch):
+    monkeypatch.setattr(feed, "migrate", lambda *a, **k: pytest.fail("fresh install staged a migration"))
+    db = str(tmp_path / "bars.db")
+    p = feed.Poller(StrictClient(data={"A": [fake_bar(datetime.now(timezone.utc) - timedelta(minutes=20))]}),
+                    db, ["A"], poll_seconds=0)
+    p.on_updated = p.stop.set
+    p.run()
+    s = Store(db)
+    assert s.meta("feed") == "sip" and len(s.bars("A", 0)) == 1 and s.staged_latest_all() == {}
+
+
+def test_interrupted_fresh_migration_still_resumes_from_staging(tmp_path):
+    db = str(tmp_path / "bars.db")
+    Store(db).upsert_staged([Bar("A", NOW_TS - 3600, 1.0, 1.0, 1.0, 1.0, 1)])  # left by an older version
+    p = feed.Poller(FakeClient(), db, ["A"], poll_seconds=0)
+    p.on_updated = p.stop.set
+    p.run()
+    s = Store(db)
+    assert s.meta("feed") == "sip" and s.latest_all() == {"A": NOW_TS - 3600} and s.staged_latest_all() == {}

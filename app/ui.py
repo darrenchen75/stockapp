@@ -462,7 +462,9 @@ class MainWindow(QMainWindow):
         self.draw()
 
     def feed_label(self) -> str:
-        return "SIP, 15 min delayed" if self.store.meta("feed") == "sip" else "IEX, switching to SIP…"
+        # No bars yet is a fresh install: the poller marks it SIP and never migrates.
+        iex = self.store.meta("feed") != "sip" and self.store.latest() is not None
+        return "IEX, switching to SIP…" if iex else "SIP, 15 min delayed"
 
     def show_status(self):
         ts = self.store.latest()
