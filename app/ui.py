@@ -375,13 +375,19 @@ class MainWindow(QMainWindow):
     def restart_poller(self):
         self.start_poller(self.keys)
 
+    def save_prefs(self, **changes) -> None:
+        try:
+            prefs.save(self.data_dir, **changes)
+        except OSError as e:  # a full or read-only disk only costs the setting, not the app
+            log.warning("couldn't save display settings: %s", e)
+
     def set_theme(self, choice: str) -> None:
         theme.apply(QApplication.instance(), choice)
-        prefs.save(self.data_dir, theme=choice)
+        self.save_prefs(theme=choice)
 
     def set_group_by(self, i: int):
         self.group_by = groups.BY[i]
-        prefs.save(self.data_dir, group_by=self.group_by)
+        self.save_prefs(group_by=self.group_by)
         self.refresh()
 
     def on_expand(self, index, is_open: bool):
@@ -389,7 +395,7 @@ class MainWindow(QMainWindow):
         new = self.expanded | {name} if is_open else self.expanded - {name}
         if new != self.expanded:  # rebuilds re-expand saved groups; no write for those
             self.expanded = new
-            prefs.save(self.data_dir, expanded=sorted(new))
+            self.save_prefs(expanded=sorted(new))
 
     def on_click(self, index):
         index = index.siblingAtColumn(0)

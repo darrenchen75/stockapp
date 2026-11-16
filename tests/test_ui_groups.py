@@ -1,3 +1,4 @@
+import logging
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -135,3 +136,14 @@ def test_regroup_draws_once(window, monkeypatch):
     w.tree.expand(group_index(w, "Information Technology"))
     w.group_by_box.setCurrentIndex(0)  # AAPL's row is visible again and re-selected
     assert draws == ["AAPL", "AAPL"] and w.tree.currentIndex().data() == "AAPL"
+
+
+def test_failed_settings_save_is_logged_not_raised(window, monkeypatch, caplog):
+    w = window()
+
+    def full(*a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(prefs, "save", full)
+    with caplog.at_level(logging.WARNING):
+        w.set_group_by(1)
+    assert w.group_by == "sector" and "No space left" in caplog.text
