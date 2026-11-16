@@ -118,9 +118,10 @@ the data source for the minute chart, so Part 2 can go first.
   - On completion, one transaction does three things: replaces the contents of `bars` with the
     staging rows, drops the staging table, and writes the marker "sip". If anything fails before
     that commit, the IEX bars and the old marker are untouched.
-  - The `splits` table stays, because SIP bars are split-adjusted the same way. A split repair
-    that lands during the migration also refetches into staging, so the staged bars are
-    adjusted too.
+  - Split repair does not run during the migration. The swap transaction also empties the
+    `splits` table, so the next `repair_splits` re-checks every split in the kept window and
+    refetches those symbols. This covers a split whose ex-date fell between staged batches
+    fetched on different launches. It costs a handful of refetches once.
 - The chart and the list header say "SIP, 15 min delayed". The status bar shows the time of
   the newest bar as before. Its "live" check (`LIVE_SECONDS` in `app/ui.py`) allows for the
   15-minute delay, so it doesn't always read "Market closed". *(My call.)*
