@@ -118,6 +118,29 @@ def test_refresh_keeps_selection(window):
     assert w.tree.currentIndex().data() == "MSFT" and w.symbol == "MSFT"
 
 
+def double_click(w, index):
+    w.show()
+    pos = w.tree.visualRect(index).center()
+    QTest.mouseClick(w.tree.viewport(), Qt.LeftButton, pos=pos)  # a real double-click starts with a click
+    QTest.mouseDClick(w.tree.viewport(), Qt.LeftButton, pos=pos)
+
+
+def test_double_click_toggles_an_etf_group(window):
+    w = window()
+    w.group_by_box.setCurrentIndex(1)
+    double_click(w, group_index(w, "Information Technology"))
+    assert w.symbol == "XLK" and w.tree.isExpanded(group_index(w, "Information Technology"))
+    double_click(w, group_index(w, "Information Technology"))
+    assert not w.tree.isExpanded(group_index(w, "Information Technology"))
+
+
+def test_double_click_toggles_an_exchange_group_once(window):
+    w = window()
+    w.group_by_box.setCurrentIndex(2)
+    double_click(w, group_index(w, "Unknown"))
+    assert w.tree.isExpanded(group_index(w, "Unknown"))
+
+
 def test_selection_reuses_the_refreshed_sessions(window, monkeypatch):
     w = window()
     loads = []

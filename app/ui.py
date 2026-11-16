@@ -147,6 +147,7 @@ class MainWindow(QMainWindow):
         self.tree.setExpandsOnDoubleClick(False)  # a click already toggles exchange groups
         self.tree.selectionModel().currentRowChanged.connect(self.on_select)
         self.tree.clicked.connect(self.on_click)
+        self.tree.doubleClicked.connect(self.on_double_click)
         self.tree.expanded.connect(lambda i: self.on_expand(i, True))
         self.tree.collapsed.connect(lambda i: self.on_expand(i, False))
         self.group_by_box = QComboBox()
@@ -401,6 +402,12 @@ class MainWindow(QMainWindow):
         index = index.siblingAtColumn(0)
         g = index.data(Qt.UserRole)
         if g is not None and g.etf is None:  # ETF-backed groups chart their ETF via on_select instead
+            self.tree.setExpanded(index, not self.tree.isExpanded(index))
+
+    def on_double_click(self, index):
+        index = index.siblingAtColumn(0)
+        g = index.data(Qt.UserRole)
+        if g is not None and g.etf is not None:  # a single click charts the ETF; exchange groups toggled on click
             self.tree.setExpanded(index, not self.tree.isExpanded(index))
 
     def rebuild(self, built: list[groups.Group]):
