@@ -84,7 +84,8 @@ def test_make_broker_is_always_paper(monkeypatch):
     assert seen == [{"paper": True}]
     app = Path(paper.__file__).parent
     hits = [p.name for p in app.rglob("*.py") for _ in range(p.read_text().count("TradingClient("))]
-    assert hits == ["paper.py"]
+    assert sorted(hits) == ["paper.py", "ui.py"]  # ui.py: the calendar client, also paper=True
+    assert "TradingClient(*keys, paper=True)" in (app / "ui.py").read_text()
 
 
 def test_equity_history_dates_by_new_york_day():

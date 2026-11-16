@@ -2,7 +2,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as clock
 from zoneinfo import ZoneInfo
 
@@ -73,6 +73,11 @@ class Store:
             "o REAL, h REAL, l REAL, c REAL, v REAL, factor_all REAL, factor_split REAL,"
             "PRIMARY KEY(symbol, date)) WITHOUT ROWID"
         )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS sessions("
+            "day TEXT PRIMARY KEY, open INTEGER, close INTEGER) WITHOUT ROWID"
+        )
+        self.db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID")
         self.db.execute("CREATE TABLE IF NOT EXISTS daily_meta(through TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS daily_symbols(symbol TEXT PRIMARY KEY) WITHOUT ROWID")
 
@@ -133,6 +138,24 @@ class Store:
         with self.db:
             self.db.execute("DELETE FROM daily_symbols")
             self.db.executemany("INSERT INTO daily_symbols VALUES (?)", [(s,) for s in set(symbols)])
+
+    def save_sessions(self, rows) -> None:
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO sessions VALUES (?,?,?)",
+                                [(r.day.isoformat(), r.open, r.close) for r in rows])
+
+    def sessions(self) -> list:
+        from app.sessions import Session  # sessions imports this module
+        return [Session(date.fromisoformat(d), o, c)
+                for d, o, c in self.db.execute("SELECT day, open, close FROM sessions ORDER BY day")]
+
+    def meta(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
 
     def handled_splits(self) -> set[tuple[str, str]]:
         return set(self.db.execute("SELECT symbol, ex_date FROM splits"))

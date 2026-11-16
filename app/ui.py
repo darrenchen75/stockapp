@@ -10,6 +10,7 @@ from pathlib import Path
 import pyqtgraph as pg
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
+from alpaca.trading.client import TradingClient
 from PySide6.QtCore import QLockFile, QPointF, QRectF, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QActionGroup, QColor, QDesktopServices, QPainter, QPicture, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QHBoxLayout, QMainWindow,
@@ -191,6 +192,7 @@ class MainWindow(QMainWindow):
     def start_poller(self, keys: tuple[str, str]):
         self.poller = Poller(StockHistoricalDataClient(*keys), self.db_path, self.symbols,
                              actions=CorporateActionsClient(*keys),
+                             trading=TradingClient(*keys, paper=True),
                              on_progress=self.progressed.emit, on_updated=self.polled.emit,
                              on_status=self.status_changed.emit, on_auth_failed=self.key_rejected.emit)
         self.poller.start()

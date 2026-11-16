@@ -11,6 +11,7 @@ from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+from app import market
 from app.store import ET, Bar, Store
 
 log = logging.getLogger(__name__)
@@ -143,11 +144,12 @@ class Poller:
     """Runs backfill() on a background thread: full on start, then a gap fill every poll_seconds.
     Plain Python so it runs without a GUI; callbacks fire on the poller thread."""
 
-    def __init__(self, client, db_path, symbols, actions=None, poll_seconds=60, retry_seconds=30,
+    def __init__(self, client, db_path, symbols, actions=None, trading=None, poll_seconds=60, retry_seconds=30,
                  on_progress=lambda done, total: None, on_updated=lambda: None,
                  on_status=lambda text: None, on_auth_failed=lambda: None):
         self.client, self.db_path, self.symbols = client, db_path, symbols
         self.actions = actions  # corporate-actions client; None skips split repair
+        self.trading = trading  # trading client for the market calendar; None skips it
         self.poll_seconds, self.retry_seconds = poll_seconds, retry_seconds
         self.on_progress, self.on_updated = on_progress, on_updated
         self.on_status, self.on_auth_failed = on_status, on_auth_failed
@@ -186,6 +188,8 @@ class Poller:
             if self.stop.is_set():
                 return
             first = False
+            if self.trading:
+                market.refresh(self.trading, store, datetime.now(ET))  # logs and swallows its own errors
             if time.time() - pruned > 86400:  # keep the cache a rolling 30 days while the app stays open
                 store.prune(DAYS)
                 pruned = time.time()
