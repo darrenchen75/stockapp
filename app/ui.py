@@ -12,11 +12,11 @@ from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.trading.client import TradingClient
 from PySide6.QtCore import QLockFile, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QActionGroup, QColor, QDesktopServices, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QMainWindow,
-                               QMessageBox, QProgressDialog, QSplitter, QTableView, QTableWidget,
-                               QTableWidgetItem)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QHBoxLayout, QLabel, QMainWindow,
+                               QMessageBox, QProgressDialog, QSplitter, QTableWidget, QTableWidgetItem,
+                               QTreeView, QVBoxLayout, QWidget)
 
-from app import prefs, quotes, sessions, settings, theme, update
+from app import groups, prefs, quotes, sessions, settings, theme, update
 from app.chart import PriceChart
 from app.feed import KEEP_DAYS, Poller
 from app.listing import Listing, load_listings
@@ -28,6 +28,17 @@ log = logging.getLogger(__name__)
 COLUMNS = ["Symbol", "Name", "Last", "% Chg", "Volume", "Gaps"]
 UP, DOWN = QColor("#26a69a"), QColor("#ef5350")
 LIVE_SECONDS = 300 + 900  # SIP bars arrive 15 minutes late
+
+
+class ListProxy(QSortFilterProxyModel):
+    """Sorts rows within each parent; group rows stay in name order."""
+
+    def lessThan(self, left, right):
+        a, b = left.siblingAtColumn(0).data(Qt.UserRole), right.siblingAtColumn(0).data(Qt.UserRole)
+        if a is None or b is None:
+            return super().lessThan(left, right)
+        # Descending sorts call lessThan(right, left), so flip to keep names ascending.
+        return a.name > b.name if self.sortOrder() == Qt.DescendingOrder else a.name < b.name
 
 
 class StatsPanel(QTableWidget):
@@ -114,24 +125,42 @@ class MainWindow(QMainWindow):
         self.model = QStandardItemModel(0, len(COLUMNS))
         self.model.setHorizontalHeaderLabels(COLUMNS)
         self.model.setHeaderData(COLUMNS.index("Gaps"), Qt.Horizontal, "Trading days with no bars in the last 30 days", Qt.ToolTipRole)
-        for s in symbols:
-            row = [QStandardItem() for _ in COLUMNS]
-            row[0].setText(s)
-            row[1].setText(self.listings[s].name if s in self.listings else "")
-            self.model.appendRow(row)
-        self.rows = {s: i for i, s in enumerate(symbols)}
-        self.proxy = QSortFilterProxyModel()  # re-sorts on data change; source rows stay put
+        saved = prefs.load(data_dir)
+        self.group_by = saved.get("group_by") if saved.get("group_by") in groups.BY else "none"
+        expanded = saved.get("expanded")
+        self.expanded = {x for x in expanded if isinstance(x, str)} if isinstance(expanded, list) else set()
+        self.shape = None  # the grouping the model was last built for; rebuilt only when it changes
+        self.rows: dict[str, list[list[QStandardItem]]] = {}  # symbol -> its rows (several in index view)
+        self.group_rows: dict[str, list[QStandardItem]] = {}
+        self.proxy = ListProxy()  # re-sorts on data change; source rows stay put
         self.proxy.setSourceModel(self.model)
 
-        self.table = QTableView()
-        self.table.setModel(self.proxy)
-        self.table.setSortingEnabled(True)
-        self.table.sortByColumn(0, Qt.AscendingOrder)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.verticalHeader().hide()
-        self.table.selectionModel().currentRowChanged.connect(self.on_select)
+        self.tree = QTreeView()
+        self.tree.setModel(self.proxy)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(0, Qt.AscendingOrder)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tree.setExpandsOnDoubleClick(False)  # a click already toggles exchange groups
+        self.tree.selectionModel().currentRowChanged.connect(self.on_select)
+        self.tree.clicked.connect(self.on_click)
+        self.tree.expanded.connect(lambda i: self.on_expand(i, True))
+        self.tree.collapsed.connect(lambda i: self.on_expand(i, False))
+        self.group_by_box = QComboBox()
+        self.group_by_box.addItems([b.capitalize() for b in groups.BY])
+        self.group_by_box.setCurrentIndex(groups.BY.index(self.group_by))
+        self.group_by_box.currentIndexChanged.connect(self.set_group_by)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Group by"))
+        bar.addWidget(self.group_by_box)
+        bar.addStretch()
+        left = QWidget()
+        box = QVBoxLayout(left)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addLayout(bar)
+        box.addWidget(self.tree)
 
         self.chart = PriceChart()
 
@@ -141,14 +170,14 @@ class MainWindow(QMainWindow):
         right.addWidget(self.stats)
         right.setSizes([480, 220])
         split = QSplitter()
-        split.addWidget(self.table)
+        split.addWidget(left)
         split.addWidget(right)
         split.setSizes([520, 680])
         self.setCentralWidget(split)
         view = self.menuBar().addMenu("View")
         self.theme_actions = {}
         theme_group = QActionGroup(self)
-        current = prefs.load(data_dir).get("theme", "system")
+        current = saved.get("theme", "system")
         for choice in theme.CHOICES:
             action = view.addAction(choice.capitalize(), lambda c=choice: self.set_theme(c))
             action.setCheckable(True)
@@ -347,17 +376,82 @@ class MainWindow(QMainWindow):
         theme.apply(QApplication.instance(), choice)
         prefs.save(self.data_dir, theme=choice)
 
+    def set_group_by(self, i: int):
+        self.group_by = groups.BY[i]
+        prefs.save(self.data_dir, group_by=self.group_by)
+        self.refresh()
+
+    def on_expand(self, index, is_open: bool):
+        name = index.siblingAtColumn(0).data(Qt.UserRole).name
+        new = self.expanded | {name} if is_open else self.expanded - {name}
+        if new != self.expanded:  # rebuilds re-expand saved groups; no write for those
+            self.expanded = new
+            prefs.save(self.data_dir, expanded=sorted(new))
+
+    def on_click(self, index):
+        index = index.siblingAtColumn(0)
+        g = index.data(Qt.UserRole)
+        if g is not None and g.etf is None:  # ETF-backed groups chart their ETF via on_select instead
+            self.tree.setExpanded(index, not self.tree.isExpanded(index))
+
+    def rebuild(self, built: list[groups.Group]):
+        self.model.removeRows(0, self.model.rowCount())
+        self.rows, self.group_rows = {}, {}
+
+        def symbol_row(s):
+            row = [QStandardItem() for _ in COLUMNS]
+            row[0].setText(s)
+            row[1].setText(self.listings[s].name if s in self.listings else "")
+            self.rows.setdefault(s, []).append(row)
+            return row
+        for s in ([] if built else self.symbols):
+            self.model.appendRow(symbol_row(s))
+        for g in built:
+            row = [QStandardItem() for _ in COLUMNS]
+            row[0].setText(f"{g.name} ({len(g.members)})")
+            row[0].setData(g, Qt.UserRole)
+            for s in g.members:
+                row[0].appendRow(symbol_row(s))
+            self.group_rows[g.name] = row
+            self.model.appendRow(row)
+        self.tree.setRootIsDecorated(bool(built))
+        for g in built:
+            if g.name in self.expanded:
+                self.tree.setExpanded(self.proxy.mapFromSource(self.group_rows[g.name][0].index()), True)
+        if built:
+            self.tree.resizeColumnToContents(0)
+        for row in self.rows.get(self.symbol, []):  # keep the highlight if its row is visible
+            index = self.proxy.mapFromSource(row[0].index())
+            if not index.parent().isValid() or self.tree.isExpanded(index.parent()):
+                self.tree.setCurrentIndex(index)
+                break
+
     def refresh(self):
         summaries, gaps = self.store.summary(sessions.load(self.store)), self.store.gaps(self.symbols)
-        for symbol, row in self.rows.items():
+        pcts = {s: x.pct for s, x in summaries.items()}
+        listed = {s: self.listings[s] for s in self.symbols if s in self.listings}
+        built = groups.build(self.group_by, listed, self.store.exchanges(), pcts)
+        shape = (self.group_by, [(g.name, g.members) for g in built])
+        if shape != self.shape:
+            self.shape = shape
+            self.rebuild(built)
+        pct_col = COLUMNS.index("% Chg")
+
+        def paint(item, pct):
+            item.setData(None if pct is None else round(pct, 2), Qt.DisplayRole)  # None = blank cell
+            item.setData(None if pct is None else (UP if pct >= 0 else DOWN), Qt.ForegroundRole)
+        for symbol, rows in self.rows.items():
             x = summaries.get(symbol)
-            pct = x.pct if x else None
-            values = [round(x.last, 2), None if pct is None else round(pct, 2), x.volume] if x else [None] * 3
-            values.append(gaps.get(symbol))  # None (no data) = blank, like the other columns
-            for col, value in enumerate(values, start=COLUMNS.index("Last")):
-                self.model.item(row, col).setData(value, Qt.DisplayRole)  # None = blank cell
-            color = None if pct is None else (UP if pct >= 0 else DOWN)
-            self.model.item(row, COLUMNS.index("% Chg")).setData(color, Qt.ForegroundRole)
+            # None (no data) = blank cell
+            cells = {"Last": round(x.last, 2) if x else None, "Volume": x.volume if x else None,
+                     "Gaps": gaps.get(symbol)}
+            for row in rows:
+                for name, value in cells.items():
+                    row[COLUMNS.index(name)].setData(value, Qt.DisplayRole)
+                paint(row[pct_col], pcts.get(symbol))
+        for g in built:
+            self.group_rows[g.name][0].setData(g, Qt.UserRole)
+            paint(self.group_rows[g.name][pct_col], g.avg_pct)
         self.model.setHeaderData(COLUMNS.index("Last"), Qt.Horizontal, self.feed_label(), Qt.ToolTipRole)
         self.show_status()
         self.draw()
@@ -377,7 +471,11 @@ class MainWindow(QMainWindow):
     def on_select(self, current, _previous):
         if not current.isValid():
             return
-        self.symbol = self.model.item(self.proxy.mapToSource(current).row(), 0).text()
+        index = current.siblingAtColumn(0)
+        g = index.data(Qt.UserRole)
+        if g is not None and g.etf is None:
+            return  # exchange groups have no chart; a click toggles them
+        self.symbol = g.etf if g else index.data()
         self.draw()
 
     def draw(self):
