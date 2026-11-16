@@ -40,7 +40,7 @@ def test_holidays_are_missing_weekdays():
 def test_market_refresh_failure_is_logged_not_raised(tmp_path, caplog):
     class Rejecting:
         def get_calendar(self, req): raise HTTPError(401)
-        def get_all_assets(self, req): return _assets(A="NYSE")
+        def get(self, path, params=None): return _assets(A="NYSE")
     market.refresh(Rejecting(), store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET))
     assert store(tmp_path).sessions() == [] and "calendar" in caplog.text
 
@@ -49,7 +49,7 @@ def test_refresh_saves_and_skips_when_fresh(tmp_path):
     calls = []
 
     class Trading:
-        def get_all_assets(self, req): return _assets(A="NYSE")
+        def get(self, path, params=None): return _assets(A="NYSE")
 
         def get_calendar(self, req):
             calls.append(req)
@@ -75,7 +75,7 @@ def test_expired_calendar_falls_back_for_uncovered_bar_dates(tmp_path):
 def test_poller_calendar_401_does_not_report_bad_key(tmp_path):
     class Rejecting:
         def get_calendar(self, req): raise HTTPError(401)
-        def get_all_assets(self, req): return _assets(A="NYSE")
+        def get(self, path, params=None): return _assets(A="NYSE")
     t = datetime.now(timezone.utc)
     client = FakeClient({"A": [fake_bar(t.replace(microsecond=0))]})
     auth, updated = [], threading.Event()
@@ -92,7 +92,7 @@ def test_refresh_failure_retries_at_most_hourly(tmp_path):
 
     class Rejecting:
         def get_calendar(self, req): calls.append(1); raise HTTPError(401)
-        def get_all_assets(self, req): return _assets(A="NYSE")
+        def get(self, path, params=None): return _assets(A="NYSE")
     s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
     market.refresh(Rejecting(), s, now)
     market.refresh(Rejecting(), s, now + timedelta(minutes=59))
@@ -119,7 +119,16 @@ def _t(d, h, m):
 
 
 def _assets(**kw):
-    return [SimpleNamespace(symbol=k, exchange=SimpleNamespace(value=v)) for k, v in kw.items()]
+    return [{"symbol": k, "exchange": v} for k, v in kw.items()]
+
+
+def test_unknown_exchange_code_is_stored_as_is(tmp_path):
+    class Trading:
+        def get_calendar(self, req): return []
+        def get(self, path, params=None): return _assets(NEW="TXSE")
+    s = store(tmp_path)
+    market.refresh(Trading(), s, datetime(2026, 11, 16, 12, tzinfo=ET))
+    assert s.exchanges() == {"NEW": "TXSE"}
 
 
 def test_refresh_caches_exchanges_for_a_week(tmp_path):
@@ -127,8 +136,8 @@ def test_refresh_caches_exchanges_for_a_week(tmp_path):
 
     class Trading:
         def get_calendar(self, req): return []
-        def get_all_assets(self, req):
-            calls.append(req)
+        def get(self, path, params=None):
+            calls.append(path)
             return _assets(AAPL="NASDAQ", KO="NYSE")
     s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
     market.refresh(Trading(), s, now)
@@ -146,7 +155,7 @@ def test_exchange_failure_is_logged_retried_hourly_and_spares_calendar(tmp_path,
         def get_calendar(self, req):
             return [SimpleNamespace(date=date(2026, 11, 16), open=datetime(2026, 11, 16, 9, 30),
                                     close=datetime(2026, 11, 16, 16, 0))]
-        def get_all_assets(self, req): calls.append(1); raise HTTPError(401)
+        def get(self, path, params=None): calls.append(1); raise HTTPError(401)
     s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
     market.refresh(Trading(), s, now)
     market.refresh(Trading(), s, now + timedelta(minutes=59))
@@ -159,7 +168,7 @@ def test_exchange_failure_is_logged_retried_hourly_and_spares_calendar(tmp_path,
 def test_calendar_failure_spares_exchanges(tmp_path):
     class Trading:
         def get_calendar(self, req): raise HTTPError(500)
-        def get_all_assets(self, req): return _assets(AAPL="NASDAQ")
+        def get(self, path, params=None): return _assets(AAPL="NASDAQ")
     s = store(tmp_path)
     market.refresh(Trading(), s, datetime(2026, 11, 16, 12, tzinfo=ET))
     assert s.exchanges() == {"AAPL": "NASDAQ"}
@@ -168,7 +177,7 @@ def test_calendar_failure_spares_exchanges(tmp_path):
 def test_empty_exchange_list_keeps_old_rows_and_retries(tmp_path, caplog):
     class Trading:
         def get_calendar(self, req): return []
-        def get_all_assets(self, req): return []
+        def get(self, path, params=None): return []
     s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
     s.save_exchanges({"AAPL": "NASDAQ"})
     market.refresh(Trading(), s, now)

@@ -1,8 +1,7 @@
 import logging
 from datetime import date, datetime, timedelta
 
-from alpaca.trading.enums import AssetClass
-from alpaca.trading.requests import GetAssetsRequest, GetCalendarRequest
+from alpaca.trading.requests import GetCalendarRequest
 
 from app.sessions import Session
 from app.store import ET, Store
@@ -20,10 +19,11 @@ def fetch_sessions(trading, start: date, end: date) -> list[Session]:
 
 
 def fetch_exchanges(trading) -> dict[str, str]:
-    assets = trading.get_all_assets(GetAssetsRequest(asset_class=AssetClass.US_EQUITY))
+    # raw rows: alpaca-py's Exchange enum rejects new codes such as TXSE
+    assets = trading.get("/assets", {"asset_class": "us_equity"})
     if not assets:  # an empty answer would wipe the cache and look fresh for a week
         raise ValueError("no assets returned")
-    return {a.symbol: a.exchange.value for a in assets}
+    return {a["symbol"]: a["exchange"] for a in assets if a.get("symbol") and a.get("exchange")}
 
 
 def refresh(trading, store: Store, now: datetime) -> None:
