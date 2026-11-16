@@ -310,6 +310,22 @@ def test_failed_swap_changes_nothing(tmp_path, fail):
     assert s.handled_splits() == {("A", "2026-11-01")} and s.meta("feed") is None
 
 
+def test_swap_truncates_the_wal(tmp_path):
+    s = staged_store(tmp_path)
+    s.swap_staged()
+    assert (tmp_path / "bars.db-wal").stat().st_size == 0  # checkpointed back into bars.db
+    assert store(tmp_path).latest_all() == {"A": 120, "B": 60}
+
+
+def test_swap_survives_a_failed_checkpoint(tmp_path, caplog):
+    s = staged_store(tmp_path)
+    s.db = FailingDb(s.db, "PRAGMA wal_checkpoint")
+    s.swap_staged()
+    assert "checkpoint" in caplog.text
+    s = store(tmp_path)
+    assert s.latest_all() == {"A": 120, "B": 60} and s.meta("feed") == "sip"
+
+
 def vm_steps(s, run) -> int:
     """SQLite virtual-machine steps `run` costs, in hundreds; a scan of bars costs about one per row."""
     steps = []

@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 import time
 from collections.abc import Iterable
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
     from app.sessions import Session
 
 ET = ZoneInfo("America/New_York")
+log = logging.getLogger(__name__)
 
 
 def day_start(ts: int) -> int:
@@ -109,6 +111,11 @@ class Store:
             self.db.execute("DELETE FROM bars_staging")
             self.db.execute("DELETE FROM splits")
             self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("feed", "sip"))
+        try:  # the swap rewrote every row, so the WAL is now about as big as bars.db; hand the space back
+            if self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+                log.warning("WAL checkpoint after the SIP swap was blocked by a reader; it shrinks later")
+        except sqlite3.Error as e:
+            log.warning("WAL checkpoint after the SIP swap failed: %s", e)
 
     def replace(self, symbol: str, bars: Iterable[Bar], ex_date: str | None) -> None:
         """Swap all of `symbol`'s rows for split-adjusted `bars` and mark the split handled (unless
