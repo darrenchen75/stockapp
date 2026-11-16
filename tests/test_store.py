@@ -308,3 +308,30 @@ def test_failed_swap_changes_nothing(tmp_path, fail):
     assert s.latest_all() == {"A": 60, "IEXONLY": 60} and s.bars("A", 0)[0].c == 1.0
     assert s.staged_latest_all() == {"A": 120, "B": 60}
     assert s.handled_splits() == {("A", "2026-11-01")} and s.meta("feed") is None
+
+
+def vm_steps(s, run) -> int:
+    """SQLite virtual-machine steps `run` costs, in hundreds; a scan of bars costs about one per row."""
+    steps = []
+    s.db.set_progress_handler(lambda: steps.append(1) and 0, 100)
+    try:
+        run()
+    finally:
+        s.db.set_progress_handler(None, 0)
+    return len(steps)
+
+
+def test_ui_refresh_queries_seek_by_primary_key(tmp_path):
+    # The UI runs these every poll and they once read all ~8M SIP rows: ~1s frozen per refresh.
+    from datetime import date, timedelta
+
+    from app import sessions
+    s = store(tmp_path)
+    days = [d for i in range(60) if (d := date(2026, 9, 1) + timedelta(days=i)).weekday() < 5]
+    s.upsert([bar(x, ts(d.year, d.month, d.day, 10, 0) + 60 * m) for x in ("AAPL", "MSFT") for d in days
+              for m in range(200)])
+    scan = vm_steps(s, lambda: s.db.execute("SELECT MAX(ts) FROM bars").fetchall())
+    assert scan > 100  # sanity: a scan of these ~17k rows is measurable
+    for run in (s.latest_all, s.latest, lambda: s.summary(SESSIONS), lambda: sessions.load(s)):
+        assert vm_steps(s, run) < scan / 5
+    assert s.latest() == ts(2026, 10, 30, 10, 0) + 60 * 199

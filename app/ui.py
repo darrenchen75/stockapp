@@ -120,6 +120,7 @@ class MainWindow(QMainWindow):
         self.store = Store(db_path)
         self.listings = load_listings()
         self.symbol: str | None = None
+        self.sessions: list[sessions.Session] = []  # loaded once per refresh; selection reuses them
         self.poller: Poller | None = None
 
         self.model = QStandardItemModel(0, len(COLUMNS))
@@ -427,7 +428,8 @@ class MainWindow(QMainWindow):
                 break
 
     def refresh(self):
-        summaries, gaps = self.store.summary(sessions.load(self.store)), self.store.gaps(self.symbols)
+        self.sessions = sessions.load(self.store)
+        summaries, gaps = self.store.summary(self.sessions), self.store.gaps(self.symbols)
         pcts = {s: x.pct for s, x in summaries.items()}
         listed = {s: self.listings[s] for s in self.symbols if s in self.listings}
         built = groups.build(self.group_by, listed, self.store.exchanges(), pcts)
@@ -475,13 +477,15 @@ class MainWindow(QMainWindow):
         g = index.data(Qt.UserRole)
         if g is not None and g.etf is None:
             return  # exchange groups have no chart; a click toggles them
-        self.symbol = g.etf if g else index.data()
-        self.draw()
+        symbol = g.etf if g else index.data()
+        if symbol != self.symbol:  # a rebuild re-selecting the same symbol is drawn once, by refresh
+            self.symbol = symbol
+            self.draw()
 
     def draw(self):
         if self.symbol is None:
             return
-        sess = sessions.load(self.store)
+        sess = self.sessions
         # Always 30 days (+1 for DST slack); the chart's range only picks the view.
         since = (self.store.session_start(self.symbol) or 0) - 31 * 86400
         name = self.listings[self.symbol].name if self.symbol in self.listings else ""

@@ -115,3 +115,23 @@ def test_refresh_keeps_selection(window):
     w.tree.setCurrentIndex(w.tree.model().index(1, 0))
     w.refresh()
     assert w.tree.currentIndex().data() == "MSFT" and w.symbol == "MSFT"
+
+
+def test_selection_reuses_the_refreshed_sessions(window, monkeypatch):
+    w = window()
+    loads = []
+    monkeypatch.setattr(ui.sessions, "load", lambda store: loads.append(1) or [])
+    w.tree.setCurrentIndex(w.tree.model().index(1, 0))
+    w.tree.setCurrentIndex(w.tree.model().index(2, 0))
+    assert loads == [] and w.symbol == "SPY"
+
+
+def test_regroup_draws_once(window, monkeypatch):
+    w = window()
+    w.tree.setCurrentIndex(w.tree.model().index(0, 0))  # AAPL
+    draws = []
+    monkeypatch.setattr(w, "draw", lambda: draws.append(w.symbol))
+    w.group_by_box.setCurrentIndex(1)
+    w.tree.expand(group_index(w, "Information Technology"))
+    w.group_by_box.setCurrentIndex(0)  # AAPL's row is visible again and re-selected
+    assert draws == ["AAPL", "AAPL"] and w.tree.currentIndex().data() == "AAPL"

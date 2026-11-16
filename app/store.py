@@ -191,10 +191,15 @@ class Store:
         return set(self.db.execute("SELECT symbol, ex_date FROM splits"))
 
     def latest_all(self) -> dict[str, int]:
-        return dict(self.db.execute("SELECT symbol, MAX(ts) FROM bars GROUP BY symbol"))
+        """Skip-scan: one primary-key seek to find each next symbol and one for its newest bar, so the
+        cost grows with symbols, not rows (GROUP BY or MAX(ts) alone read every row: ~0.2s at SIP size)."""
+        return dict(self.db.execute(
+            "WITH RECURSIVE s(sym) AS (SELECT MIN(symbol) FROM bars UNION ALL"
+            " SELECT (SELECT MIN(symbol) FROM bars WHERE symbol > sym) FROM s WHERE sym IS NOT NULL)"
+            " SELECT sym, (SELECT MAX(ts) FROM bars WHERE symbol = sym) FROM s WHERE sym IS NOT NULL"))
 
     def latest(self) -> int | None:
-        return self.db.execute("SELECT MAX(ts) FROM bars").fetchone()[0]
+        return max(self.latest_all().values(), default=None)
 
     def bars(self, symbol: str, since: int) -> list[Bar]:
         rows = self.db.execute(

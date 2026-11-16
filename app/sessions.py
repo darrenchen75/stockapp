@@ -36,14 +36,15 @@ def load(store: Store) -> list[Session]:
     global _warned
     rows = {s.day: s for s in store.sessions()}
     lo, hi = store.meta("calendar_from"), store.meta("calendar_to")
-    last = store.latest()
-    if last is not None:
-        end = datetime.fromtimestamp(last, ET).date()
+    latest = store.latest_all()
+    if latest:
+        end = datetime.fromtimestamp(max(latest.values()), ET).date()
         days = (end - timedelta(days=36) + timedelta(days=i) for i in range(37))
+        # symbol IN (...) makes each probe primary-key seeks; a bare ts range reads every row on a bar-less day
+        probe = f"SELECT 1 FROM bars WHERE symbol IN ({','.join('?' * len(latest))}) AND ts >= ? AND ts < ? LIMIT 1"
         uncovered = [d for d in days if d.weekday() < 5 and d not in rows
                      and not (lo and hi and lo <= d.isoformat() <= hi)
-                     and store.db.execute("SELECT 1 FROM bars WHERE ts >= ? AND ts < ? LIMIT 1",
-                                          (_at(d, 0, 0), _at(d + timedelta(days=1), 0, 0))).fetchone()]
+                     and store.db.execute(probe, (*latest, _at(d, 0, 0), _at(d + timedelta(days=1), 0, 0))).fetchone()]
         if uncovered:
             if not _warned:
                 log.warning("market calendar missing for %d day(s); assuming 09:30-16:00 ET", len(uncovered))
