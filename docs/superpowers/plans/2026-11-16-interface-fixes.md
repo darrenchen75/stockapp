@@ -25,11 +25,11 @@
 
 ## Review Focus
 
-1. **App opened before today's open, or on a weekend/holiday:** Last and 1D show the previous session vs the one before; nothing reads 0 or blank for a stock that traded. → test in Task 6.
-2. **Early-close day (13:00 close):** post-13:00 bars excluded from Last/Volume/volatility. → test in Task 2 and Task 6.
-3. **Migration interrupted by quit mid-download, then relaunched:** IEX bars still shown, resumes from staging, never an empty list. → test in Task 5.
+1. **App opened before today's open, or on a weekend/holiday:** Last and 1D show the previous session vs the one before; nothing reads 0 or blank for a stock that traded. → test in Task 5.
+2. **Early-close day (13:00 close):** post-13:00 bars excluded from Last/Volume/volatility. → test in Task 2 and Task 5.
+3. **Migration interrupted by quit mid-download, then relaunched:** IEX bars still shown, resumes from staging, never an empty list. → test in Task 4.
 4. **User scrolled back while new bars arrive and the oldest day is pruned:** the view still shows the same times. → test in Task 3.
-5. **Live-only Alpaca key (paper endpoint 401):** calendar falls back, exchanges stay "Unknown", no key prompt, data keeps flowing. → test in Task 2 and Task 9.
+5. **Live-only Alpaca key (paper endpoint 401):** calendar falls back, exchanges stay "Unknown", no key prompt, data keeps flowing. → test in Task 2 and Task 8.
 
 ---
 
@@ -102,13 +102,13 @@ def test_watcher_fires_on_palette_change_and_new_window_starts_in_new_colours(qa
 - Produces:
   - `sessions.Session(day: date, open: int, close: int)` frozen dataclass (Unix seconds).
   - `sessions.fallback(days: Iterable[date]) -> list[Session]` — weekdays given, 09:30–16:00 ET.
-  - `sessions.load(store: Store) -> list[Session]` — cached calendar sorted by day; when empty, `fallback` over NY dates that have bars (logs a warning once per process).
+  - `sessions.load(store: Store) -> list[Session]` — cached calendar sessions, plus `fallback` sessions for every NY weekday that has bars and lies *outside* the cached calendar's covered range (`meta("calendar_from")`..`meta("calendar_to")`), sorted by day. Inside the covered range the cache is authoritative (a weekday missing from it is a holiday). An empty cache means everything is fallback. Logs a warning once per process when any fallback is used. *(Codex plan review: an expired cache must not freeze prices.)*
   - `sessions.holidays(sessions: list[Session]) -> list[date]` — weekdays between first and last session day that aren't sessions.
   - `sessions.regular(bars: list[Bar], sessions: list[Session]) -> dict[date, list[Bar]]` — regular bars grouped by session day, in time order; days with none are absent.
   - `sessions.to_x(ts: int, holidays: list[date]) -> float | None` and `sessions.from_x(x: float, holidays: list[date]) -> int` (see Step 3).
   - `Store.save_sessions(rows: list[Session]) -> None` (upsert), `Store.sessions() -> list[Session]`, `Store.meta(key: str) -> str | None`, `Store.set_meta(key: str, value: str) -> None`.
   - `market.fetch_sessions(trading, start: date, end: date) -> list[Session]` via `GetCalendarRequest`; `open`/`close` are naive NY datetimes in alpaca-py — localise with `ET`.
-  - `market.refresh(trading, store: Store, now: datetime) -> None` — if `meta("calendar_at")` is older than 1 day: fetch `[today - 35, today + 10]`, save, set meta. Catches every exception and logs it.
+  - `market.refresh(trading, store: Store, now: datetime) -> None` — if `meta("calendar_at")` is older than 1 day: fetch `[today - 35, today + 10]`, save, set `calendar_at`, and widen `calendar_from`/`calendar_to` to cover the fetched range. Catches every exception and logs it.
   - `Poller(..., trading=None)`: calls `market.refresh(self.trading, store, datetime.now(ET))` after each successful backfill when `trading` is set.
 
 - [ ] **Step 1: Write failing tests:**
@@ -138,6 +138,14 @@ def test_market_refresh_failure_is_logged_not_raised(tmp_path, caplog):
         def get_calendar(self, req): raise HTTPError(401)
     market.refresh(Rejecting(), store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET))
     assert store(tmp_path).sessions() == [] and "calendar" in caplog.text
+
+def test_expired_calendar_falls_back_for_uncovered_bar_dates(tmp_path):
+    s = store(tmp_path)
+    s.save_sessions([Session(date(2026, 11, 2), ts(2026, 11, 2, 9, 30), ts(2026, 11, 2, 16, 0))])
+    s.set_meta("calendar_from", "2026-11-02"); s.set_meta("calendar_to", "2026-11-03")  # 11-03 covered, no session = holiday
+    s.upsert([bar("A", ts(2026, 11, 3, 10, 0)), bar("A", ts(2026, 11, 16, 10, 0))])  # 11-16 is past the cache
+    days = [x.day for x in sessions.load(s)]
+    assert date(2026, 11, 16) in days and date(2026, 11, 3) not in days
 
 def test_poller_calendar_401_does_not_report_bad_key(tmp_path):
     # Poller with a FakeClient that serves bars and a trading client whose get_calendar raises HTTPError(401):
@@ -194,6 +202,16 @@ def test_held_view_keeps_its_times_after_new_bar_and_prune(qapp):
     assert c.visible_ts() == before
 
 def test_unheld_view_follows_latest_bar(qapp): ...   # set_data with a later bar moves the right edge to it
+@pytest.mark.parametrize("last_day, name, start_day", [
+    (date(2026, 11, 16), "30D", date(2026, 10, 19)),  # Mon; 30 days back is Sat 10-17 → Mon 10-19
+    (date(2026, 11, 19), "5D", date(2026, 11, 16)),   # Thu; 5 days back is Sat 11-14 → Mon 11-16
+    (date(2026, 11, 30), "5D", date(2026, 11, 25)),   # Mon; 5 days back is Wed 11-25, a session
+    (date(2026, 11, 3), "5D", date(2026, 10, 29)),    # Tue; 5 days back is Thu 10-29, across the 2026-11-01 DST change
+    (date(2026, 3, 10), "5D", date(2026, 3, 5)),      # Tue; 5 days back is Thu 03-05, across the 2026-03-08 DST change
+])
+def test_range_start_uses_new_york_dates(qapp, last_day, name, start_day): ...
+    # bars every 30 min 04:00-20:00 ET on every weekday up to last_day, holidays=[2026-11-26];
+    # after set_range(name), visible_ts()[0] == 04:00 ET on start_day
 def test_double_click_resets(qapp): ...              # c.on_double_click() clears hold
 def test_title_axis_labels_and_line_over_candles(qapp):
     c = PriceChart(); c.set_data("AAPL", "AAPL · Apple Inc.", bars, S, "SIP, 15 min delayed")
@@ -206,7 +224,7 @@ def test_title_axis_labels_and_line_over_candles(qapp):
 
 - [ ] **Step 2: Run** `uv run pytest tests/test_chart.py -v` — FAIL.
 
-- [ ] **Step 3: Implement `app/chart.py`.** Bars whose `to_x` is `None` are not drawn. Close line: `pg.PlotDataItem` with `connect="finite"`, inserting `NaN` where consecutive bars are more than 1 x apart (gaps inside the trading day stay visible). Candles drawn at `to_x(ts)` with opacity ~0.3, `theme.colors().up/down`. `vb.setMouseEnabled(x=True, y=False)`, `vb.enableAutoRange(axis="y")`, `vb.setAutoVisible(y=True)`. `sigRangeChangedManually` → `hold = visible_ts()`. On `set_data`: if `hold`, map both ends with `to_x` (a `None` end snaps to the nearest drawn bar) and `setXRange(..., padding=0)`; else range start = latest session's 04:00 for 1D, or `last_ts - N*86400` for 5D/30D, end = last bar. Double-click: `self.plot.scene().sigMouseClicked` with `ev.double()` → `on_double_click()` → `reset()` + re-scope. Title: `f"{title} · {range} · {feed_label}"` (omit empty parts). Restyle on `theme.watcher().changed`.
+- [ ] **Step 3: Implement `app/chart.py`.** Bars whose `to_x` is `None` are not drawn. Close line: `pg.PlotDataItem` with `connect="finite"`, inserting `NaN` where consecutive bars are more than 1 x apart (gaps inside the trading day stay visible). Candles drawn at `to_x(ts)` with opacity ~0.3, `theme.colors().up/down`. `vb.setMouseEnabled(x=True, y=False)`, `vb.enableAutoRange(axis="y")`, `vb.setAutoVisible(y=True)`. `sigRangeChangedManually` → `hold = visible_ts()`. On `set_data`: if `hold`, map both ends with `to_x` (a `None` end snaps to the nearest drawn bar) and `setXRange(..., padding=0)`; else the range is computed in **New York calendar dates** *(Codex plan review)*: `last_day` = NY date of the newest drawn bar; 1D start day = `last_day`; 5D/30D start day = the first non-holiday weekday on or after `last_day - N days` (date arithmetic, not seconds, so DST changes nothing and the lookback matches the stats panel). Range start = `to_x` of 04:00 ET on the start day; end = `to_x(last bar) + 1`. Every boundary is therefore a valid x. Double-click: `self.plot.scene().sigMouseClicked` with `ev.double()` → `on_double_click()` → `reset()` + re-scope. Title: `f"{title} · {range} · {feed_label}"` (omit empty parts). Restyle on `theme.watcher().changed`.
 
 - [ ] **Step 4: Wire into `ui.py`.** `MainWindow.draw()` calls `self.chart.set_data(symbol, title, self.store.bars(symbol, since), sessions.load(self.store), label)`, with `since` = start of 30D window (always load 30 days; the range only sets the view). Delete `Candles` and the old range buttons from `ui.py`.
 
@@ -216,15 +234,27 @@ def test_title_axis_labels_and_line_over_candles(qapp):
 
 ## Phase 2: SIP switch
 
-### Task 4: SIP feed, 15-minute end, 35-day keep
+### Task 4: SIP switch — feed, 15-minute end, 35-day keep, staged migration
+
+One task, one commit: the feed must never write SIP bars into `bars` before the migration gate exists. *(Codex plan review: an intermediate commit with SIP fetch and no gate would mix feeds.)*
 
 **Files:**
-- Modify: `app/feed.py` (`fetch`, `backfill`, `repair_splits`, `Poller.run` prune, `KEEP_DAYS`), `app/ui.py` (`LIVE_SECONDS`), `tests/test_feed.py`
+- Modify: `app/feed.py` (`fetch`, `plan`, `backfill`, `repair_splits`, `Poller.run`, `KEEP_DAYS`, `DELAY`, `migrate`), `app/store.py` (staging), `app/ui.py` (`LIVE_SECONDS`, `feed_label`), `tests/test_feed.py`, `tests/test_store.py`
 
 **Interfaces:**
-- Produces: `feed.DELAY = timedelta(minutes=15)`, `feed.KEEP_DAYS = 35`. `plan(...)` floor uses `KEEP_DAYS`; `backfill`/`repair_splits` use `end = now - DELAY` everywhere they used `now`; poller prunes `KEEP_DAYS`. `DAYS = 30` remains for gaps/chart. `ui.LIVE_SECONDS = 300 + 900`.
+- Produces:
+  - `feed.DELAY = timedelta(minutes=15)`, `feed.KEEP_DAYS = 35`. `DAYS = 30` remains for gaps and the chart.
+  - `fetch` sends `DataFeed.SIP`. `backfill`, `migrate` and `repair_splits` use `end = now - DELAY` wherever they used `now`.
+  - `plan(symbols, latest, now, include_empty)`: `now` is the request end; floor = `now - KEEP_DAYS`; a job whose start is not before `now` is dropped (a bar newer than `now - DELAY` must not create an inverted window).
+  - `repair_splits` uses `KEEP_DAYS` for both the corporate-actions search window and the full refetch it hands to `Store.replace`, so a repair never deletes days 31–35 and a split 30–35 days old is found.
+  - Poller prunes `KEEP_DAYS`. `ui.LIVE_SECONDS = 300 + 900`.
+  - `Store`: table `bars_staging` (same columns/PK as `bars`); `staged_latest_all() -> dict[str, int]`; `upsert_staged(bars: Iterable[Bar]) -> None`; `swap_staged() -> None` — one transaction: `DELETE FROM bars`, `INSERT INTO bars SELECT * FROM bars_staging`, `DELETE FROM bars_staging`, `DELETE FROM splits`, `meta feed = "sip"`.
+  - `feed.migrate(client, store, symbols, now=None, sleep=time.sleep, progress=..., stop=None) -> bool` — plans from `staged_latest_all()` with `include_empty=True`, fetches each batch into staging; returns `True` and calls `swap_staged()` only if every batch was fetched without a stop; returns `False` on stop; exceptions propagate.
+  - `Poller.run`: while `store.meta("feed") != "sip"`, run `migrate` and nothing else that writes `bars` (no backfill, no split repair, no prune); `on_updated` after a successful swap; errors follow today's offline/auth handling (a data-client 401 is still a real key failure).
+  - `MainWindow.feed_label() -> str` — `"SIP, 15 min delayed"` if `meta("feed") == "sip"` else `"IEX, switching to SIP…"`; used in the chart title, the `Last` header tooltip and the status bar.
+  - A fresh install (no bars at all) also goes through `migrate`; it simply has nothing to replace.
 
-- [ ] **Step 1: Write failing tests** in `tests/test_feed.py`:
+- [ ] **Step 1: Write failing tests.** Add `StrictClient(FakeClient)` in `tests/test_feed.py` that raises `AssertionError` when `utc(req.start) >= utc(req.end)` or `utc(req.end) > now - 15 min`.
 
 ```python
 def test_fetch_asks_for_sip_ending_15_minutes_ago(tmp_path):
@@ -232,33 +262,17 @@ def test_fetch_asks_for_sip_ending_15_minutes_ago(tmp_path):
     backfill(c, store(tmp_path), ["A"], now=now)
     assert all(r.feed == DataFeed.SIP and utc(r.end) <= now - timedelta(minutes=15) for r in c.requests)
 
-def test_plan_first_run_fetches_35_days(): ...        # floor = now - 35 days
-def test_poller_prunes_to_35_days(tmp_path): ...      # update existing prune test
-```
+def test_upgrade_with_recent_iex_bars_never_inverts_a_window_or_mixes_feeds(tmp_path):
+    s = store(tmp_path); s.upsert([bar("A", int((NOW - timedelta(minutes=2)).timestamp()), c=1.0)])
+    p = Poller(StrictClient(data={"A": [...]}), str(tmp_path / "bars.db"), ["A"])  # run one cycle
+    # after the cycle: bars("A") are exactly the SIP rows from the fake, feed == "sip"; no request was inverted
 
-Update existing tests that assert 30-day floors or `DataFeed.IEX` to the new values (`test_plan_first_run_fetches_30_days_in_batches_of_10`, `test_plan_never_starts_before_30_day_floor`, `test_poller_prunes_while_running`, `test_fetch_requests_split_adjusted_bars`); rename where the number is in the name.
+def test_poller_does_not_backfill_or_repair_before_migration_completes(tmp_path): ...
+    # migrate stopped mid-way → backfill and repair_splits never called; bars untouched
 
-- [ ] **Step 2: Run** `uv run pytest tests/test_feed.py -v` — new tests FAIL.
-- [ ] **Step 3: Implement** the constants and uses above. `FakeClient` already records `requests`; `utc()` in `tests/test_feed.py` normalises alpaca-py's naive UTC times.
-- [ ] **Step 4: Run** `uv run pytest -q` — all pass.
-- [ ] **Step 5: Commit** `feat: fetch full-market minute bars 15 minutes behind`.
+def test_repair_keeps_35_days_and_finds_older_split(tmp_path): ...
+    # bars from now-35d; split ex-date now-33d → found, refetch starts at now-35d, 30D reference bar still present
 
-### Task 5: Staged IEX-to-SIP migration
-
-**Files:**
-- Modify: `app/store.py`, `app/feed.py`, `app/ui.py`, `tests/test_store.py`, `tests/test_feed.py`
-
-**Interfaces:**
-- Produces:
-  - `Store`: table `bars_staging` (same columns/PK as `bars`); `staged_latest_all() -> dict[str, int]`; `upsert_staged(bars: Iterable[Bar]) -> None`; `swap_staged() -> None` — one transaction: `DELETE FROM bars`, `INSERT INTO bars SELECT * FROM bars_staging`, `DELETE FROM bars_staging`, `DELETE FROM splits`, `meta feed = "sip"`.
-  - `feed.migrate(client, store, symbols, now=None, sleep=time.sleep, progress=..., stop=None) -> bool` — plans from `staged_latest_all()` with `include_empty=True`, fetches each batch (SIP, `end = now - DELAY`) into staging; returns `True` and calls `swap_staged()` only if every batch was fetched without a stop; returns `False` on stop; exceptions propagate.
-  - `Poller.run`: while `store.meta("feed") != "sip"`, run `migrate` instead of backfill/split repair; `on_updated` after a successful swap; errors follow today's offline/auth handling (data client 401 is still a real key failure).
-  - `MainWindow.feed_label() -> str` — `"SIP, 15 min delayed"` if `meta("feed") == "sip"` else `"IEX, switching to SIP…"`; used in the chart title, the `Last` header tooltip and the status bar.
-  - A fresh install (no bars at all) also goes through `migrate`; it simply has nothing to replace.
-
-- [ ] **Step 1: Write failing tests:**
-
-```python
 def test_migrate_error_leaves_iex_bars_and_keeps_staged(tmp_path):
     s = store(tmp_path); s.upsert([bar("A", NOW_TS - 3600, c=1.0)])
     c = FailSecond(data=...)  # FakeClient subclass: get_stock_bars raises HTTPError(500) on its 2nd call
@@ -269,20 +283,19 @@ def test_migrate_stop_returns_false_and_resume_finishes(tmp_path): ...
     # stop after batch 1 → False, bars untouched; second migrate() fetches only remaining symbols, swaps, feed == "sip"
 
 def test_swap_is_atomic_and_clears_splits(tmp_path): ...
-    # make INSERT fail (e.g. monkeypatch db.execute to raise on INSERT) → bars and splits unchanged, meta unchanged
-
-def test_poller_migrates_before_polling(tmp_path): ...
-    # feed marker missing → first cycle calls migrate, not backfill; after swap, next cycle backfills
+    # make the INSERT fail (wrap the connection) → bars, splits and meta unchanged
 ```
 
-- [ ] **Step 2: Run** — FAIL.
-- [ ] **Step 3: Implement** the interfaces above. `fetch` gains no table parameter; `migrate` calls `store.upsert_staged(fetch(...))`.
+Update existing tests that assert 30-day floors or `DataFeed.IEX` (`test_plan_first_run_fetches_30_days_in_batches_of_10`, `test_plan_never_starts_before_30_day_floor`, `test_poller_prunes_while_running`, `test_fetch_requests_split_adjusted_bars`, the `repair_splits` tests); rename where the number is in the name. Existing poller tests that expect a backfill on the first cycle set `meta("feed") = "sip"` first.
+
+- [ ] **Step 2: Run** `uv run pytest tests/test_feed.py tests/test_store.py -v` — new tests FAIL.
+- [ ] **Step 3: Implement** the interfaces above. `FakeClient` already records `requests`; `utc()` in `tests/test_feed.py` normalises alpaca-py's naive UTC times. `fetch` gains no table parameter; `migrate` calls `store.upsert_staged(fetch(...))`.
 - [ ] **Step 4: Run** `uv run pytest -q` — all pass.
-- [ ] **Step 5: Commit** `feat: switch stored bars to SIP without losing the old ones first`.
+- [ ] **Step 5: Commit** `feat: switch minute bars to SIP behind a staged migration`.
 
 ## Phase 3: Names and stats
 
-### Task 6: Regular-session summary
+### Task 5: Regular-session summary
 
 **Files:**
 - Modify: `app/store.py` (`summary`), `app/ui.py` (`refresh`), `tests/test_store.py`
@@ -309,14 +322,14 @@ def test_summary_no_regular_bars_is_absent(tmp_path):
     # only pre-market bars ever → symbol not in summary (blank row, not 0)
 ```
 
-`test_session_uses_new_york_date_not_utc` keeps its `session_start` assertion; its summary assertion changes to the regular rule (19:30 bar ignored → `last == 50.0`).
+`test_session_uses_new_york_date_not_utc` keeps its `session_start` assertion; its summary assertion changes to the regular rule (19:30 bar ignored → `last == 50.0`). `test_summary_reads_one_snapshot_while_history_is_replaced` passes sessions to both `summary()` calls and keeps its race: the new `summary` must still call `self.latest_all()` first, inside the `BEGIN` snapshot, so the hook's concurrent `replace` lands mid-read. Grep `summary(` in `app/` and `tests/` and update every caller. *(Codex plan review.)*
 
 - [ ] **Step 2: Run** `uv run pytest tests/test_store.py -v` — FAIL.
 - [ ] **Step 3: Implement**; `MainWindow.refresh` passes `sessions.load(self.store)`.
 - [ ] **Step 4: Run** `uv run pytest -q` — all pass.
 - [ ] **Step 5: Commit** `feat: list figures use regular-session bars only`.
 
-### Task 7: Viewer listings, names and packaging
+### Task 6: Viewer listings, names and packaging
 
 **Files:**
 - Create: `app/nasdaq100.csv`, `app/dow30.csv`, `app/listing.py`, `tests/test_listing.py`
@@ -355,7 +368,7 @@ def test_selftest_loads_viewer_listings(monkeypatch):
 - [ ] **Step 5: Run** `uv run pytest -q` and `packaging/build.sh && dist/StockBars/StockBars --selftest packaging/smoke_strategy.py` — prints `selftest ok`.
 - [ ] **Step 6: Commit** `feat: show company names and track Nasdaq-100, Dow 30 and sector ETFs`.
 
-### Task 8: Stats panel
+### Task 7: Stats panel
 
 **Files:**
 - Create: `app/quotes.py`, `tests/test_quotes.py`
@@ -386,7 +399,7 @@ def test_quote_matches_summary_on_same_bars(tmp_path): ...  # last/chg_1d/volume
 
 ## Phase 4: Grouping
 
-### Task 9: Exchange lookup
+### Task 8: Exchange lookup
 
 **Files:**
 - Modify: `app/market.py`, `app/store.py`, `tests/test_sessions.py` (or new `tests/test_market.py`)
@@ -397,7 +410,7 @@ def test_quote_matches_summary_on_same_bars(tmp_path): ...  # last/chg_1d/volume
 - [ ] **Step 1: Write failing tests:** refresh with a fake trading client stores exchanges and sets `exchanges_at`; a second refresh within 7 days does not call `get_all_assets`; a 401 leaves `exchanges()` empty and is logged.
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement.** **Step 4: Run** `uv run pytest -q`. **Step 5: Commit** `feat: cache each symbol's exchange`.
 
-### Task 10: Group-by list
+### Task 9: Group-by list
 
 **Files:**
 - Create: `app/groups.py`, `tests/test_groups.py`
@@ -433,7 +446,7 @@ For the window tests, build `MainWindow` with the poller start stubbed (monkeypa
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement.** Sorting stays enabled; the proxy sorts children within each parent. Selection reads the symbol from column 0 of the source item, skipping group rows (group rows store their `Group` in `Qt.UserRole`).
 - [ ] **Step 4: Run** `uv run pytest -q` — all pass. **Step 5: Commit** `feat: group the list by sector, exchange or index`.
 
-### Task 11: Live check and README
+### Task 10: Live check and README
 
 **Files:**
 - Create: `tests/test_interface_live.py`
