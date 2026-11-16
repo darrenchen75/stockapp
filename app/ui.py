@@ -316,7 +316,7 @@ class MainWindow(QMainWindow):
         prefs.save(self.data_dir, theme=choice)
 
     def refresh(self):
-        summaries, gaps = self.store.summary(), self.store.gaps(self.symbols)
+        summaries, gaps = self.store.summary(sessions.load(self.store)), self.store.gaps(self.symbols)
         for symbol, row in self.rows.items():
             x = summaries.get(symbol)
             pct = x.pct if x else None

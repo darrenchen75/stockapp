@@ -3,6 +3,7 @@ from datetime import datetime
 
 import pytest
 
+from app.sessions import Session
 from app.store import ET, Bar, DailyBar, Store
 
 
@@ -12,6 +13,14 @@ def ts(y, m, d, hh, mm):
 
 def bar(symbol, t, c=10.0, v=100):
     return Bar(symbol, t, c, c, c, c, v)
+
+
+def sess(y, m, d, close=(16, 0)):
+    return Session(datetime(y, m, d).date(), ts(y, m, d, 9, 30), ts(y, m, d, *close))
+
+
+THU, FRI, MON = sess(2026, 10, 15), sess(2026, 10, 16), sess(2026, 10, 19)
+SESSIONS = [sess(2026, 10, 14), THU, FRI, MON]
 
 
 def store(tmp_path):
@@ -56,7 +65,7 @@ def test_prune_drops_rows_older_than_30_days(tmp_path):
 def test_summary_empty_store(tmp_path):
     s = store(tmp_path)
     assert s.session_start() is None
-    assert s.summary() == {}
+    assert s.summary(SESSIONS) == {}
 
 
 def test_summary_compares_last_session_to_previous_close(tmp_path):
@@ -67,7 +76,7 @@ def test_summary_compares_last_session_to_previous_close(tmp_path):
         bar("AAPL", ts(2026, 10, 16, 9, 30), c=101.0, v=10),
         bar("AAPL", ts(2026, 10, 16, 15, 59), c=102.0, v=20),
     ])
-    x = s.summary()["AAPL"]
+    x = s.summary(SESSIONS)["AAPL"]
     assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 30)
     assert round(x.pct, 2) == 2.0
 
@@ -80,8 +89,8 @@ def test_session_uses_new_york_date_not_utc(tmp_path):
         bar("AAPL", ts(2026, 11, 20, 19, 30), c=51.0, v=2),
     ])
     assert s.session_start() == ts(2026, 11, 20, 0, 0)
-    x = s.summary()["AAPL"]
-    assert (x.last, x.prev_close, x.volume, x.pct) == (51.0, None, 3, None)
+    x = s.summary([sess(2026, 11, 20)])["AAPL"]
+    assert (x.last, x.prev_close, x.volume, x.pct) == (50.0, None, 1, None)
 
 
 def test_summary_is_per_symbol_when_one_is_stale(tmp_path):
@@ -94,7 +103,7 @@ def test_summary_is_per_symbol_when_one_is_stale(tmp_path):
         bar("MSFT", ts(2026, 10, 14, 15, 59), c=200.0, v=7),
         bar("MSFT", ts(2026, 10, 15, 15, 59), c=210.0, v=9),
     ])
-    a, m = s.summary()["AAPL"], s.summary()["MSFT"]
+    a, m = s.summary(SESSIONS)["AAPL"], s.summary(SESSIONS)["MSFT"]
     assert (a.last, a.prev_close, a.volume) == (102.0, 100.0, 20)
     assert (m.last, m.prev_close, m.volume) == (210.0, 200.0, 9)
     assert s.session_start() == ts(2026, 10, 16, 0, 0)
@@ -113,9 +122,41 @@ def test_summary_reads_one_snapshot_while_history_is_replaced(tmp_path):
         return out
 
     s.latest_all = racing
-    assert s.summary()["AAPL"].last == 100.0  # pre-repair snapshot, not a crash on the vanished minute
+    assert s.summary(SESSIONS)["AAPL"].last == 100.0  # pre-repair snapshot, not a crash on the vanished minute
     s.latest_all = latest_all
-    assert s.summary()["AAPL"].last == 50.0
+    assert s.summary(SESSIONS)["AAPL"].last == 50.0
+
+
+def test_summary_ignores_post_market_and_closing_minute(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 15, 15, 59), c=100.0, v=5),
+              bar("A", ts(2026, 10, 16, 15, 59), c=102.0, v=20), bar("A", ts(2026, 10, 16, 16, 0), c=103.0, v=7),
+              bar("A", ts(2026, 10, 16, 19, 30), c=110.0, v=9)])
+    x = s.summary([THU, FRI])["A"]
+    assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 20)
+
+
+def test_summary_before_open_shows_previous_session(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 15, 15, 59), c=100.0), bar("A", ts(2026, 10, 16, 15, 59), c=102.0, v=20),
+              bar("A", ts(2026, 10, 19, 8, 0), c=120.0, v=9)])
+    x = s.summary(SESSIONS)["A"]
+    assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 20)
+
+
+def test_summary_early_close(tmp_path):
+    early = sess(2026, 10, 16, close=(13, 0))
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 15, 15, 59), c=100.0), bar("A", ts(2026, 10, 16, 12, 59), c=102.0, v=20),
+              bar("A", ts(2026, 10, 16, 13, 30), c=110.0, v=9)])
+    x = s.summary([THU, early])["A"]
+    assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 20)
+
+
+def test_summary_no_regular_bars_is_absent(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 16, 8, 0)), bar("A", ts(2026, 10, 16, 17, 0))])
+    assert s.summary(SESSIONS) == {}
 
 
 def test_replace_swaps_all_rows_and_records_split(tmp_path):

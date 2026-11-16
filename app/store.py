@@ -4,7 +4,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as clock
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from app.sessions import Session
 
 ET = ZoneInfo("America/New_York")
 
@@ -201,23 +205,28 @@ class Store:
         ).fetchone()[0]
         return None if ts is None else day_start(ts)
 
-    def summary(self) -> dict[str, Summary]:
-        """Each symbol's latest session vs. its own previous close (primary-key lookups)."""
+    def summary(self, sessions: "list[Session]") -> dict[str, Summary]:
+        """Regular-session figures: latest session with a regular bar vs. the one before it.
+        Primary-key range probes, newest session first, stopping at the second hit."""
         out = {}
         self.db.execute("BEGIN")  # one snapshot, so a split repair committing mid-read can't pull rows away
         try:
-            for s, ts in self.latest_all().items():
-                start = day_start(ts)
-                last = self.db.execute(
-                    "SELECT c FROM bars WHERE symbol = ? AND ts = ?", (s, ts)
-                ).fetchone()[0]
-                prev = self.db.execute(
-                    "SELECT c FROM bars WHERE symbol = ? AND ts < ? ORDER BY ts DESC LIMIT 1", (s, start)
-                ).fetchone()
-                volume = self.db.execute(
-                    "SELECT SUM(v) FROM bars WHERE symbol = ? AND ts >= ?", (s, start)
-                ).fetchone()[0]
-                out[s] = Summary(last, prev[0] if prev else None, volume)
+            for s in self.latest_all():
+                last = volume = prev = None
+                for x in sorted(sessions, key=lambda x: x.day, reverse=True):
+                    row = self.db.execute(
+                        "SELECT c, (SELECT SUM(v) FROM bars WHERE symbol = ?1 AND ts >= ?2 AND ts < ?3)"
+                        " FROM bars WHERE symbol = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts DESC LIMIT 1",
+                        (s, x.open, x.close)).fetchone()
+                    if row is None:
+                        continue
+                    if last is None:
+                        last, volume = row
+                    else:
+                        prev = row[0]
+                        break
+                if last is not None:
+                    out[s] = Summary(last, prev, volume)
         finally:
             self.db.commit()
         return out
