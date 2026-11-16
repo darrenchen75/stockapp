@@ -40,6 +40,7 @@ def test_holidays_are_missing_weekdays():
 def test_market_refresh_failure_is_logged_not_raised(tmp_path, caplog):
     class Rejecting:
         def get_calendar(self, req): raise HTTPError(401)
+        def get_all_assets(self, req): return _assets(A="NYSE")
     market.refresh(Rejecting(), store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET))
     assert store(tmp_path).sessions() == [] and "calendar" in caplog.text
 
@@ -48,6 +49,8 @@ def test_refresh_saves_and_skips_when_fresh(tmp_path):
     calls = []
 
     class Trading:
+        def get_all_assets(self, req): return _assets(A="NYSE")
+
         def get_calendar(self, req):
             calls.append(req)
             return [SimpleNamespace(date=date(2026, 11, 16), open=datetime(2026, 11, 16, 9, 30),
@@ -72,6 +75,7 @@ def test_expired_calendar_falls_back_for_uncovered_bar_dates(tmp_path):
 def test_poller_calendar_401_does_not_report_bad_key(tmp_path):
     class Rejecting:
         def get_calendar(self, req): raise HTTPError(401)
+        def get_all_assets(self, req): return _assets(A="NYSE")
     t = datetime.now(timezone.utc)
     client = FakeClient({"A": [fake_bar(t.replace(microsecond=0))]})
     auth, updated = [], threading.Event()
@@ -88,6 +92,7 @@ def test_refresh_failure_retries_at_most_hourly(tmp_path):
 
     class Rejecting:
         def get_calendar(self, req): calls.append(1); raise HTTPError(401)
+        def get_all_assets(self, req): return _assets(A="NYSE")
     s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
     market.refresh(Rejecting(), s, now)
     market.refresh(Rejecting(), s, now + timedelta(minutes=59))
@@ -158,3 +163,14 @@ def test_calendar_failure_spares_exchanges(tmp_path):
     s = store(tmp_path)
     market.refresh(Trading(), s, datetime(2026, 11, 16, 12, tzinfo=ET))
     assert s.exchanges() == {"AAPL": "NASDAQ"}
+
+
+def test_empty_exchange_list_keeps_old_rows_and_retries(tmp_path, caplog):
+    class Trading:
+        def get_calendar(self, req): return []
+        def get_all_assets(self, req): return []
+    s, now = store(tmp_path), datetime(2026, 11, 16, 12, tzinfo=ET)
+    s.save_exchanges({"AAPL": "NASDAQ"})
+    market.refresh(Trading(), s, now)
+    assert s.exchanges() == {"AAPL": "NASDAQ"} and s.meta("exchanges_at") is None
+    assert s.meta("exchanges_failed_at") and "exchanges" in caplog.text

@@ -21,6 +21,8 @@ def fetch_sessions(trading, start: date, end: date) -> list[Session]:
 
 def fetch_exchanges(trading) -> dict[str, str]:
     assets = trading.get_all_assets(GetAssetsRequest(asset_class=AssetClass.US_EQUITY))
+    if not assets:  # an empty answer would wipe the cache and look fresh for a week
+        raise ValueError("no assets returned")
     return {a.symbol: a.exchange.value for a in assets}
 
 
