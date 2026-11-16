@@ -112,3 +112,27 @@ def test_main_window_charts_30_days_of_the_selected_symbol(qapp, tmp_path, monke
     assert w.chart.bars[0].ts == ts(2026, 10, 14, 10, 0) and w.chart.bars[-1] == bars[-1]
     assert w.chart.visible_ts()[0] == ts(2026, 11, 13, 4, 0)  # 1D
     w.close()
+
+
+@pytest.mark.parametrize("minutes, broken", [((0, 2, 4), False), ((0, 6), True)])
+def test_line_bridges_short_gaps_and_breaks_long_ones(qapp, minutes, broken):
+    import numpy as np
+    data = [Bar("A", ts(2026, 11, 13, 5, 0) + 60 * m, 10, 10, 10, 10, 1) for m in minutes]
+    c = PriceChart(); c.set_data("A", "A", data, S, "")
+    assert np.isnan(c.line.getData()[1]).any() == broken
+
+
+def test_held_ends_off_the_axis_snap_to_nearest_bar_and_keep_it_whole(qapp):
+    c = PriceChart(); c.set_data("A", "A", bars, S, "")
+    c.hold = (ts(2026, 11, 11, 3, 0), ts(2026, 11, 14, 10, 0))  # before 04:00; a Saturday
+    c.set_data("A", "A", bars, S, "")
+    assert c.visible_ts() == (bars[0].ts, bars[-1].ts + 60)
+
+
+def test_full_extended_day_still_gets_hourly_ticks(qapp):
+    data = [Bar("A", ts(2026, 11, 13, 4, 0) + 60 * m, 10, 10, 10, 10, 1) for m in range(960)]  # last bar 19:59
+    c = PriceChart(); c.set_data("A", "A", data, S, "")
+    lo, hi = c.vb.viewRange()[0]
+    axis = c.plot.getAxis("bottom"); axis.setRange(lo, hi)
+    (step, values), = axis.tickValues(lo, hi, 800)
+    assert step < 960 and axis.tickStrings(values[:1], 1, step) == ["04:00"]

@@ -12,6 +12,7 @@ from app.sessions import DAY_MIN, Session, from_x, holidays, to_x
 from app.store import ET, Bar
 
 RANGES = {"1D": None, "5D": 5, "30D": 30}  # None = the latest session's day
+LINE_GAP = 5  # trading minutes; shorter gaps (sparse pre/post-market, illiquid stocks) stay joined
 
 
 class Candles(pg.GraphicsObject):
@@ -57,12 +58,12 @@ class SessionAxis(pg.AxisItem):
 
     def tickValues(self, lo, hi, size):
         span = hi - lo
-        steps = (15, 30, 60, 120, 240) if span < DAY_MIN else tuple(DAY_MIN * n for n in (1, 2, 5, 10, 20))
+        steps = (15, 30, 60, 120, 240) if span <= DAY_MIN else tuple(DAY_MIN * n for n in (1, 2, 5, 10, 20))
         step = next((s for s in steps if span / s <= max(size / 80, 2)), steps[-1])
         return [(step, list(np.arange(np.ceil(lo / step) * step, hi, step)))]
 
     def tickStrings(self, values, scale, spacing):
-        fmt = "%H:%M" if self.range[1] - self.range[0] < DAY_MIN else "%b %d"
+        fmt = "%H:%M" if self.range[1] - self.range[0] <= DAY_MIN else "%b %d"
         return [datetime.fromtimestamp(from_x(v, self.holidays), ET).strftime(fmt) for v in values]
 
 
@@ -113,7 +114,7 @@ class PriceChart(QWidget):
         if self.hold is None:
             self.scope()
         elif len(self.xs):
-            self.vb.setXRange(*(self.x_near(t) for t in self.hold), padding=0)
+            self.vb.setXRange(self.x_near(self.hold[0]), self.x_near(self.hold[1], right=True), padding=0)
 
     def set_range(self, name: str) -> None:
         self.range = name
@@ -140,10 +141,12 @@ class PriceChart(QWidget):
         lo, hi = self.vb.viewRange()[0]
         return from_x(lo, self.holidays), from_x(hi, self.holidays)
 
-    def x_near(self, ts: int) -> float:
-        """x of `ts`; a time off the session axis snaps to the nearest drawn bar."""
+    def x_near(self, ts: int, right: bool = False) -> float:
+        """x of `ts`; a time off the session axis snaps to the nearest drawn bar (its right edge for a right end)."""
         x = to_x(ts, self.holidays)
-        return x if x is not None else self.xs[np.abs(np.array([b.ts for b in self.bars]) - ts).argmin()]
+        if x is not None:
+            return x
+        return self.xs[np.abs(np.array([b.ts for b in self.bars]) - ts).argmin()] + right
 
     def scope(self):
         """Show the chosen range, ending at the newest bar. Start days are New York calendar dates."""
@@ -170,7 +173,7 @@ class PriceChart(QWidget):
         o, h, l, close = np.array([(b.o, b.h, b.l, b.c) for b in self.bars], dtype=float).T
         self.candles = Candles(self.xs, o, h, l, close, c.up, c.down)
         self.candles.setOpacity(0.3)
-        breaks = np.flatnonzero(np.diff(self.xs) > 1) + 1  # a missing minute is a gap, not a slope
+        breaks = np.flatnonzero(np.diff(self.xs) >= LINE_GAP) + 1  # a long gap is a gap, not a slope
         self.line = pg.PlotDataItem(np.insert(self.xs + 0.5, breaks, np.nan), np.insert(close, breaks, np.nan),
                                     pen=pg.mkPen(c.line, width=2), connect="finite")
         self.plot.addItem(self.candles)
