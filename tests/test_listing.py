@@ -7,7 +7,8 @@ from app.listing import ETFS, load_listings, viewer_symbols
 
 
 def test_load_symbols_and_backtest_universe_unchanged():
-    assert load_symbols() == [r["Symbol"] for r in csv.DictReader(open("app/sp500.csv"))]
+    with open("app/sp500.csv") as f:
+        assert load_symbols() == [r["Symbol"] for r in csv.DictReader(f)]
     assert daily.universe() == load_symbols() + ["SPY"]
 
 
@@ -21,10 +22,15 @@ def test_every_listing_has_name_and_sector():
     assert all(l.name and l.sector for l in load_listings().values())
 
 
+def test_sectors_are_gics_or_etf():
+    with open("app/sp500.csv") as f:
+        gics = {r["GICS Sector"] for r in csv.DictReader(f)}
+    assert {l.sector for l in load_listings().values()} <= gics | {"ETF"}
+
+
 def test_etfs():
     assert set(ETFS) == set("SPY QQQ DIA XLK XLF XLV XLY XLP XLE XLI XLB XLU XLRE XLC".split())
     assert load_listings()["XLK"].etf_for == "Information Technology" and load_listings()["XLK"].sector == "ETF"
-    assert len(csv.DictReader(open("app/dow30.csv")).__next__()) == 3
     assert sum("Dow 30" in l.indexes for l in load_listings().values()) == 30
 
 

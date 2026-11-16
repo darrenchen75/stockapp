@@ -242,5 +242,4 @@ prints `selftest ok`.
 The viewer's extra lists come from Wikipedia, fetched 2026-11-16:
 `app/nasdaq100.csv` from <https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies> and
 `app/dow30.csv` from <https://en.wikipedia.org/wiki/List_of_Dow_Jones_Industrial_Average_companies>
-(Dow names and sectors come from `app/sp500.csv`). The Nasdaq-100 page gives ICB
-industries, not GICS, so the 15 members outside the S&P 500 carry the ICB industry.
+(Dow names and sectors come from `app/sp500.csv`). Sectors for members outside the S&P 500 were assigned by hand to GICS sectors.
