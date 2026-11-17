@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
 
-from app import backtest, paper
+from app import backtest, paper, paper_state
 from app.daily import load_bars
 from app.paper import BrokerOrder, Refusal
 from app.paper_plan import Order
@@ -648,6 +648,45 @@ def test_release_waits_for_cancels(env):
     assert paper.release(env.broker, env.acct) is None and env.acct.state()["halted"] is False
     last = json.loads((env.acct.dir / "events.jsonl").read_text().splitlines()[-1])
     assert last["kind"] == "state" and last["new"] == {"halted": False}  # logged
+
+
+def test_kill_journals_the_cancel_of_a_sent_attempt(env):
+    paper.send_plan(env.broker, env.acct, env.run(), SEND)  # attempt 1 is closed "sent", its order still open
+    paper.kill(env.broker, env.acct, sleep=no_wait)
+    j = env.acct.journal(T, 1)
+    assert j.order_states()[oid(1, "SPY")] == "canceled"  # the live E2E's journal check
+    assert j.closed() == "killed"  # the kill cancelled one of its orders
+    assert paper.release(env.broker, env.acct) is None and env.acct.state()["halted"] is False
+
+
+def test_a_refresh_journaling_the_kills_cancel_first_still_closes_killed(env):
+    paper.send_plan(env.broker, env.acct, env.run(), SEND)
+    env.broker.cancel_to = "pending_cancel"
+    paper.kill(env.broker, env.acct, sleep=no_wait)  # gives up with the cancel unconfirmed
+    env.broker.orders = [replace(o, status="canceled") for o in env.broker.orders]
+    assert paper.unresolved_cancels(env.broker, env.acct) == []  # the status refresh journals "canceled"
+    j = env.acct.journal(T, 1)
+    assert j.order_states()[oid(1, "SPY")] == "canceled" and j.closed() == "sent"
+    assert paper.release(env.broker, env.acct) is None and j.closed() == "killed"
+
+
+def test_kill_leaves_an_attempt_cancelled_before_it_closed_sent(env, monkeypatch):
+    paper.send_plan(env.broker, env.acct, env.run(), SEND)
+    env.broker.orders = [replace(o, status="canceled") for o in env.broker.orders]  # cancelled by hand earlier
+    with monkeypatch.context() as m:
+        m.setattr(paper_state, "_now", lambda: "2020-01-01T00:00:00+00:00")
+        assert paper.unresolved_cancels(env.broker, env.acct) == []
+    paper.kill(env.broker, env.acct, sleep=no_wait)
+    j = env.acct.journal(T, 1)
+    assert j.order_states()[oid(1, "SPY")] == "canceled" and j.closed() == "sent"
+
+
+def test_kill_leaves_a_finished_sent_attempt_closed_sent(env):
+    paper.send_plan(env.broker, env.acct, env.run(), SEND)
+    env.broker.orders = [replace(o, status="filled") for o in env.broker.orders]  # filled before the kill
+    paper.kill(env.broker, env.acct, sleep=no_wait)
+    j = env.acct.journal(T, 1)
+    assert j.order_states()[oid(1, "SPY")] == "filled" and j.closed() == "sent"
 
 
 def test_done_for_day_order_does_not_block_release(env):

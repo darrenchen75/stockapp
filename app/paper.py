@@ -469,8 +469,8 @@ def _settle(broker: Broker, acct: AccountStore, polls: int = 0, sleep=_sleep, cl
             recancel: int = 0) -> dict[str, str]:
     """The latest status of every order of every open attempt and of every order Alpaca still has open. Orders
     not finished are looked up again, up to `polls` more times (cancelling everything again before the first
-    `recancel` of them), and new statuses are journaled. With `close`, attempts whose orders are all finished
-    are closed "killed"."""
+    `recancel` of them), and new statuses are journaled, in "sent" attempts too. With `close`, open attempts whose
+    orders are all finished, and sent ones with an order journaled cancelled since the last kill, are closed "killed"."""
     for n in range(polls + 1):
         if n:
             if n <= recancel:  # an order may have got out after the last cancel
@@ -478,7 +478,8 @@ def _settle(broker: Broker, acct: AccountStore, polls: int = 0, sleep=_sleep, cl
             sleep(_POLL)
         live = {o.client_order_id or o.id: o for o in broker.open_orders()}
         status = {cid: o.status for cid, o in live.items()}
-        journals = [j for j in acct.entries() if not j.closed()]
+        # a "sent" attempt still gets its orders' later statuses, so a kill's cancels reach the journal
+        journals = [j for j in acct.entries() if j.closed() in (None, "sent")]
         for j in journals:
             for cid, st in j.order_states().items():
                 got, new = live.get(cid), st
@@ -495,8 +496,14 @@ def _settle(broker: Broker, acct: AccountStore, polls: int = 0, sleep=_sleep, cl
         if all(st in _FINAL for st in status.values()):
             break
     if close:
+        killed = acct.state()["killed_at"]
+        since = killed and datetime.fromisoformat(killed).replace(microsecond=0)  # event times are whole seconds
         for j in journals:
-            if all(st in _FINAL for st in j.order_states().values()):
+            why = j.closed()
+            # by time, not by this call: a refresh may have journaled the kill's cancel first
+            hit = why == "sent" and since and any(
+                e.get("status") == "canceled" and datetime.fromisoformat(e["at"]) >= since for e in j.events())
+            if (not why or hit) and all(st in _FINAL for st in j.order_states().values()):
                 j.close("killed")
     return status
 
