@@ -3,7 +3,7 @@ import warnings
 import pandas as pd
 import pytest
 
-from app.stats import best, drawdown, growth, summary
+from app.stats import best, drawdown, growth, risk, summary
 
 
 def portfolio(values, start="2020-01-01"):
@@ -47,3 +47,43 @@ def test_all_nan_warning_column_counts_zero_without_pandas_warning():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert summary(portfolio([100, 121]), pos)["warnings"] == 0
+
+
+def daily(returns, start="2020-01-02"):
+    """Portfolio whose daily returns are exactly `returns`, starting at 100."""
+    values = [100.0]
+    for r in returns:
+        values.append(values[-1] * (1 + r))
+    return pd.DataFrame({"date": pd.bdate_range(start, periods=len(values)), "value": values})
+
+
+def test_risk_regression_by_hand():
+    # x = [-.01, 0, .01], y = [0, 0, .03]: slope 1.5, intercept .01, s^2 = .00015, Sxx = .0002
+    r = risk(daily([0, 0, .03]), daily([-.01, 0, .01]))
+    assert r["beta"] == pytest.approx(1.5) and r["beta_se"] == pytest.approx((.00015 / .0002) ** .5)
+    assert r["alpha"] == pytest.approx(.01 * 252) and r["alpha_se"] == pytest.approx((.00015 / 3) ** .5 * 252)
+    assert r["days"] == 3
+    assert r["volatility"] == pytest.approx(pd.Series([0, 0, .03]).std() * 252 ** .5)
+
+
+def test_benchmark_against_itself_is_beta_one_alpha_zero():
+    spy = daily([.01, -.02, .03, .005])
+    r = risk(spy, spy)
+    assert r["beta"] == pytest.approx(1) and r["alpha"] == pytest.approx(0, abs=1e-12)
+    assert r["beta_se"] == pytest.approx(0, abs=1e-12)
+
+
+def test_risk_uses_only_dates_both_have():
+    run = daily([0, 0, .03], start="2020-01-03")  # starts a day later than SPY
+    spy = daily([.02, -.01, 0, .01, .05])  # SPY's extra first and last days must be ignored
+    r = risk(run, spy)
+    assert r["days"] == 3 and r["beta"] == pytest.approx(1.5)
+
+
+def test_risk_without_benchmark_or_enough_days():
+    r = risk(daily([.01, .02, .03]), None)
+    assert r["beta"] is None and r["alpha"] is None and r["volatility"] is not None and r["days"] == 3
+    short = risk(daily([.01, .02]), daily([.01, .03]))  # 2 returns: no degrees of freedom for the error
+    assert short["beta"] is None and short["volatility"] is not None
+    one = risk(daily([.01]), None)
+    assert one["volatility"] is None and one["days"] == 1

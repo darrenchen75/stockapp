@@ -123,14 +123,15 @@ def fetch_daily(client, actions, symbols, through: date, sleep=time.sleep) -> di
 
 
 def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.sleep,
-                  progress=lambda done, total: None, cancelled=None) -> bool:
+                  progress=lambda done, total: None, cancelled=None, expect: date | None = None) -> bool:
     """Download everything again unless the stored data already reaches the latest final day
-    for the same symbols.
+    for the same symbols (and, with `expect`, SPY's last bar is on or after `expect`).
     Each symbol is replaced in one transaction; the marker is set last, so a failure retries all.
-    Raises IncompleteDownload, with no marker, if SPY comes back empty.
+    Raises IncompleteDownload, with no marker, if SPY comes back empty or ends before `expect`.
     Raises Cancelled, with no marker, if cancelled() is true before a batch; rows already replaced stay."""
     through = last_final_date(now or datetime.now(timezone.utc))
-    if store.daily_through() == through.isoformat() and store.daily_symbols() == set(symbols):
+    spy_short = lambda: expect is not None and (store.daily_last("SPY") or "") < expect.isoformat()
+    if store.daily_through() == through.isoformat() and store.daily_symbols() == set(symbols) and not spy_short():
         return False
     total, got = -(-len(symbols) // MAX_SYMBOLS), set()
     for done, batch in enumerate(batches(client, actions, symbols, through, sleep, cancelled), 1):
@@ -143,6 +144,8 @@ def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.s
         log.warning("no daily bars for %d symbols: %s", len(missing), ", ".join(missing))
     if "SPY" in missing:  # SPY sets the run's calendar, so a stale copy would silently shrink it
         raise IncompleteDownload("no daily bars for SPY; the marker is not set, so the next run retries")
+    if spy_short():  # the marker must record verified coverage, not just the date asked for
+        raise IncompleteDownload(f"SPY has no bar for {expect} yet; the marker is not set, so the next run retries")
     store.set_daily_symbols(symbols)  # before the marker: a crash between them only costs a download
     store.set_daily_through(through.isoformat())
     return True

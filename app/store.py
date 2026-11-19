@@ -113,6 +113,9 @@ class Store:
             args += symbols
         return self.db.execute(sql + " ORDER BY date, symbol", args)
 
+    def daily_last(self, symbol: str) -> str | None:
+        return self.db.execute("SELECT MAX(date) FROM daily_bars WHERE symbol = ?", (symbol,)).fetchone()[0]
+
     def daily_through(self) -> str | None:
         row = self.db.execute("SELECT through FROM daily_meta").fetchone()
         return row[0] if row else None

@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pandas as pd
 import pytest
 from PySide6.QtCore import QObject, Qt
 from PySide6.QtGui import QCloseEvent
@@ -428,10 +430,34 @@ def test_table_bolds_best_but_never_spy(make_window):
         w.tick(i)
     spy_ready(w)
     bold = lambda r, c: w.table.item(r, c).font().bold()
-    assert w.table.horizontalHeaderItem(3).text() == "SPY" and w.table.rowCount() == 5
+    assert w.table.horizontalHeaderItem(3).text() == "SPY" and w.table.rowCount() == 8
     # row 0 is the newest run (cost 200 bps), so the cheapest run is column 2
     assert [bold(0, c) for c in range(4)] == [False, False, True, False]
-    assert not any(bold(r, 3) for r in range(5)) and not any(bold(r, c) for r in (3, 4) for c in range(4))
+    assert not any(bold(r, 3) for r in range(8)) and not any(bold(r, c) for r in range(3, 8) for c in range(4))
+
+
+def row(w, label):
+    return next(r for r in range(w.table.rowCount()) if w.table.verticalHeaderItem(r).text() == label)
+
+
+def test_risk_rows_show_error_and_days(make_window):
+    w = make_window(runs=1)
+    w.tick(0)
+    spy_ready(w)
+    vol, beta, alpha = row(w, "Volatility"), row(w, "Beta"), row(w, "Alpha (yearly)")
+    assert re.fullmatch(r"\d+\.\d% \(\d+ d\)", w.table.item(vol, 1).text())
+    assert re.fullmatch(r"1\.00 ± 0\.00 \(\d+ d\)", w.table.item(beta, 1).text())  # SPY against itself
+    assert re.fullmatch(r"\+0\.0% ± 0\.0% \(\d+ d\)", w.table.item(alpha, 1).text())
+
+
+def test_beta_and_alpha_need_spy_ticked(make_window):
+    w = make_window(runs=1)
+    w.tick(0)
+    w.spy_item.setCheckState(Qt.Unchecked)
+    for label in ("Beta", "Alpha (yearly)"):
+        cell = w.table.item(row(w, label), 0)
+        assert cell.text() == "—" and cell.toolTip() == "Tick SPY to compare"
+    assert w.table.item(row(w, "Volatility"), 0).text() != "—"
 
 
 def test_spy_disabled_without_daily_data(make_window):
@@ -630,9 +656,10 @@ def test_export_cancelled_writes_nothing(window_with_runs, monkeypatch):
 # --- entry from the main window, and its guards ---
 @pytest.fixture
 def main_window(qapp, tmp_path, monkeypatch):
-    from app import ui
+    from app import paper_state, ui
     monkeypatch.setattr(ui.MainWindow, "start_poller", lambda self, keys: None)
     monkeypatch.setattr(ui.MainWindow, "check_for_update", lambda self: None)
+    monkeypatch.setattr(paper_state, "paper_dir", lambda: tmp_path / "paper")  # never the real paper account
     w = ui.MainWindow(str(tmp_path / "bars.db"), [], ("k", "s"), tmp_path)
     yield w
     w.compare = None
@@ -714,3 +741,75 @@ def test_compare_window_close_while_running_asks_and_cancels(window_with_runs, m
     assert event.isAccepted() is closes
     assert w.run_worker.cancel.called is closes
     w.run_worker = None
+
+
+# --- paper lines ---
+
+def paper_frame(growth=2.0):
+    days = pd.to_datetime(D)
+    return pd.DataFrame({"date": days, "value": [1000.0 * growth ** i for i in range(4)]})
+
+
+@pytest.fixture
+def paper_window(make_window, tmp_path, qapp):
+    def make(source):
+        w = make_window(runs=2, spy=True)  # same data as make_window
+        w.close()
+        w = CompareWindow(str(tmp_path / "bars.db"), tmp_path / "runs", lambda: None, "0.1.4", paper_source=source)
+        made.append(w)
+        wait(lambda: not w.workers)
+        return w
+    made = []
+    yield make
+    for w in made:
+        w.close()
+
+
+def test_paper_line_pinned_never_best(paper_window):
+    w = paper_window(lambda: [("Paper: s (abc1234)", paper_frame())])  # beats every run
+    n = len(w.records)
+    assert [w.list.item(i).text() for i in range(n, n + 2)] == ["SPY (buy and hold)", "Paper: s (abc1234)"]
+    assert w.list.item(n + 1).checkState() == Qt.Unchecked
+    w.tick(0)
+    w.list.item(n + 1).setCheckState(Qt.Checked)
+    wait(lambda: not w.workers)
+    cols = [w.table.horizontalHeaderItem(c).text() for c in range(w.table.columnCount())]
+    assert cols[-2:] == ["SPY", "Paper: s (abc1234)"]
+    paper_col = cols.index("Paper: s (abc1234)")
+    assert not any(w.table.item(r, paper_col).font().bold() for r in range(w.table.rowCount()))
+    assert w.table.item(4, paper_col).text() != "—"  # beta against SPY is computed
+    assert any(w.table.item(0, c).font().bold() for c in range(w.table.columnCount()))  # a run is marked instead
+
+
+def test_paper_note_mentions_no_dividends(paper_window):
+    w = paper_window(lambda: [("Paper: s (abc1234)", paper_frame())])
+    w.tick(0)
+    assert "no dividends (Alpaca paper)" not in w.results_note.text()
+    w.list.item(len(w.records) + 1).setCheckState(Qt.Checked)
+    assert "no dividends (Alpaca paper)" in w.results_note.text()
+
+
+def test_paper_source_error_is_a_note_not_a_crash(paper_window):
+    def boom():
+        raise RuntimeError("no keys\nat all")
+    w = paper_window(boom)
+    assert w.paper_note.text() == "Paper: could not load (RuntimeError: no keys at all)"
+    assert w.list.count() == len(w.records) + 1
+
+
+def test_paper_line_alone_is_compared_with_spy(paper_window):
+    w = paper_window(lambda: [("Paper: s (abc1234)", paper_frame())])
+    w.list.item(len(w.records) + 1).setCheckState(Qt.Checked)  # no run ticked
+    wait(lambda: not w.workers and w.table.columnCount() == 2)
+    assert [w.table.horizontalHeaderItem(c).text() for c in range(2)] == ["SPY", "Paper: s (abc1234)"]
+    assert w.table.item(4, 1).text() != "—"
+
+
+def test_paper_column_has_no_rebalance_or_warning_counts(paper_window):
+    w = paper_window(lambda: [("Paper: s (abc1234)", paper_frame())])
+    w.tick(0)
+    w.list.item(len(w.records) + 1).setCheckState(Qt.Checked)
+    wait(lambda: not w.workers)
+    col = w.table.columnCount() - 1
+    assert [w.table.item(r, col).text() for r in (6, 7)] == ["—", "—"]
+    assert w.table.item(6, 0).text() != "—"
