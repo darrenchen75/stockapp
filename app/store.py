@@ -27,6 +27,19 @@ class Bar:
 
 
 @dataclass(frozen=True)
+class DailyBar:
+    symbol: str
+    date: str  # YYYY-MM-DD, New York date
+    o: float  # o, h, l, c, v are raw (not split-adjusted)
+    h: float
+    l: float
+    c: float
+    v: float
+    factor_all: float
+    factor_split: float
+
+
+@dataclass(frozen=True)
 class Summary:
     last: float
     prev_close: float | None
@@ -54,6 +67,14 @@ class Store:
             "symbol TEXT NOT NULL, ex_date TEXT NOT NULL,"
             "PRIMARY KEY(symbol, ex_date)) WITHOUT ROWID"
         )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS daily_bars("
+            "symbol TEXT NOT NULL, date TEXT NOT NULL,"
+            "o REAL, h REAL, l REAL, c REAL, v REAL, factor_all REAL, factor_split REAL,"
+            "PRIMARY KEY(symbol, date)) WITHOUT ROWID"
+        )
+        self.db.execute("CREATE TABLE IF NOT EXISTS daily_meta(through TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS daily_symbols(symbol TEXT PRIMARY KEY) WITHOUT ROWID")
 
     def upsert(self, bars: Iterable[Bar]) -> None:
         with self.db:
@@ -73,6 +94,38 @@ class Store:
             )
             if ex_date:
                 self.db.execute("INSERT OR IGNORE INTO splits VALUES (?,?)", (symbol, ex_date))
+
+    def replace_daily(self, symbol: str, bars: Iterable[DailyBar]) -> None:
+        """Swap all of `symbol`'s daily rows, atomically. Plain INSERT so bad data raises and rolls back."""
+        with self.db:
+            self.db.execute("DELETE FROM daily_bars WHERE symbol = ?", (symbol,))
+            self.db.executemany(
+                "INSERT INTO daily_bars VALUES (?,?,?,?,?,?,?,?,?)",
+                [(b.symbol, b.date, b.o, b.h, b.l, b.c, b.v, b.factor_all, b.factor_split) for b in bars],
+            )
+
+    def daily_rows(self, through: str) -> Iterable[tuple]:
+        return self.db.execute(
+            "SELECT * FROM daily_bars WHERE date <= ? ORDER BY date, symbol", (through,)
+        )
+
+    def daily_through(self) -> str | None:
+        row = self.db.execute("SELECT through FROM daily_meta").fetchone()
+        return row[0] if row else None
+
+    def set_daily_through(self, date: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM daily_meta")
+            self.db.execute("INSERT INTO daily_meta VALUES (?)", (date,))
+
+    def daily_symbols(self) -> set[str]:
+        """The symbols the last finished daily download asked for."""
+        return {r[0] for r in self.db.execute("SELECT symbol FROM daily_symbols")}
+
+    def set_daily_symbols(self, symbols: Iterable[str]) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM daily_symbols")
+            self.db.executemany("INSERT INTO daily_symbols VALUES (?)", [(s,) for s in set(symbols)])
 
     def handled_splits(self) -> set[tuple[str, str]]:
         return set(self.db.execute("SELECT symbol, ex_date FROM splits"))
