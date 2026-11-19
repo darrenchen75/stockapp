@@ -246,6 +246,8 @@ def selftest(path: str) -> int:
     """Run a strategy file over two synthetic days, without Qt or network. CI runs this on each packaged app."""
     bars = pd.DataFrame(dict(symbol="A", date=["2020-01-02", "2020-01-03"], o=10.0, h=10.0, l=10.0, c=10.0, v=1.0))
     try:
+        from app import listing
+        listing.load_listings()  # a packaged app missing a listing file must fail selftest
         import app.paper  # noqa: F401  here, not at the top: a packaged app missing alpaca.trading must fail selftest
         run(load_strategy(path), bars, "2020-01-02", "2020-01-03")
     except Exception as e:

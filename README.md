@@ -1,7 +1,8 @@
 # Stock Bars
 
-Stock Bars shows you minute-by-minute prices for every company in the S&P 500,
-right on your computer. It keeps the last 30 days of prices and updates every
+Stock Bars shows you minute-by-minute prices for the companies in the S&P 500,
+Nasdaq-100 and Dow 30, plus the sector and index funds (ETFs) that track them,
+right on your computer. It keeps the last 35 days of prices and updates every
 minute while the stock market is open.
 
 It only shows prices. It never touches your real money. The only buying and
@@ -11,8 +12,8 @@ plan shown, or the confirmation that **Sell everything** asks for).
 
 ## What you'll see
 
-**On the left: a list of about 500 companies**, by their stock symbol (for
-example, AAPL is Apple). For each one you'll see:
+**On the left: a list of about 530 companies and funds**, by their stock symbol
+(for example, AAPL is Apple). For each one you'll see:
 
 - **Last**: the most recent price.
 - **% Chg**: how much the price moved since the previous trading day's last
@@ -21,15 +22,43 @@ example, AAPL is Apple). For each one you'll see:
 - **Gaps**: how many market days in the past month are missing prices for that
   company. Usually 0. A higher number means some of its history is incomplete.
 
-Click any column title to sort the list by it.
+Click any column title to sort the list by it. **Group by** above the list
+sorts it into sectors, exchanges or an index (such as the Nasdaq-100 or Dow 30).
+Click a sector or index row to chart its fund, and double-click it to open or
+close the group. Click an exchange row to open or close it. Each company also shows its name. Next to **Group by** you'll see where the
+prices come from (for example, **SIP, 15 min delayed**).
+
+Last, % Chg and Volume count regular trading hours only (9:30 a.m. to 4:00 p.m.
+New York time). They come from the minute prices, so a close can differ from
+the official closing price by a few cents.
 
 **On the right: a price chart** for whichever company you click. Each small
 bar is one minute: green if the price rose during that minute, red if it fell.
-Use the buttons above the chart to see:
+The chart uses the full market's prices (SIP), shown 15 minutes behind. Use
+the buttons above the chart to see:
 
 - **1D**: the latest trading day.
 - **5D**: the last 5 days.
 - **30D**: the last 30 days.
+
+The app keeps 35 days, not 30, so the 30-day change has a starting price from
+before the window.
+
+**Under the chart: a stats panel** that puts the company you clicked next to
+SPY (the S&P 500 fund), so you can compare them:
+
+- **Last**: the latest regular-hours price.
+- **Change 1D, 5D, 30D**: how much the price moved over 1, 5 and 30 days.
+- **Volume**: shares traded on the latest trading day.
+- **Volatility (30D)**: how much the price swings from day to day, over the
+  last 30 days, as a yearly figure. The number in brackets is how many days it
+  is based on, so a figure from only a few days deserves less trust.
+- **Sector**: the company's industry group.
+
+A cell stays blank when there isn't enough data to work it out.
+
+**Light or dark:** use **View** then **System**, **Light** or **Dark**. I've
+only checked this on Linux; Windows and macOS haven't been looked at yet.
 
 **At the bottom: a status line.** It says **Live** while new prices are coming
 in. It says **Market closed** outside trading hours, with the time of the
@@ -38,9 +67,11 @@ its own.
 
 ## What to expect
 
-- **The first time you open it**, the app spends a few minutes downloading a
-  month of prices. The status line shows its progress. You can watch the list
-  fill in while it works.
+- **The first time you open it**, the app spends a few minutes downloading
+  35 days of prices. The status line shows its progress, and the list fills in
+  when it's done.
+- **The first launch after an update** re-downloads about 35 days of prices,
+  because the price source changed. It takes a few minutes, like the first time.
 - **After that**, opening the app is quick. It only downloads what's new since
   you last used it.
 - **Prices update every minute** on weekdays from about 8:00 a.m. to 5:00 p.m.
@@ -49,9 +80,8 @@ its own.
   prices from before trading stopped.
 - **Some minutes have no bar.** Quiet stocks don't trade every minute, so their
   charts can have small empty spaces. This is normal.
-- **Volume looks lower than on other websites.** The free price source sees
-  only part of the market's trading. Prices are accurate, but volume numbers
-  are smaller than the full-market totals you see elsewhere.
+- **Prices are 15 minutes behind.** That's how Alpaca's free plan delivers
+  full-market data.
 - **Stock splits are handled for you.** When a company splits its stock, the
   app fixes that company's past prices so the chart doesn't show a sudden fake
   drop or jump.
@@ -238,3 +268,8 @@ Run `packaging/build.sh`. It is the same command the release uses, and the app l
 `dist/`. To check that strategies can import the standard library, pandas and numpy in
 that build, run `dist/StockBars/StockBars --selftest packaging/smoke_strategy.py`. It
 prints `selftest ok`.
+
+The viewer's extra lists come from Wikipedia, fetched 2026-11-16:
+`app/nasdaq100.csv` from <https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies> and
+`app/dow30.csv` from <https://en.wikipedia.org/wiki/List_of_Dow_Jones_Industrial_Average_companies>
+(Dow names and sectors come from `app/sp500.csv`). Sectors for members outside the S&P 500 were assigned by hand to GICS sectors.

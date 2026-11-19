@@ -1,8 +1,10 @@
 import sqlite3
+import warnings
 from datetime import datetime
 
 import pytest
 
+from app.sessions import Session
 from app.store import ET, Bar, DailyBar, Store
 
 
@@ -12,6 +14,14 @@ def ts(y, m, d, hh, mm):
 
 def bar(symbol, t, c=10.0, v=100):
     return Bar(symbol, t, c, c, c, c, v)
+
+
+def sess(y, m, d, close=(16, 0)):
+    return Session(datetime(y, m, d).date(), ts(y, m, d, 9, 30), ts(y, m, d, *close))
+
+
+THU, FRI, MON = sess(2026, 10, 15), sess(2026, 10, 16), sess(2026, 10, 19)
+SESSIONS = [sess(2026, 10, 14), THU, FRI, MON]
 
 
 def store(tmp_path):
@@ -56,7 +66,7 @@ def test_prune_drops_rows_older_than_30_days(tmp_path):
 def test_summary_empty_store(tmp_path):
     s = store(tmp_path)
     assert s.session_start() is None
-    assert s.summary() == {}
+    assert s.summary(SESSIONS) == {}
 
 
 def test_summary_compares_last_session_to_previous_close(tmp_path):
@@ -67,7 +77,7 @@ def test_summary_compares_last_session_to_previous_close(tmp_path):
         bar("AAPL", ts(2026, 10, 16, 9, 30), c=101.0, v=10),
         bar("AAPL", ts(2026, 10, 16, 15, 59), c=102.0, v=20),
     ])
-    x = s.summary()["AAPL"]
+    x = s.summary(SESSIONS)["AAPL"]
     assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 30)
     assert round(x.pct, 2) == 2.0
 
@@ -80,8 +90,8 @@ def test_session_uses_new_york_date_not_utc(tmp_path):
         bar("AAPL", ts(2026, 11, 20, 19, 30), c=51.0, v=2),
     ])
     assert s.session_start() == ts(2026, 11, 20, 0, 0)
-    x = s.summary()["AAPL"]
-    assert (x.last, x.prev_close, x.volume, x.pct) == (51.0, None, 3, None)
+    x = s.summary([sess(2026, 11, 20)])["AAPL"]
+    assert (x.last, x.prev_close, x.volume, x.pct) == (50.0, None, 1, None)
 
 
 def test_summary_is_per_symbol_when_one_is_stale(tmp_path):
@@ -94,7 +104,7 @@ def test_summary_is_per_symbol_when_one_is_stale(tmp_path):
         bar("MSFT", ts(2026, 10, 14, 15, 59), c=200.0, v=7),
         bar("MSFT", ts(2026, 10, 15, 15, 59), c=210.0, v=9),
     ])
-    a, m = s.summary()["AAPL"], s.summary()["MSFT"]
+    a, m = s.summary(SESSIONS)["AAPL"], s.summary(SESSIONS)["MSFT"]
     assert (a.last, a.prev_close, a.volume) == (102.0, 100.0, 20)
     assert (m.last, m.prev_close, m.volume) == (210.0, 200.0, 9)
     assert s.session_start() == ts(2026, 10, 16, 0, 0)
@@ -113,9 +123,49 @@ def test_summary_reads_one_snapshot_while_history_is_replaced(tmp_path):
         return out
 
     s.latest_all = racing
-    assert s.summary()["AAPL"].last == 100.0  # pre-repair snapshot, not a crash on the vanished minute
+    assert s.summary(SESSIONS)["AAPL"].last == 100.0  # pre-repair snapshot, not a crash on the vanished minute
     s.latest_all = latest_all
-    assert s.summary()["AAPL"].last == 50.0
+    assert s.summary(SESSIONS)["AAPL"].last == 50.0
+
+
+def test_summary_ignores_post_market_and_closing_minute(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 15, 15, 59), c=100.0, v=5),
+              bar("A", ts(2026, 10, 16, 15, 59), c=102.0, v=20), bar("A", ts(2026, 10, 16, 16, 0), c=103.0, v=7),
+              bar("A", ts(2026, 10, 16, 19, 30), c=110.0, v=9)])
+    x = s.summary([THU, FRI])["A"]
+    assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 20)
+
+
+def test_summary_before_open_shows_previous_session(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 15, 15, 59), c=100.0), bar("A", ts(2026, 10, 16, 15, 59), c=102.0, v=20),
+              bar("A", ts(2026, 10, 19, 8, 0), c=120.0, v=9)])
+    x = s.summary(SESSIONS)["A"]
+    assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 20)
+
+
+def test_summary_raises_no_warnings(tmp_path):  # sqlite3 deprecates mixed placeholder styles
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 16, 15, 59))])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert "A" in s.summary(SESSIONS)
+
+
+def test_summary_early_close(tmp_path):
+    early = sess(2026, 10, 16, close=(13, 0))
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 15, 15, 59), c=100.0), bar("A", ts(2026, 10, 16, 12, 59), c=102.0, v=20),
+              bar("A", ts(2026, 10, 16, 13, 30), c=110.0, v=9)])
+    x = s.summary([THU, early])["A"]
+    assert (x.last, x.prev_close, x.volume) == (102.0, 100.0, 20)
+
+
+def test_summary_no_regular_bars_is_absent(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("A", ts(2026, 10, 16, 8, 0)), bar("A", ts(2026, 10, 16, 17, 0))])
+    assert s.summary(SESSIONS) == {}
 
 
 def test_replace_swaps_all_rows_and_records_split(tmp_path):
@@ -202,3 +252,102 @@ def test_daily_symbols_round_trip(tmp_path):
     s.set_daily_symbols(["B", "A"])
     s.set_daily_symbols(["C", "A"])
     assert s.daily_symbols() == {"A", "C"}
+
+
+class FailingDb:
+    """Wraps a connection so the statement starting with `fail` raises (sqlite3.Connection can't be patched)."""
+
+    def __init__(self, db, fail):
+        self.db, self.fail = db, fail
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    def __enter__(self):
+        return self.db.__enter__()
+
+    def __exit__(self, *exc):
+        return self.db.__exit__(*exc)
+
+    def execute(self, sql, *args):
+        if sql.startswith(self.fail):
+            raise sqlite3.OperationalError("disk I/O error")
+        return self.db.execute(sql, *args)
+
+
+def staged_store(tmp_path):
+    s = store(tmp_path)
+    s.upsert([bar("A", 60, c=1.0), bar("IEXONLY", 60)])
+    s.replace("A", [bar("A", 60, c=1.0)], "2026-11-01")
+    s.upsert_staged([bar("A", 60, c=2.0), bar("A", 120, c=3.0), bar("B", 60)])
+    return s
+
+
+def test_staged_rows_stay_out_of_bars_until_swap(tmp_path):
+    s = staged_store(tmp_path)
+    assert s.staged_latest_all() == {"A": 120, "B": 60}
+    assert s.latest_all() == {"A": 60, "IEXONLY": 60}
+
+
+def test_swap_is_atomic_and_clears_splits(tmp_path):
+    s = staged_store(tmp_path)
+    s.swap_staged()
+    s = store(tmp_path)  # committed: visible from a fresh connection
+    assert s.bars("A", 0) == [bar("A", 60, c=2.0), bar("A", 120, c=3.0)]
+    assert s.latest_all() == {"A": 120, "B": 60}
+    assert s.staged_latest_all() == {} and s.handled_splits() == set() and s.meta("feed") == "sip"
+
+
+@pytest.mark.parametrize("fail", ["INSERT INTO bars", "DELETE FROM splits", "INSERT OR REPLACE INTO meta"])
+def test_failed_swap_changes_nothing(tmp_path, fail):
+    s = staged_store(tmp_path)
+    s.db = FailingDb(s.db, fail)
+    with pytest.raises(sqlite3.OperationalError):
+        s.swap_staged()
+    s = store(tmp_path)
+    assert s.latest_all() == {"A": 60, "IEXONLY": 60} and s.bars("A", 0)[0].c == 1.0
+    assert s.staged_latest_all() == {"A": 120, "B": 60}
+    assert s.handled_splits() == {("A", "2026-11-01")} and s.meta("feed") is None
+
+
+def test_swap_truncates_the_wal(tmp_path):
+    s = staged_store(tmp_path)
+    s.swap_staged()
+    assert (tmp_path / "bars.db-wal").stat().st_size == 0  # checkpointed back into bars.db
+    assert store(tmp_path).latest_all() == {"A": 120, "B": 60}
+
+
+def test_swap_survives_a_failed_checkpoint(tmp_path, caplog):
+    s = staged_store(tmp_path)
+    s.db = FailingDb(s.db, "PRAGMA wal_checkpoint")
+    s.swap_staged()
+    assert "checkpoint" in caplog.text
+    s = store(tmp_path)
+    assert s.latest_all() == {"A": 120, "B": 60} and s.meta("feed") == "sip"
+
+
+def vm_steps(s, run) -> int:
+    """SQLite virtual-machine steps `run` costs, in hundreds; a scan of bars costs about one per row."""
+    steps = []
+    s.db.set_progress_handler(lambda: steps.append(1) and 0, 100)
+    try:
+        run()
+    finally:
+        s.db.set_progress_handler(None, 0)
+    return len(steps)
+
+
+def test_ui_refresh_queries_seek_by_primary_key(tmp_path):
+    # The UI runs these every poll and they once read all ~8M SIP rows: ~1s frozen per refresh.
+    from datetime import date, timedelta
+
+    from app import sessions
+    s = store(tmp_path)
+    days = [d for i in range(60) if (d := date(2026, 9, 1) + timedelta(days=i)).weekday() < 5]
+    s.upsert([bar(x, ts(d.year, d.month, d.day, 10, 0) + 60 * m) for x in ("AAPL", "MSFT") for d in days
+              for m in range(200)])
+    scan = vm_steps(s, lambda: s.db.execute("SELECT MAX(ts) FROM bars").fetchall())
+    assert scan > 100  # sanity: a scan of these ~17k rows is measurable
+    for run in (s.latest_all, s.latest, lambda: s.summary(SESSIONS), lambda: sessions.load(s)):
+        assert vm_steps(s, run) < scan / 5
+    assert s.latest() == ts(2026, 10, 30, 10, 0) + 60 * 199

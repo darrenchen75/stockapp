@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
                                QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSplitter,
                                QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
+from app import theme
 from app.backtest import (SOURCE, Cancelled, DownloadError, StrategyError, backtest, buy_spy, load_strategy, run,
                           RESULTS_FORMAT)
 from app.daily import last_final_date, load_bars
@@ -200,7 +201,8 @@ class NewRunDialog(QDialog):
         self.note_label = QLabel(note, wordWrap=True)
         self.bar = QProgressBar(visible=False)
         self.error = QLabel(wordWrap=True)
-        self.error.setStyleSheet("color: #c62828")
+        self.restyle()
+        theme.watcher().changed.connect(self.restyle)
         self.run_button = QPushButton("Run", default=True)
         self.cancel_button = QPushButton("Cancel")
         self.run_button.clicked.connect(self.request_run)
@@ -215,6 +217,9 @@ class NewRunDialog(QDialog):
         column.addLayout(buttons)
         self.running = False
         self.setMinimumWidth(460)
+
+    def restyle(self) -> None:
+        self.error.setStyleSheet(f"color: {theme.shade('#c62828')}")
 
     def note(self) -> str:
         return self.note_label.text()
@@ -398,6 +403,8 @@ class CompareWindow(QWidget):
         self.plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem(utcOffset=0)})
         self.plot.addLegend()
         self.plot.showGrid(x=True, y=True, alpha=0.2)
+        theme.style_plot(self.plot)
+        theme.watcher().changed.connect(self.restyle)
         self.spy_note = QLabel()
         self.paper_note = QLabel()
         self.table = QTableWidget()
@@ -714,6 +721,10 @@ class CompareWindow(QWidget):
         if result is not None:
             self.benchmark_ready.emit()
 
+    def restyle(self) -> None:
+        theme.style_plot(self.plot)
+        self.redraw()
+
     def redraw(self) -> None:
         ids = self.ticked()
         self.colors = {i: c for i, c in self.colors.items() if i in ids}
@@ -722,7 +733,7 @@ class CompareWindow(QWidget):
                 self.colors[i] = next(c for c in COLORS if c not in self.colors.values())
         self._updating = True
         for i, rec in enumerate(self.records):
-            self.list.item(i).setIcon(swatch(self.colors[rec.id]) if rec.id in self.colors else QIcon())
+            self.list.item(i).setIcon(swatch(theme.shade(self.colors[rec.id])) if rec.id in self.colors else QIcon())
         self._updating = False
         self.plot.clear()
         self.plot.setTitle(None if ids else "Tick a run to compare")
@@ -732,7 +743,7 @@ class CompareWindow(QWidget):
         def line(portfolio, color, name, **pen):
             s = series(portfolio)
             x = (s.index - pd.Timestamp("1970-01-01")).total_seconds().to_numpy()  # UTC seconds, as DateAxisItem wants
-            self.plot.plot(x, s.to_numpy(), pen=pg.mkPen(color, width=2, **pen), name=name)
+            self.plot.plot(x, s.to_numpy(), pen=pg.mkPen(theme.shade(color), width=2, **pen), name=name)
 
         columns = {}  # header -> (summary, colour)
         pticked = [(n, p) for n, p in self.paper_lines or [] if n in self.paper_ticked()]
@@ -790,7 +801,7 @@ class CompareWindow(QWidget):
         self.table.setVerticalHeaderLabels([label for _, label in ROWS])
         for col, (name, stats, color, run_id) in enumerate(shown):
             header = QTableWidgetItem(name)
-            header.setForeground(QColor(color))
+            header.setForeground(QColor(theme.shade(color)))
             self.table.setHorizontalHeaderItem(col, header)
             for row, (key, _) in enumerate(ROWS):
                 value = stats[key]
