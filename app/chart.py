@@ -12,6 +12,12 @@ from app.sessions import DAY_MIN, Session, from_x, holidays, to_x
 from app.store import ET, Bar
 
 RANGES = {"1D": None, "5D": 5, "30D": 30}  # None = the latest session's day
+
+
+def _bold(button: QPushButton, on: bool) -> None:
+    font = button.font()
+    font.setBold(on)
+    button.setFont(font)
 LINE_GAP = 5  # trading minutes; shorter gaps (sparse pre/post-market, illiquid stocks) stay joined
 
 
@@ -96,6 +102,8 @@ class PriceChart(QWidget):
         for name in RANGES:
             button = self.buttons[name] = QPushButton(name, checkable=True, checked=name == self.range)
             button.clicked.connect(lambda _=False, n=name: self.set_range(n))
+            button.toggled.connect(lambda on, b=button: _bold(b, on))  # some dark styles draw no checked shade
+            _bold(button, button.isChecked())
             group.addButton(button)
             buttons.addWidget(button)
         buttons.addStretch()

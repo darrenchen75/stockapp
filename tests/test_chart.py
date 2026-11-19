@@ -165,3 +165,10 @@ def test_fresh_install_never_says_iex(qapp, tmp_path, monkeypatch):
     w = ui.MainWindow(str(tmp_path / "bars.db"), ["A"], ("k", "s"), tmp_path)  # no bars, no feed marker
     assert w.feed_label() == w.feed_tag.text() == "SIP, 15 min delayed"
     w.close()
+
+
+def test_checked_range_button_is_bold(qapp):  # the checked shade is invisible in some dark styles
+    c = PriceChart()
+    assert [n for n, b in c.buttons.items() if b.font().bold()] == ["1D"]
+    c.buttons["5D"].click()
+    assert [n for n, b in c.buttons.items() if b.font().bold()] == ["5D"]

@@ -42,6 +42,9 @@ def _palette(c: Colors) -> QPalette:
                         (QPalette.Highlight, QColor(c.line)), (QPalette.HighlightedText, bg),
                         (QPalette.PlaceholderText, fg.darker(150) if bg.lightness() < 128 else fg.lighter(150))):
         p.setColor(role, color)
+    off = QColor((fg.red() + bg.red()) // 2, (fg.green() + bg.green()) // 2, (fg.blue() + bg.blue()) // 2)
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        p.setColor(QPalette.Disabled, role, off)  # halfway to the background, so disabled controls look it
     return p
 
 

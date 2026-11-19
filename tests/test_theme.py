@@ -4,6 +4,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pyqtgraph as pg
 import pytest
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
 from app import prefs, theme
@@ -84,3 +85,12 @@ def test_paper_window_and_dialog_restyle_on_theme_change(qapp, monkeypatch, tmp_
     assert "#c62828" in w.cash_label.styleSheet() and "#c62828" in d.error.styleSheet()
     theme.apply(qapp, "dark"); qapp.processEvents()
     assert "#ef9a9a" in w.cash_label.styleSheet() and "#ef9a9a" in d.error.styleSheet()
+
+
+def test_fallback_palette_dims_disabled_text():
+    for c in (theme.LIGHT, theme.DARK):
+        p, bg = theme._palette(c), QColor(c.background)
+        for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+            on, off = p.color(QPalette.Active, role), p.color(QPalette.Disabled, role)
+            assert off != on  # a disabled button must not look clickable
+            assert abs(off.lightness() - bg.lightness()) < abs(on.lightness() - bg.lightness())
