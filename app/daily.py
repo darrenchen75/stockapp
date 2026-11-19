@@ -26,6 +26,10 @@ class IncompleteDownload(Exception):
     """A download finished without data the run cannot do without."""
 
 
+class Cancelled(Exception):
+    """The caller asked a long run to stop."""
+
+
 def decision_time(day: date) -> datetime:
     return datetime.combine(day, CUTOFF, ET)
 
@@ -84,11 +88,14 @@ def parse_actions(data) -> dict[str, tuple[list, list]]:
     return out
 
 
-def batches(client, actions, symbols, through: date, sleep=time.sleep):
-    """Yield {symbol: bars} for each batch of symbols, with both requests done before it is yielded."""
+def batches(client, actions, symbols, through: date, sleep=time.sleep, cancelled=None):
+    """Yield {symbol: bars} for each batch of symbols, with both requests done before it is yielded.
+    Raises Cancelled before starting a batch if cancelled() is true."""
     start = datetime.combine(HISTORY_START, clock(), ET)
     end = decision_time(through) - timedelta(minutes=15)  # SIP data newer than 15 minutes is not allowed
     for i in range(0, len(symbols), MAX_SYMBOLS):
+        if cancelled and cancelled():
+            raise Cancelled()
         batch = symbols[i:i + MAX_SYMBOLS]
         bars = with_retries(lambda: client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=batch, timeframe=TimeFrame.Day, start=start, end=end,
@@ -116,16 +123,17 @@ def fetch_daily(client, actions, symbols, through: date, sleep=time.sleep) -> di
 
 
 def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.sleep,
-                  progress=lambda done, total: None) -> bool:
+                  progress=lambda done, total: None, cancelled=None) -> bool:
     """Download everything again unless the stored data already reaches the latest final day
     for the same symbols.
     Each symbol is replaced in one transaction; the marker is set last, so a failure retries all.
-    Raises IncompleteDownload, with no marker, if SPY comes back empty."""
+    Raises IncompleteDownload, with no marker, if SPY comes back empty.
+    Raises Cancelled, with no marker, if cancelled() is true before a batch; rows already replaced stay."""
     through = last_final_date(now or datetime.now(timezone.utc))
     if store.daily_through() == through.isoformat() and store.daily_symbols() == set(symbols):
         return False
     total, got = -(-len(symbols) // MAX_SYMBOLS), set()
-    for done, batch in enumerate(batches(client, actions, symbols, through, sleep), 1):
+    for done, batch in enumerate(batches(client, actions, symbols, through, sleep, cancelled), 1):
         for s, bars in batch.items():
             store.replace_daily(s, bars)
             got.add(s)
@@ -143,6 +151,6 @@ def refresh_daily(client, actions, store: Store, symbols, now=None, sleep=time.s
 def load_bars(store: Store, now=None, symbols=None) -> pd.DataFrame:
     """All stored bars through the last final day, or only those of `symbols` if given."""
     through = last_final_date(now or datetime.now(timezone.utc))
-    df = pd.DataFrame.from_records(list(store.daily_rows(through.isoformat())), columns=COLUMNS)
+    df = pd.DataFrame.from_records(list(store.daily_rows(through.isoformat(), symbols)), columns=COLUMNS)
     df["date"] = pd.to_datetime(df["date"])
-    return df if symbols is None else df[df["symbol"].isin(symbols)].reset_index(drop=True)
+    return df

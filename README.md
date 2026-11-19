@@ -54,6 +54,33 @@ its own.
   app fixes that company's past prices so the chart doesn't show a sudden fake
   drop or jump.
 
+## Backtests
+
+Open **Tools**, then **Backtests…** to try a trading idea on past prices. The
+app never buys or sells anything. A backtest only replays history on paper.
+
+- **Make a run.** Click **New…**, pick a strategy file (a small Python file
+  that decides what to hold each day), choose the dates, starting money, a
+  trading cost and whether to count dividends, and start it. It runs in the
+  background, shows its progress, and you can cancel it. The strategy file may
+  use Python's standard library, pandas and numpy.
+- **Compare runs.** Every finished run is saved in a list. Tick up to 6 to draw
+  them on one chart (each starts at $100,000, so runs with different starting
+  money compare fairly) and side by side in a table of total return, yearly
+  growth, worst drop, trades and warnings. You can also tick **SPY**, a
+  buy-and-hold benchmark for the S&P 500. You can rename or delete a run, re-run it
+  with the same settings, open one to see what it held at each rebalance, and export
+  its results as two CSV files.
+- **Runs stay on this computer.** They are saved in Stock Bars' own data
+  folder, along with a copy of the strategy file as it was when you ran it.
+  Nothing is sent anywhere or shared between computers. Backtests use
+  daily prices, which the app downloads the first time you run one.
+- **Read results with care.** A backtest uses today's S&P 500 companies only,
+  so it leaves out companies that dropped out of the index. That makes results
+  look better than they would have been (survivorship bias). The note on the
+  screen, in the run detail and in exports says this, and names the data source
+  and the dividend setting. Past results don't predict future ones.
+
 ## Setup
 
 ### Step 1: Get a free Alpaca key
@@ -136,3 +163,10 @@ Send the app's log file to whoever gave you the app. It's in this folder:
 - **Windows**: press Windows key + R, paste `%LOCALAPPDATA%\stockapp\Logs\`, and press Enter
 - **Linux**: `~/.local/state/stockapp/log/` in your Home folder (show hidden
   files with Ctrl+H)
+
+## Building the app yourself
+
+Run `packaging/build.sh`. It is the same command the release uses, and the app lands in
+`dist/`. To check that strategies can import the standard library, pandas and numpy in
+that build, run `dist/StockBars/StockBars --selftest packaging/smoke_strategy.py`. It
+prints `selftest ok`.

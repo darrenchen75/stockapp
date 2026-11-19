@@ -12,7 +12,7 @@ import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 
-from app.daily import default_db_path, last_final_date, load_bars, refresh_daily, universe
+from app.daily import Cancelled, default_db_path, last_final_date, load_bars, refresh_daily, universe
 from app.store import Store
 
 
@@ -45,8 +45,15 @@ def history_as_of(prices: Prices, day: pd.Timestamp) -> dict[str, pd.DataFrame]:
     return out
 
 
+RESULTS_FORMAT = 1  # version of Result's column layout, saved with each run
+
+
 class StrategyError(Exception):
     """A strategy raised or returned invalid weights; the message names the decision date."""
+
+
+class DownloadError(Exception):
+    """The daily data could not be refreshed; the message says why."""
 
 
 def validate_weights(weights, symbols, day) -> dict[str, float]:
@@ -115,8 +122,10 @@ class Result:
     dividends: bool
 
 
-def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=True, now=None) -> Result:
-    """Decide on each day's final bar, fill at the next open, value at that day's close."""
+def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=True, now=None,
+        progress=None, cancelled=None) -> Result:
+    """Decide on each day's final bar, fill at the next open, value at that day's close.
+    progress(done, total) follows each day. Raises Cancelled if cancelled() is true before a day or after the last."""
     if not (math.isfinite(capital) and capital > 0):
         raise ValueError(f"capital must be a finite number above 0, got {capital}")
     if not (math.isfinite(cost_bps) and 0 <= cost_bps < 10_000):
@@ -137,6 +146,8 @@ def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=T
         return {s: n * prices.factor.at[day, s] for s, n in shares.items()}
 
     for i, day in enumerate(days):
+        if cancelled and cancelled():
+            raise Cancelled()
         note = None
         if pending:
             decided, targets = pending
@@ -163,6 +174,10 @@ def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=T
         except Exception as e:
             raise StrategyError(f"{day:%Y-%m-%d}: strategy raised {type(e).__name__}: {e}") from e
         pending = day, validate_weights(weights, symbols, day)
+        if progress:
+            progress(i + 1, len(days))
+    if cancelled and cancelled():
+        raise Cancelled()
     decided, targets = pending
     now = held(days[-1])
     for s in sorted(set(targets) | set(now)):  # the last decision has no fill
@@ -172,6 +187,30 @@ def run(strategy, bars, start, end, capital=100_000.0, cost_bps=0.0, dividends=T
     portfolio["return"] = portfolio["value"].pct_change().fillna(0.0)
     cols = ["decided_on", "date", "symbol", "target_weight", "fill_price", "shares", "warning"]
     return Result(portfolio, pd.DataFrame(pos, columns=cols), dividends)
+
+
+def buy_spy(history, as_of) -> dict[str, float]:
+    return {"SPY": 1.0}  # the app's benchmark strategy
+
+
+def backtest(strategy, start, end, capital, cost_bps, dividends, client, actions, store,
+             download_progress=None, progress=None, cancelled=None) -> Result:
+    """Refresh the daily data, check that SPY is complete, and run. Raises Cancelled, DownloadError,
+    StrategyError or ValueError."""
+    symbols = universe()
+    try:
+        refresh_daily(client, actions, store, symbols, progress=download_progress or (lambda done, total: None),
+                      cancelled=cancelled)
+    except Cancelled:
+        raise
+    except Exception as e:
+        raise DownloadError(f"Could not download daily data: {e}") from e
+    bars = load_bars(store, symbols=symbols)
+    last = bars.groupby("symbol")["date"].max()
+    if "SPY" not in last or last["SPY"] < last.max():
+        raise ValueError(f"SPY data is incomplete: it stops before {str(last.max())[:10]}, "
+                         "the latest day of other symbols. Try again later.")
+    return run(strategy, bars, start, end, capital, cost_bps, dividends, progress=progress, cancelled=cancelled)
 
 
 def load_strategy(path: str):
@@ -184,6 +223,18 @@ def load_strategy(path: str):
     if not callable(getattr(module, "target_weights", None)):
         raise StrategyError(f"{path} must define target_weights(history, as_of)")
     return module.target_weights
+
+
+def selftest(path: str) -> int:
+    """Run a strategy file over two synthetic days, without Qt or network. CI runs this on each packaged app."""
+    bars = pd.DataFrame(dict(symbol="A", date=["2020-01-02", "2020-01-03"], o=10.0, h=10.0, l=10.0, c=10.0, v=1.0))
+    try:
+        run(load_strategy(path), bars, "2020-01-02", "2020-01-03")
+    except Exception as e:
+        print(f"selftest failed: {type(e).__name__}: {e}", file=sys.stderr)  # no-op in a windowed Windows exe
+        return 1
+    print("selftest ok")
+    return 0
 
 
 def write_results(result: Result, out_dir: str, source: str) -> None:
@@ -232,20 +283,11 @@ def main(argv=None) -> int:
         return fail("No Alpaca key found. Open Stock Bars once and enter your Alpaca key.")
     try:
         strategy = load_strategy(args.strategy)
-        store, symbols = Store(default_db_path()), universe()
-        try:
-            refresh_daily(StockHistoricalDataClient(*keys), CorporateActionsClient(*keys), store, symbols,
-                          progress=lambda done, total: print(f"downloaded {done}/{total}", file=sys.stderr))
-        except Exception as e:
-            return fail(f"Could not download daily data: {e}")
-        bars = load_bars(store, symbols=symbols)
-        last = bars.groupby("symbol")["date"].max()
-        if "SPY" not in last or last["SPY"] < last.max():
-            return fail(f"SPY data is incomplete: it stops before {str(last.max())[:10]}, "
-                        "the latest day of other symbols. Try again later.")
-        result = run(strategy, bars, args.start, args.end, args.capital, args.cost_bps, args.dividends)
+        result = backtest(strategy, args.start, args.end, args.capital, args.cost_bps, args.dividends,
+                          StockHistoricalDataClient(*keys), CorporateActionsClient(*keys), Store(default_db_path()),
+                          download_progress=lambda done, total: print(f"downloaded {done}/{total}", file=sys.stderr))
         write_results(result, args.out, SOURCE)
-    except (StrategyError, ValueError) as e:
+    except (StrategyError, DownloadError, ValueError) as e:
         return fail(str(e))
     return 0
 

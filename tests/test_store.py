@@ -156,6 +156,15 @@ def test_daily_rows_stop_at_through(tmp_path):
     assert [r[1] for r in s.daily_rows("2020-01-02")] == ["2020-01-02"]
 
 
+def test_daily_rows_can_limit_the_symbols(tmp_path):
+    s = store(tmp_path)
+    for sym in ("A", "B", "C"):
+        s.replace_daily(sym, [daily(sym, "2020-01-03"), daily(sym, "2020-01-02")])
+    assert [r[:2] for r in s.daily_rows("2099-01-01", ["C", "A"])] == [
+        ("A", "2020-01-02"), ("C", "2020-01-02"), ("A", "2020-01-03"), ("C", "2020-01-03")]
+    assert list(s.daily_rows("2099-01-01", [])) == []
+
+
 def test_failed_replace_keeps_old_rows(tmp_path):
     s = store(tmp_path)
     s.replace_daily("A", [daily("A", "2020-01-02")])
